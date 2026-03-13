@@ -1,0 +1,92 @@
+Content-Type: multipart/mixed; boundary="------------2KUDlwlbFE00og4OLUeXK0zS"
+Message-ID: <123b29e0-b3f1-66b4-b69a-bcd0cadfed80@echtzeit.solutions>
+Date: Fri, 10 Mar 2023 14:43:25 +0100
+MIME-Version: 1.0
+User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:102.0) Gecko/20100101
+ Thunderbird/102.7.1
+Subject: Re: TC-Helicon Blender
+Content-Language: en-US
+To: alsa-devel@alsa-project.org
+References: <948733d5-cbea-2c9f-95c7-6e95fdcacaba@echtzeit.solutions>
+ <87fsafiy9t.wl-tiwai@suse.de>
+From: =?UTF-8?Q?Florian_H=c3=a4nel?= <florian.haenel@echtzeit.solutions>
+In-Reply-To: <87fsafiy9t.wl-tiwai@suse.de>
+
+This is a multi-part message in MIME format.
+--------------2KUDlwlbFE00og4OLUeXK0zS
+Content-Type: text/plain; charset=UTF-8; format=flowed
+Content-Transfer-Encoding: 8bit
+
+
+On 08.03.23 06:54, Takashi Iwai wrote:
+> On Mon, 13 Feb 2023 08:57:19 +0100,
+> Florian Hänel wrote:
+>> I have this USB device called TC-Helicon Blender which provides 12
+>> input streams, 8 output streams (6/4 stereo plugs), in addition to
+>> some midi interface and internal playback and record channel.
+>>
+>> Bus 005 Device 016: ID 1220:8fe1 TC Electronic Blender
+>>
+>> If I power the device on while connected to a windows machine with its
+>> driver installed, then plug it into my linux machine, it appears to
+>> work correctly:
+>>
+>> arecord -D front:CARD=Blender  -r48000 -fS32_LE -c 12 blender.wav -d 20
+>> Recording WAVE 'blender.wav' : Signed 32 bit Little Endian, Rate 48000
+>> Hz, Channels 12
+>>
+>> 46080044 blender.wav
+>>
+>> However if I have it on my linux machine while powering it on, I only
+>> get timeouts and no samples from arecord:
+>>
+>> arecord -D front:CARD=Blender  -r48000 -fS32_LE -c 12 blender.wav -d 20
+>> Recording WAVE 'blender.wav' : Signed 32 bit Little Endian, Rate 48000
+>> Hz, Channels 12
+>> arecord: pcm_read:2221: read error: Input/output error
+>>
+>> 44 blender.wav
+> So the device didn't give any data.
+
+The maintainer of  the userland utility that makes a device of the same 
+manufacturer work on osx and linux has provided this experimental patch.
+
+Could you provide some feedback if this approach would be welcomed into 
+alsa?
+
+As I understand it it requires sending some vendor configuration packets.
+
+
+- Florian
+
+--------------2KUDlwlbFE00og4OLUeXK0zS
+Content-Type: text/x-patch; charset=UTF-8; name="goxlr-patch.diff"
+Content-Disposition: attachment; filename="goxlr-patch.diff"
+Content-Transfer-Encoding: base64
+
+ZGlmZiAtLWdpdCBhL3NvdW5kL3VzYi9xdWlya3MuYyBiL3NvdW5kL3VzYi9xdWlya3MuYwpp
+bmRleCAzZWNkMWJhN2ZkNGIuLjM2ZWE1YWFiZDQxZCAxMDA2NDQKLS0tIGEvc291bmQvdXNi
+L3F1aXJrcy5jCisrKyBiL3NvdW5kL3VzYi9xdWlya3MuYwpAQCAtMTM5MCw2ICsxMzkwLDI1
+IEBAIHN0YXRpYyBpbnQgc25kX3VzYl9tb3R1X21fc2VyaWVzX2Jvb3RfcXVpcmsoc3RydWN0
+IHVzYl9kZXZpY2UgKmRldikKIAlyZXR1cm4gMDsKIH0KIAorc3RhdGljIGludCBzbmRfdXNi
+X2dveGxyX2Jvb3RfcXVpcmsoc3RydWN0IHVzYl9kZXZpY2UgKmRldikKK3sKKwkvKiBMb2Fk
+IHRoZSA0ODAwMEh6IHJhdGUgaW50byBhIGJ1ZmZlciAqLworCXU4IHNyYXRlWzRdID0gezB4
+ODAsIDB4YmIsIDB4MDAsIDB4MDB9OworCXU4IHRlbXBbMjRdOworCisJLyogQ2xlYXIgdGhl
+IFZlbmRvciBidWZmZXIsIHdlIGRvbid0IG5lZWQgdG8gZG8gYW55dGhpbmcgd2l0aCB0aGlz
+IGRhdGEgKi8KKwlzbmRfdXNiX2N0bF9tc2coZGV2LCB1c2JfcmN2Y3RybHBpcGUoZGV2LDAp
+LCAweDAwLAorCQlVU0JfRElSX0lOIHwgVVNCX1RZUEVfVkVORE9SIHwgVVNCX1JFQ0lQX0lO
+VEVSRkFDRSwKKwkJMCwgMCwgJnRlbXAsIDB4MDAxOCk7CisKKwkvKiBTZW5kIHRoZSBwYWNr
+ZXQgdG8gYWN0aXZhdGUgdGhlIGF1ZGlvIGF0IDQ4MDAwSHogKi8KKwlzbmRfdXNiX2N0bF9t
+c2coZGV2LCB1c2Jfc25kY3RybHBpcGUoZGV2LCAwKSwgMHgwMSwKKwkJVVNCX0RJUl9PVVQg
+fCBVU0JfVFlQRV9DTEFTUyB8IFVTQl9SRUNJUF9JTlRFUkZBQ0UsCisJCTB4MDEwMCwgMHgy
+OTAwLCAmc3JhdGUsIDB4MDAwNCk7CisKKwlyZXR1cm4gMDsKK30KKwogLyoKICAqIFNldHVw
+IHF1aXJrcwogICovCkBAIC0xNjE3LDYgKzE2MzYsMTAgQEAgaW50IHNuZF91c2JfYXBwbHlf
+Ym9vdF9xdWlyayhzdHJ1Y3QgdXNiX2RldmljZSAqZGV2LAogCQkgICAgZ2V0X2lmYWNlX2Rl
+c2MoaW50Zi0+YWx0c2V0dGluZyktPmJJbnRlcmZhY2VOdW1iZXIgPCAzKQogCQkJcmV0dXJu
+IHNuZF91c2JfbW90dV9taWNyb2Jvb2tpaV9ib290X3F1aXJrKGRldik7CiAJCWJyZWFrOwor
+CisJY2FzZSBVU0JfSUQoMHgxMjIwLCAweDhmZTApOiAvKiBUQy1IZWxpY29uIEdvWExSICov
+CisJY2FzZSBVU0JfSUQoMHgxMjIwLCAweDhmZTQpOiAvKiBUQy1IZWxpY29uIEdvWExSIE1p
+bmkgKi8KKwkJcmV0dXJuIHNuZF91c2JfZ294bHJfYm9vdF9xdWlyayhkZXYpOwogCX0KIAog
+CXJldHVybiAwOwo=
+
+--------------2KUDlwlbFE00og4OLUeXK0zS--

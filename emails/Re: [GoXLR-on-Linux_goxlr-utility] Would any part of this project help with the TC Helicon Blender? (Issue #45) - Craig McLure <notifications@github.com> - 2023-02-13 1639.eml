@@ -1,0 +1,154 @@
+Return-Path: <noreply@github.com>
+Authentication-Results:  gmx.net; dkim=pass header.i=@github.com
+Received: from out-18.smtp.github.com ([192.30.252.201]) by mx-ha.gmx.net
+ (mxgmx101 [212.227.17.5]) with ESMTPS (Nemesis) id 1MlwSJ-1ojUk72HlD-00j25a
+ for <heeen@gmx.de>; Mon, 13 Feb 2023 16:39:04 +0100
+Received: from github-lowworker-c53a806.ac4-iad.github.net (github-lowworker-c53a806.ac4-iad.github.net [10.52.23.45])
+	by smtp.github.com (Postfix) with ESMTP id 96951340F6E
+	for <heeen@gmx.de>; Mon, 13 Feb 2023 07:39:03 -0800 (PST)
+DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed; d=github.com;
+	s=pf2014; t=1676302743;
+	bh=a31H2vWOeHVIUUV3yll6Y8hWDYnoY5LgEdfTQbOvjFo=;
+	h=Date:From:Reply-To:To:Cc:In-Reply-To:References:Subject:List-ID:
+	 List-Archive:List-Post:List-Unsubscribe:From;
+	b=LyOxT/7NtauS88st3FXwG4wK+YdjCD9gJEz0Gj+3Iac7e2dAAUDakqgpt8JklQB8x
+	 14JhXZUI69/8vBEdH7+OnaPEYKeasRDmfH2F7kxJKbdTsaFE8Wx1JgqNk39nnQfnMd
+	 BWV/ZI12LMVkO6lY7EmKMZMVfWyq6Cbl1ZOPkzVE=
+Date: Mon, 13 Feb 2023 07:39:03 -0800
+From: Craig McLure <notifications@github.com>
+Reply-To: GoXLR-on-Linux/goxlr-utility <reply+AAM67KXDX3TPJNFBJTFOPSGB66GBPEVBNHHF4UUEAU@reply.github.com>
+To: GoXLR-on-Linux/goxlr-utility <goxlr-utility@noreply.github.com>
+Cc: =?UTF-8?B?RmxvcmlhbiBIw6RuZWw=?= <heeen@gmx.de>, 
+ Author <author@noreply.github.com>
+Message-ID: <GoXLR-on-Linux/goxlr-utility/issues/45/1428157623@github.com>
+In-Reply-To: <GoXLR-on-Linux/goxlr-utility/issues/45@github.com>
+References: <GoXLR-on-Linux/goxlr-utility/issues/45@github.com>
+Subject: Re: [GoXLR-on-Linux/goxlr-utility] Would any part of this project
+ help with the TC Helicon Blender? (Issue #45)
+Mime-Version: 1.0
+Content-Type: multipart/alternative;
+ boundary="--==_mimepart_63ea59978878d_278bc5bc67478";
+ charset=UTF-8
+Content-Transfer-Encoding: 7bit
+Precedence: list
+X-GitHub-Sender: FrostyCoolSlug
+X-GitHub-Recipient: heeen
+X-GitHub-Reason: author
+List-ID: GoXLR-on-Linux/goxlr-utility
+ <goxlr-utility.GoXLR-on-Linux.github.com>
+List-Archive: https://github.com/GoXLR-on-Linux/goxlr-utility
+List-Post: <mailto:reply+AAM67KXDX3TPJNFBJTFOPSGB66GBPEVBNHHF4UUEAU@reply.github.com>
+List-Unsubscribe: <mailto:unsub+AAM67KXDX3TPJNFBJTFOPSGB66GBPEVBNHHF4UUEAU@reply.github.com>,
+ <https://github.com/notifications/unsubscribe/AAM67KS4UBY7NVPOYIXPTSDWXJIRPANCNFSM6AAAAAAU2K5DWY>
+X-Auto-Response-Suppress: All
+X-GitHub-Recipient-Address: heeen@gmx.de
+Envelope-To: <heeen@gmx.de>
+X-GMX-Antispam: 0 (Mail was not recognized as spam); Detail=V3;
+X-Spam-Flag: NO
+UI-InboundReport: notjunk:1;M01:P0:S+0veGINOyw=;uJx6D4dWd52faqelwZ3xidJZo4Ej
+ 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
+
+
+----==_mimepart_63ea59978878d_278bc5bc67478
+Content-Type: text/plain;
+ charset=UTF-8
+Content-Transfer-Encoding: 7bit
+
+Thanks, I'm not at a computer currently, but will check as soon as I am (might be a day or two, I'm on vacation currently :).
+
+In the meantime, if you'd like to experiment, you can try removing the if Err(Pipe) condition from the initialiser to force an initialisation attempt.
+
+Before initialising the code currently does a GoXLR specific check for initialisation, which is seemingly always succeeding on the Blender, so it's not running the code that attempts to activate the audio
+
+-- 
+Reply to this email directly or view it on GitHub:
+https://github.com/GoXLR-on-Linux/goxlr-utility/issues/45#issuecomment-1428157623
+You are receiving this because you authored the thread.
+
+Message ID: <GoXLR-on-Linux/goxlr-utility/issues/45/1428157623@github.com>
+----==_mimepart_63ea59978878d_278bc5bc67478
+Content-Type: text/html;
+ charset=UTF-8
+Content-Transfer-Encoding: 7bit
+
+<p></p>
+<p dir="auto">Thanks, I'm not at a computer currently, but will check as soon as I am (might be a day or two, I'm on vacation currently :).</p>
+<p dir="auto">In the meantime, if you'd like to experiment, you can try removing the if Err(Pipe) condition from the initialiser to force an initialisation attempt.</p>
+<p dir="auto">Before initialising the code currently does a GoXLR specific check for initialisation, which is seemingly always succeeding on the Blender, so it's not running the code that attempts to activate the audio</p>
+
+<p style="font-size:small;-webkit-text-size-adjust:none;color:#666;">&mdash;<br />Reply to this email directly, <a href="https://github.com/GoXLR-on-Linux/goxlr-utility/issues/45#issuecomment-1428157623">view it on GitHub</a>, or <a href="https://github.com/notifications/unsubscribe-auth/AAM67KXZJPM4P3GYVZN3KUTWXJIRPANCNFSM6AAAAAAU2K5DWY">unsubscribe</a>.<br />You are receiving this because you authored the thread.<img src="https://github.com/notifications/beacon/AAM67KVUI7EM3RRTAIWE37DWXJIRPA5CNFSM6AAAAAAU2K5DW2WGG33NNVSW45C7OR4XAZNMJFZXG5LFINXW23LFNZ2KUY3PNVWWK3TUL5UWJTSVD72LO.gif" height="1" width="1" alt="" /><span style="color: transparent; font-size: 0; display: none; visibility: hidden; overflow: hidden; opacity: 0; width: 0; height: 0; max-width: 0; max-height: 0; mso-hide: all">Message ID: <span>&lt;GoXLR-on-Linux/goxlr-utility/issues/45/1428157623</span><span>@</span><span>github</span><span>.</span><span>com&gt;</span></span></p>
+<script type="application/ld+json">[
+{
+"@context": "http://schema.org",
+"@type": "EmailMessage",
+"potentialAction": {
+"@type": "ViewAction",
+"target": "https://github.com/GoXLR-on-Linux/goxlr-utility/issues/45#issuecomment-1428157623",
+"url": "https://github.com/GoXLR-on-Linux/goxlr-utility/issues/45#issuecomment-1428157623",
+"name": "View Issue"
+},
+"description": "View this Issue on GitHub",
+"publisher": {
+"@type": "Organization",
+"name": "GitHub",
+"url": "https://github.com"
+}
+}
+]</script>
+----==_mimepart_63ea59978878d_278bc5bc67478--

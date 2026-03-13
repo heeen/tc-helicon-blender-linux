@@ -1,0 +1,149 @@
+Return-Path: <noreply@github.com>
+Authentication-Results:  gmx.net; dkim=pass header.i=@github.com
+Received: from out-22.smtp.github.com ([192.30.252.205]) by mx-ha.gmx.net
+ (mxgmx005 [212.227.15.9]) with ESMTPS (Nemesis) id 1N9LAE-1oXYEN38KK-015Jna
+ for <heeen@gmx.de>; Mon, 13 Feb 2023 19:14:39 +0100
+Received: from github-lowworker-9675bf1.va3-iad.github.net (github-lowworker-9675bf1.va3-iad.github.net [10.48.113.84])
+	by smtp.github.com (Postfix) with ESMTP id D86497220B3
+	for <heeen@gmx.de>; Mon, 13 Feb 2023 10:14:38 -0800 (PST)
+DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed; d=github.com;
+	s=pf2014; t=1676312078;
+	bh=5BhflvLbl809Qt8sa3GW6P09SyLIpDtwB/4IkAesxBI=;
+	h=Date:From:Reply-To:To:Cc:In-Reply-To:References:Subject:List-ID:
+	 List-Archive:List-Post:List-Unsubscribe:From;
+	b=HulnXcVHh8xOj2oG/LGl7/o1Y61exnKdaHK6n5ftmrmIVZOFTm6BDii9Iuh36W3sN
+	 DFwC5Iu3ozhaDjCR9RY8MdoMqPBDebGl12jZnk70VpKTa7xD71vTE1LweLgqwBlRnb
+	 2X1jPf9F9tQwiNcUKeYerRX7KyRump2p4BzVMa14=
+Date: Mon, 13 Feb 2023 10:14:38 -0800
+From: Craig McLure <notifications@github.com>
+Reply-To: GoXLR-on-Linux/goxlr-utility <reply+AAM67KWCCKVIQDJKMBLUW7OB66YI5EVBNHHF4UUEAU@reply.github.com>
+To: GoXLR-on-Linux/goxlr-utility <goxlr-utility@noreply.github.com>
+Cc: =?UTF-8?B?RmxvcmlhbiBIw6RuZWw=?= <heeen@gmx.de>, 
+ Author <author@noreply.github.com>
+Message-ID: <GoXLR-on-Linux/goxlr-utility/issues/45/1428430403@github.com>
+In-Reply-To: <GoXLR-on-Linux/goxlr-utility/issues/45@github.com>
+References: <GoXLR-on-Linux/goxlr-utility/issues/45@github.com>
+Subject: Re: [GoXLR-on-Linux/goxlr-utility] Would any part of this project
+ help with the TC Helicon Blender? (Issue #45)
+Mime-Version: 1.0
+Content-Type: multipart/alternative;
+ boundary="--==_mimepart_63ea7e0ec9ea8_3f16c5bc156293";
+ charset=UTF-8
+Content-Transfer-Encoding: 7bit
+Precedence: list
+X-GitHub-Sender: FrostyCoolSlug
+X-GitHub-Recipient: heeen
+X-GitHub-Reason: author
+List-ID: GoXLR-on-Linux/goxlr-utility
+ <goxlr-utility.GoXLR-on-Linux.github.com>
+List-Archive: https://github.com/GoXLR-on-Linux/goxlr-utility
+List-Post: <mailto:reply+AAM67KWCCKVIQDJKMBLUW7OB66YI5EVBNHHF4UUEAU@reply.github.com>
+List-Unsubscribe: <mailto:unsub+AAM67KWCCKVIQDJKMBLUW7OB66YI5EVBNHHF4UUEAU@reply.github.com>,
+ <https://github.com/notifications/unsubscribe/AAM67KV4ZHGJWHPQNRZEVYTWXJ2Y5ANCNFSM6AAAAAAU2K5DWY>
+X-Auto-Response-Suppress: All
+X-GitHub-Recipient-Address: heeen@gmx.de
+Envelope-To: <heeen@gmx.de>
+X-GMX-Antispam: 0 (Mail was not recognized as spam); Detail=V3;
+X-Spam-Flag: NO
+UI-InboundReport: notjunk:1;M01:P0:95RkdHmj+d4=;fJQrBHpWVbuX3oIHrjMxUSemhn34
+ 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
+ AZ10rBXDrl2etI=
+
+
+----==_mimepart_63ea7e0ec9ea8_3f16c5bc156293
+Content-Type: text/plain;
+ charset=UTF-8
+Content-Transfer-Encoding: 7bit
+
+Thanks, that's making some sense.. as an experiment, could you remove the lines for handle.release_interface, it looks like the release is waking alsa up, then the reset immediately after is causing the problems.
+
+-- 
+Reply to this email directly or view it on GitHub:
+https://github.com/GoXLR-on-Linux/goxlr-utility/issues/45#issuecomment-1428430403
+You are receiving this because you authored the thread.
+
+Message ID: <GoXLR-on-Linux/goxlr-utility/issues/45/1428430403@github.com>
+----==_mimepart_63ea7e0ec9ea8_3f16c5bc156293
+Content-Type: text/html;
+ charset=UTF-8
+Content-Transfer-Encoding: 7bit
+
+<p></p>
+<p dir="auto">Thanks, that's making some sense.. as an experiment, could you remove the lines for handle.release_interface, it looks like the release is waking alsa up, then the reset immediately after is causing the problems.</p>
+
+<p style="font-size:small;-webkit-text-size-adjust:none;color:#666;">&mdash;<br />Reply to this email directly, <a href="https://github.com/GoXLR-on-Linux/goxlr-utility/issues/45#issuecomment-1428430403">view it on GitHub</a>, or <a href="https://github.com/notifications/unsubscribe-auth/AAM67KQ7VW7UOPILLOXOAILWXJ2Y5ANCNFSM6AAAAAAU2K5DWY">unsubscribe</a>.<br />You are receiving this because you authored the thread.<img src="https://github.com/notifications/beacon/AAM67KSGP7R3MS2P6QTCYPTWXJ2Y5A5CNFSM6AAAAAAU2K5DW2WGG33NNVSW45C7OR4XAZNMJFZXG5LFINXW23LFNZ2KUY3PNVWWK3TUL5UWJTSVEQPEG.gif" height="1" width="1" alt="" /><span style="color: transparent; font-size: 0; display: none; visibility: hidden; overflow: hidden; opacity: 0; width: 0; height: 0; max-width: 0; max-height: 0; mso-hide: all">Message ID: <span>&lt;GoXLR-on-Linux/goxlr-utility/issues/45/1428430403</span><span>@</span><span>github</span><span>.</span><span>com&gt;</span></span></p>
+<script type="application/ld+json">[
+{
+"@context": "http://schema.org",
+"@type": "EmailMessage",
+"potentialAction": {
+"@type": "ViewAction",
+"target": "https://github.com/GoXLR-on-Linux/goxlr-utility/issues/45#issuecomment-1428430403",
+"url": "https://github.com/GoXLR-on-Linux/goxlr-utility/issues/45#issuecomment-1428430403",
+"name": "View Issue"
+},
+"description": "View this Issue on GitHub",
+"publisher": {
+"@type": "Organization",
+"name": "GitHub",
+"url": "https://github.com"
+}
+}
+]</script>
+----==_mimepart_63ea7e0ec9ea8_3f16c5bc156293--

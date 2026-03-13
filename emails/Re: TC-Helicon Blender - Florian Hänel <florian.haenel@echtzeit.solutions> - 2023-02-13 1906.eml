@@ -1,0 +1,80 @@
+Message-ID: <5b801868-0a03-a200-8d88-59079f5a41ab@echtzeit.solutions>
+Date: Mon, 13 Feb 2023 19:06:51 +0100
+MIME-Version: 1.0
+User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:102.0) Gecko/20100101
+ Thunderbird/102.4.2
+Subject: Re: TC-Helicon Blender
+Content-Language: en-US
+To: alsa-devel@alsa-project.org
+References: <948733d5-cbea-2c9f-95c7-6e95fdcacaba@echtzeit.solutions>
+From: =?UTF-8?Q?Florian_H=c3=a4nel?= <florian.haenel@echtzeit.solutions>
+In-Reply-To: <948733d5-cbea-2c9f-95c7-6e95fdcacaba@echtzeit.solutions>
+Content-Type: text/plain; charset=UTF-8; format=flowed
+Content-Transfer-Encoding: 8bit
+
+I found a tool [1] written for a device by the same vendor, so likely to 
+share hardware/firmware and it sends a single packet to make the device 
+work.
+
+It sort of works for me, except I have to unplug and re-plug the device 
+to make it work.
+
+My question now is, is there a quirks flag and configuration that allows 
+me to do the same thing on plug-in?
+
+
+Florian
+
+
+[1]: 
+https://github.com/GoXLR-on-Linux/goxlr-utility/blob/main/initialiser/src/main.rs#L117
+
+On 13.02.23 08:57, Florian Hänel wrote:
+> I have this USB device called TC-Helicon Blender which provides 12 
+> input streams, 8 output streams (6/4 stereo plugs), in addition to 
+> some midi interface and internal playback and record channel.
+>
+> Bus 005 Device 016: ID 1220:8fe1 TC Electronic Blender
+>
+> If I power the device on while connected to a windows machine with its 
+> driver installed, then plug it into my linux machine, it appears to 
+> work correctly:
+>
+> arecord -D front:CARD=Blender  -r48000 -fS32_LE -c 12 blender.wav -d 20
+> Recording WAVE 'blender.wav' : Signed 32 bit Little Endian, Rate 48000 
+> Hz, Channels 12
+>
+> 46080044 blender.wav
+>
+> However if I have it on my linux machine while powering it on, I only 
+> get timeouts and no samples from arecord:
+>
+> arecord -D front:CARD=Blender  -r48000 -fS32_LE -c 12 blender.wav -d 20
+> Recording WAVE 'blender.wav' : Signed 32 bit Little Endian, Rate 48000 
+> Hz, Channels 12
+> arecord: pcm_read:2221: read error: Input/output error
+>
+> 44 blender.wav
+>
+>
+> What can I do to try and get this device to init correctly under 
+> linux? I have captured USB packets of the init phase using wireshark 
+> on both windows and linux but comparing them is tedious if I don't 
+> know what to look for. Are there quirks flags I can play around with? 
+> This is my first time looking at a linux device driver issue like this.
+>
+> Would it be ok to attach the usb captures on this mailing list?
+>
+>
+> thanks
+>
+> Florian
+>
+-- 
+Florian Hänel
+Geschäftsführer
+
+echtzeit.solutions GmbH
+Handelsregistergericht München HRB 231056
+Ust-ID DE310379807
+
