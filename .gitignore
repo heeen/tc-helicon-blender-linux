@@ -1,0 +1,29 @@
+# Claude
+CLAUDE.local.md
+
+# Python
+__pycache__/
+.venv/
+
+# Rust build
+target/
+
+# GoXLR reference (not part of Blender project)
+goxlr-utility/
+apps/goxlr-app-extracted/
+apps/goxlr-windows/
+apps/GoXLR-App-1.6.4.014.exe
+
+# Tools (not project artifacts)
+apps/jadx/
+
+# Ghidra lock files
+*.lock~
+apps/**/*.lock
+
+# DKMS build artifacts (will be replaced by patch series)
+snd-usb-audio-tc-helicon-dkms/
+
+# Misc
+*.pyc
+memory/

@@ -1,0 +1,10 @@
+[package]
+name = "blender-usb"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+blender-proto = { path = "../blender-proto" }
+rusb = "0.9"
+anyhow = "1"
+log = "0.4"

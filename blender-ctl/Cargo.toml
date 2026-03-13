@@ -1,0 +1,23 @@
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+version = "0.2.0"
+
+[package]
+name = "blender-ctl"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+blender-proto = { path = "crates/blender-proto" }
+blender-ble = { path = "crates/blender-ble" }
+blender-usb = { path = "crates/blender-usb" }
+blender-tui = { path = "crates/blender-tui" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+log = "0.4"
+env_logger = "0.11"
