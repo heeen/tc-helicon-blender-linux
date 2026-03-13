@@ -1,0 +1,8 @@
+package com.google.android.gms.internal;
+
+/* JADX INFO: loaded from: classes.dex */
+public final class zzeea {
+    public static final int zzmys = 1;
+    public static final int zzmyt = 2;
+    private static final /* synthetic */ int[] zzmyu = {1, 2};
+}

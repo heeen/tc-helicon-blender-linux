@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<menu xmlns:android="http://schemas.android.com/apk/res/android" xmlns:app="http://schemas.android.com/apk/res-auto">
+    <item
+        android:icon="@drawable/yt_icon_rgb"
+        android:id="@+id/tutorial"
+        android:title="Tutorial"/>
+    <item
+        android:icon="@drawable/tc_logo_social"
+        android:id="@+id/tc_helicon"
+        android:title="tc-helicon.com"/>
+    <item
+        android:icon="@drawable/fb_logo"
+        android:id="@+id/facebook"
+        android:title="@tchelicon"/>
+    <item
+        android:icon="@drawable/ig_glyph_fill"
+        android:id="@+id/instagram"
+        android:title="@tchelicon"/>
+    <item
+        android:icon="@drawable/twitter_logo_blue"
+        android:id="@+id/twitter"
+        android:title="@tchelicon"/>
+</menu>

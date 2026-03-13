@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<menu xmlns:android="http://schemas.android.com/apk/res/android" xmlns:app="http://schemas.android.com/apk/res-auto">
+    <item
+        android:icon="@drawable/faq"
+        android:id="@+id/faq_menu"
+        android:title="FAQ"/>
+    <item
+        android:icon="@drawable/info"
+        android:id="@+id/about_blender_menu"
+        android:title="About Blender"/>
+    <item
+        android:icon="@drawable/tc2"
+        android:id="@+id/about_tc_menu"
+        android:title="About TC-Helicon"/>
+    <item
+        android:icon="@drawable/facebook"
+        android:id="@+id/follow_facebook_menu"
+        android:title="Follow Us On Facebook"/>
+    <item
+        android:icon="@drawable/twitter"
+        android:id="@+id/follow_twitter_menu"
+        android:title="Follow Us On Twitter"/>
+    <item
+        android:icon="@drawable/contact"
+        android:id="@+id/contact_us_menu"
+        android:title="Contact Us"/>
+    <item
+        android:icon="@drawable/web"
+        android:id="@+id/website_menu"
+        android:title="Website"/>
+</menu>

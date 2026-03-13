@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="utf-8"?>
+<android.support.constraint.ConstraintLayout xmlns:android="http://schemas.android.com/apk/res/android" xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+    <android.support.constraint.ConstraintLayout
+        android:id="@+id/spacer"
+        android:layout_width="0dp"
+        android:layout_height="16dp"
+        android:layout_weight="14"
+        app:layout_constraintEnd_toStartOf="@+id/label_container"
+        app:layout_constraintHorizontal_bias="0.5"
+        app:layout_constraintHorizontal_chainStyle="spread_inside"
+        app:layout_constraintHorizontal_weight="14"
+        app:layout_constraintStart_toStartOf="parent"/>
+    <android.support.constraint.ConstraintLayout
+        android:id="@+id/label_container"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="40dp"
+        android:layout_weight="72"
+        app:layout_constraintEnd_toStartOf="@+id/spacer2"
+        app:layout_constraintHorizontal_bias="0.5"
+        app:layout_constraintHorizontal_weight="72"
+        app:layout_constraintStart_toEndOf="@+id/spacer"
+        app:layout_constraintTop_toTopOf="parent">
+        <ImageView
+            android:id="@+id/imageView2"
+            android:layout_width="20dp"
+            android:layout_height="20dp"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toTopOf="parent"
+            app:srcCompat="@android:drawable/stat_sys_data_bluetooth"/>
+        <TextView
+            android:id="@+id/connected_label"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Connected to"
+            android:layout_marginStart="8dp"
+            app:layout_constraintBottom_toBottomOf="parent"
+            app:layout_constraintStart_toEndOf="@+id/imageView2"/>
+        <TextView
+            android:id="@+id/connected_to"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="8dp"
+            android:text="Connected to"
+            android:layout_marginStart="8dp"
+            app:layout_constraintBottom_toTopOf="@+id/connected_label"
+            app:layout_constraintStart_toEndOf="@+id/imageView2"
+            app:layout_constraintTop_toTopOf="parent"/>
+    </android.support.constraint.ConstraintLayout>
+    <android.support.constraint.ConstraintLayout
+        android:id="@+id/spacer2"
+        android:layout_width="0dp"
+        android:layout_height="16dp"
+        android:layout_weight="14"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintHorizontal_bias="0.5"
+        app:layout_constraintHorizontal_weight="14"
+        app:layout_constraintStart_toEndOf="@+id/label_container"/>
+</android.support.constraint.ConstraintLayout>

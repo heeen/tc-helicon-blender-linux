@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<menu xmlns:android="http://schemas.android.com/apk/res/android">
+    <item
+        android:icon="@drawable/mute2"
+        android:id="@+id/disconnect_menu"
+        android:title="Disconnect Bluetooth"/>
+    <item
+        android:icon="@drawable/reset"
+        android:id="@+id/reset_to_default_menu"
+        android:title="Reset to default"/>
+    <item
+        android:icon="@drawable/info"
+        android:id="@+id/info_menu"
+        android:title="Info"/>
+</menu>

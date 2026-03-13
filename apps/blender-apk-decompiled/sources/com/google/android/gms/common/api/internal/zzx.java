@@ -1,0 +1,58 @@
+package com.google.android.gms.common.api.internal;
+
+import android.os.Bundle;
+import android.support.annotation.NonNull;
+import android.support.annotation.Nullable;
+import com.google.android.gms.common.ConnectionResult;
+
+/* JADX INFO: loaded from: classes.dex */
+final class zzx implements zzcd {
+    private /* synthetic */ zzv zzfwc;
+
+    private zzx(zzv zzvVar) {
+        this.zzfwc = zzvVar;
+    }
+
+    /* synthetic */ zzx(zzv zzvVar, zzw zzwVar) {
+        this(zzvVar);
+    }
+
+    @Override // com.google.android.gms.common.api.internal.zzcd
+    public final void zzc(@NonNull ConnectionResult connectionResult) {
+        this.zzfwc.zzfwa.lock();
+        try {
+            this.zzfwc.zzfvx = connectionResult;
+            this.zzfwc.zzait();
+        } finally {
+            this.zzfwc.zzfwa.unlock();
+        }
+    }
+
+    @Override // com.google.android.gms.common.api.internal.zzcd
+    public final void zzf(int i, boolean z) {
+        this.zzfwc.zzfwa.lock();
+        try {
+            if (this.zzfwc.zzfvz || this.zzfwc.zzfvy == null || !this.zzfwc.zzfvy.isSuccess()) {
+                this.zzfwc.zzfvz = false;
+                this.zzfwc.zze(i, z);
+            } else {
+                this.zzfwc.zzfvz = true;
+                this.zzfwc.zzfvs.onConnectionSuspended(i);
+            }
+        } finally {
+            this.zzfwc.zzfwa.unlock();
+        }
+    }
+
+    @Override // com.google.android.gms.common.api.internal.zzcd
+    public final void zzk(@Nullable Bundle bundle) {
+        this.zzfwc.zzfwa.lock();
+        try {
+            this.zzfwc.zzj(bundle);
+            this.zzfwc.zzfvx = ConnectionResult.zzfqt;
+            this.zzfwc.zzait();
+        } finally {
+            this.zzfwc.zzfwa.unlock();
+        }
+    }
+}
