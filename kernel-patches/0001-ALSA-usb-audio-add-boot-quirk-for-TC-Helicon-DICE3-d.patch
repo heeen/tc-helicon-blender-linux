@@ -1,0 +1,135 @@
+From e6ca1d0835c9e68a331c6a63cf8e78bc7c8a51fb Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Florian=20H=C3=A4nel?= <florian.haenel@echtzeit.solutions>
+Date: Fri, 13 Mar 2026 15:11:45 +0100
+Subject: [PATCH 1/2] ALSA: usb-audio: add boot quirk for TC Helicon DICE3
+ devices
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+TC Helicon GoXLR, Blender, and GoXLR Mini are DICE3/TCAT-based USB
+audio interfaces that require a vendor-specific init sequence to
+activate USB audio streaming. Without it, the firmware's DAL state
+machine never transitions to STABLE and isochronous transfers fail.
+
+The 5-step sequence (vendor read, SET_CUR 48kHz, vendor write, 1s
+sleep, vendor read) was determined by USB-sniffing the Windows driver
+and cross-referenced with Ghidra reverse engineering of the firmware.
+
+Signed-off-by: Florian Hänel <florian.haenel@echtzeit.solutions>
+---
+ sound/usb/quirks.c | 91 ++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 91 insertions(+)
+
+diff --git a/sound/usb/quirks.c b/sound/usb/quirks.c
+index 766db7d00cbc..6cddb73e23fd 100644
+--- a/sound/usb/quirks.c
++++ b/sound/usb/quirks.c
+@@ -1606,6 +1606,93 @@ int snd_usb_apply_interface_quirk(struct snd_usb_audio *chip,
+ 	return 0;
+ }
+ 
++/*
++ * TC Helicon GoXLR, Blender, and GoXLR Mini boot quirk.
++ *
++ * These DICE3/TCAT-based devices require a vendor-specific init sequence
++ * to activate USB audio streaming. Without it, the firmware's DAL (Device
++ * Abstraction Layer) state machine never transitions to STABLE and
++ * isochronous transfers fail.
++ *
++ * The sequence was determined by USB-sniffing the Windows driver (Thesycon
++ * TUSBAudio), cross-referenced with Ghidra reverse engineering of the
++ * firmware and the GoXLR Utility project.
++ *
++ * Steps:
++ *   1. Vendor read 0x00 — triggers dcp_vendor_handler (fw 0x1BF6C) which
++ *      resets the DCP USB command state machine (cmd_state=0, cmd_index=0).
++ *      Clears any stale state from a previous connection.
++ *
++ *   2. UAC2 SET_CUR 48kHz — routed to uac2_set_sample_rate (fw 0x1B364)
++ *      → dal_apply_rate_change (fw 0x194C8) which programs the DICE3 HPLL
++ *      (hardware PLL) and reconfigures all audio routing. The DAL state
++ *      machine begins transitioning LOCK_ACQUIRED → RATE_CHANGED → STABLE.
++ *
++ *   3. Vendor write 0x01 — triggers DCP reset, clears the command index
++ *      counter.
++ *
++ *   4. 1s sleep — the DAL state machine needs time to achieve clock lock.
++ *      The HPLL must lock to the new rate and the firmware must complete
++ *      the diceHPLL → diceClock → dalClkCtrl chain. Firmware polls at
++ *      ~10ms intervals; 1s provides margin for the full LOCK_ACQUIRED →
++ *      STABLE transition.
++ *
++ *   5. Vendor read 0x03 — drains any pending DCP response from the
++ *      previous vendor write. Response data is discarded.
++ *
++ * No USB reset is required; the device applies the configuration
++ * in-place, so we return 0 and normal probe continues.
++ */
++static int snd_usb_tc_helicon_boot_quirk(struct usb_device *dev)
++{
++	int ret;
++	u8 buf[24];
++
++	/* Step 1: vendor read 0x00 — reset DCP command state machine */
++	ret = snd_usb_ctl_msg(dev, usb_rcvctrlpipe(dev, 0), 0x00,
++			      USB_DIR_IN | USB_TYPE_VENDOR | USB_RECIP_INTERFACE,
++			      0, 0, buf, sizeof(buf));
++	if (ret < 0)
++		dev_warn(&dev->dev,
++			 "TC Helicon boot quirk: vendor read failed %d\n", ret);
++
++	/* Step 2: SET_CUR 48kHz — programs DICE3 HPLL, starts DAL rate change */
++	buf[0] = 0x80;	/* 48000 in LE */
++	buf[1] = 0xbb;
++	buf[2] = 0x00;
++	buf[3] = 0x00;
++	ret = snd_usb_ctl_msg(dev, usb_sndctrlpipe(dev, 0), UAC_SET_CUR,
++			      USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
++			      0x0100, /* UAC2_CS_CONTROL_SAM_FREQ << 8 */
++			      0x2900, buf, 4);
++	if (ret < 0) {
++		dev_err(&dev->dev,
++			"TC Helicon boot quirk: SET_CUR failed %d\n", ret);
++		return ret;
++	}
++
++	/* Step 3: vendor write 0x01 — DCP reset, clears command index */
++	ret = snd_usb_ctl_msg(dev, usb_sndctrlpipe(dev, 0), 0x01,
++			      USB_DIR_OUT | USB_TYPE_VENDOR | USB_RECIP_INTERFACE,
++			      0, 0, NULL, 0);
++	if (ret < 0)
++		dev_warn(&dev->dev,
++			 "TC Helicon boot quirk: activate failed %d\n", ret);
++
++	/* Step 4: wait for DAL state machine LOCK_ACQUIRED → STABLE */
++	msleep(1000);
++
++	/* Step 5: vendor read 0x03 — drain pending DCP response */
++	ret = snd_usb_ctl_msg(dev, usb_rcvctrlpipe(dev, 0), 0x03,
++			      USB_DIR_IN | USB_TYPE_VENDOR | USB_RECIP_INTERFACE,
++			      0, 0, buf, 16);
++	if (ret < 0)
++		dev_warn(&dev->dev,
++			 "TC Helicon boot quirk: state read failed %d\n", ret);
++
++	return 0;
++}
++
+ int snd_usb_apply_boot_quirk(struct usb_device *dev,
+ 			     struct usb_interface *intf,
+ 			     const struct snd_usb_audio_quirk *quirk,
+@@ -1682,6 +1769,10 @@ int snd_usb_apply_boot_quirk_once(struct usb_device *dev,
+ 	switch (id) {
+ 	case USB_ID(0x07fd, 0x0008): /* MOTU M Series, 1st hardware version */
+ 		return snd_usb_motu_m_series_boot_quirk(dev);
++	case USB_ID(0x1220, 0x8fe0): /* TC Helicon GoXLR */
++	case USB_ID(0x1220, 0x8fe1): /* TC Helicon Blender */
++	case USB_ID(0x1220, 0x8fe4): /* TC Helicon GoXLR Mini */
++		return snd_usb_tc_helicon_boot_quirk(dev);
+ 	}
+ 
+ 	return 0;
+-- 
+2.51.0
+

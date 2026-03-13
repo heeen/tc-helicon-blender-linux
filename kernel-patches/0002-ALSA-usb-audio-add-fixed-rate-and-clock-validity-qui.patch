@@ -1,0 +1,147 @@
+From 98a6fecb8fc56c4c61d41b1b31f7ceb560ac14dd Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Florian=20H=C3=A4nel?= <florian.haenel@echtzeit.solutions>
+Date: Fri, 13 Mar 2026 15:12:58 +0100
+Subject: [PATCH 2/2] ALSA: usb-audio: add fixed-rate and clock validity quirks
+ for TC Helicon
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+TC Helicon DICE3 devices have a hardware-level bug where class IN
+transfers >2 bytes corrupt the data phase. The 2-byte CS_RANGE count
+query succeeds but the full rate table read fails with EPROTO.
+
+Add these devices to snd_usb_fixed_rate_quirk() (renamed from
+line6_parse_audio_format_rates_quirk to reflect its broader use) and
+add a fallback in parse_audio_format_rates_v2v3 for when the full
+CS_RANGE query fails after the count query succeeds.
+
+Also override clock validity — the firmware reports clock as invalid
+during the DAL LOCK_ACQUIRING phase, but audio works correctly at
+48kHz after the boot quirk completes.
+
+Set QUIRK_FLAG_FIXED_RATE for all three devices.
+
+Signed-off-by: Florian Hänel <florian.haenel@echtzeit.solutions>
+---
+ sound/usb/clock.c  | 14 ++++++++++++++
+ sound/usb/format.c | 37 +++++++++++++++++++++++++++++--------
+ sound/usb/quirks.c |  6 ++++++
+ 3 files changed, 49 insertions(+), 8 deletions(-)
+
+diff --git a/sound/usb/clock.c b/sound/usb/clock.c
+index 842ba5b801ea..9bcbb1f86120 100644
+--- a/sound/usb/clock.c
++++ b/sound/usb/clock.c
+@@ -207,6 +207,20 @@ static bool uac_clock_source_is_valid_quirk(struct snd_usb_audio *chip,
+ 			return true;
+ 	}
+ 
++	/*
++	 * TC Helicon DICE3 devices: the firmware's clock validity handler
++	 * reports clock as invalid during the DAL state machine's
++	 * LOCK_ACQUIRING phase. The boot quirk's 1s sleep should ensure
++	 * we're past this phase, but we override unconditionally for
++	 * robustness.
++	 */
++	switch (chip->usb_id) {
++	case USB_ID(0x1220, 0x8fe0): /* TC Helicon GoXLR */
++	case USB_ID(0x1220, 0x8fe1): /* TC Helicon Blender */
++	case USB_ID(0x1220, 0x8fe4): /* TC Helicon GoXLR Mini */
++		return true;
++	}
++
+ 	/*
+ 	 * MOTU MicroBook IIc
+ 	 * Sample rate changes takes more than 2 seconds for this device. Clock
+diff --git a/sound/usb/format.c b/sound/usb/format.c
+index ec95a063beb1..aa33f0abe280 100644
+--- a/sound/usb/format.c
++++ b/sound/usb/format.c
+@@ -416,12 +416,19 @@ static int parse_uac2_sample_rate_range(struct snd_usb_audio *chip,
+ 	return nr_rates;
+ }
+ 
+-/* Line6 Helix series and the Rode Rodecaster Pro don't support the
+- * UAC2_CS_RANGE usb function call. Return a static table of known
+- * clock rates.
++/*
++ * Fixed-rate quirk for devices that don't support UAC2 CS_RANGE.
++ *
++ * Line6 Helix series and Rode Rodecaster Pro don't implement CS_RANGE at all.
++ * TC Helicon DICE3 devices (GoXLR, Blender, GoXLR Mini) succeed the 2-byte
++ * count query but fail the full CS_RANGE read with EPROTO — the DICE3 USB
++ * core has a hardware-level bug where class IN transfers >2 bytes corrupt
++ * the data phase.
++ *
++ * All these devices are fixed at 48kHz.
+  */
+-static int line6_parse_audio_format_rates_quirk(struct snd_usb_audio *chip,
+-						struct audioformat *fp)
++static int snd_usb_fixed_rate_quirk(struct snd_usb_audio *chip,
++				    struct audioformat *fp)
+ {
+ 	switch (chip->usb_id) {
+ 	case USB_ID(0x0e41, 0x4241): /* Line6 Helix */
+@@ -435,6 +442,9 @@ static int line6_parse_audio_format_rates_quirk(struct snd_usb_audio *chip,
+ 	case USB_ID(0x0e41, 0x424a): /* Line6 Helix LT >= fw 2.82 */
+ 	case USB_ID(0x0e41, 0x424b): /* Line6 Pod Go */
+ 	case USB_ID(0x19f7, 0x0011): /* Rode Rodecaster Pro */
++	case USB_ID(0x1220, 0x8fe0): /* TC Helicon GoXLR */
++	case USB_ID(0x1220, 0x8fe1): /* TC Helicon Blender */
++	case USB_ID(0x1220, 0x8fe4): /* TC Helicon GoXLR Mini */
+ 		return set_fixed_rate(fp, 48000, SNDRV_PCM_RATE_48000);
+ 	}
+ 
+@@ -576,10 +586,10 @@ static int parse_audio_format_rates_v2v3(struct snd_usb_audio *chip,
+ 			      tmp, sizeof(tmp));
+ 
+ 	if (ret < 0) {
+-		/* line6 helix devices don't support UAC2_CS_CONTROL_SAM_FREQ call */
+-		ret_l6 = line6_parse_audio_format_rates_quirk(chip, fp);
++		/* Some devices don't support CS_RANGE at all */
++		ret_l6 = snd_usb_fixed_rate_quirk(chip, fp);
+ 		if (ret_l6 == -ENODEV) {
+-			/* no line6 device found continue showing the error */
++			/* not a fixed-rate device, continue showing the error */
+ 			dev_err(&dev->dev,
+ 				"%s(): unable to retrieve number of sample rates (clock %d)\n",
+ 				__func__, clock);
+@@ -611,6 +621,17 @@ static int parse_audio_format_rates_v2v3(struct snd_usb_audio *chip,
+ 			      data, data_size);
+ 
+ 	if (ret < 0) {
++		/* DICE3 USB core bug: class IN transfers >2 bytes corrupt the
++		 * data phase, so the full CS_RANGE fails despite the 2-byte
++		 * count query succeeding. Fall back to fixed rate. */
++		ret_l6 = snd_usb_fixed_rate_quirk(chip, fp);
++		if (ret_l6 == 0) {
++			dev_info(&dev->dev,
++				"%s(): full CS_RANGE failed, using predefined rate (clock %d)\n",
++				__func__, clock);
++			kfree(data);
++			return 0;
++		}
+ 		dev_err(&dev->dev,
+ 			"%s(): unable to retrieve sample rate range (clock %d)\n",
+ 				__func__, clock);
+diff --git a/sound/usb/quirks.c b/sound/usb/quirks.c
+index 6cddb73e23fd..3e13cd223e04 100644
+--- a/sound/usb/quirks.c
++++ b/sound/usb/quirks.c
+@@ -2354,6 +2354,12 @@ static const struct usb_audio_quirk_flags_table quirk_flags_table[] = {
+ 		   QUIRK_FLAG_SHARE_MEDIA_DEVICE | QUIRK_FLAG_ALIGN_TRANSFER),
+ 	DEVICE_FLG(0x1101, 0x0003, /* Audioengine D1 */
+ 		   QUIRK_FLAG_GET_SAMPLE_RATE),
++	DEVICE_FLG(0x1220, 0x8fe0, /* TC Helicon GoXLR */
++		   QUIRK_FLAG_FIXED_RATE),
++	DEVICE_FLG(0x1220, 0x8fe1, /* TC Helicon Blender */
++		   QUIRK_FLAG_FIXED_RATE),
++	DEVICE_FLG(0x1220, 0x8fe4, /* TC Helicon GoXLR Mini */
++		   QUIRK_FLAG_FIXED_RATE),
+ 	DEVICE_FLG(0x12d1, 0x3a07, /* Huawei Technologies Co., Ltd. */
+ 		   QUIRK_FLAG_MIXER_MIN_MUTE),
+ 	DEVICE_FLG(0x1224, 0x2a25, /* Jieli Technology USB PHY 2.0 */
+-- 
+2.51.0
+
