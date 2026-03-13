@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="utf-8" ?>
+
+<!-- Control Panel Configuration File          
+     For documentation see TUSBAudio_UserManual.pdf, section "Control Panel Customization".
+-->
+       
+<ControlPanel FormatVersionMajor="3" FormatVersionMinor="0">
+    <!-- ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ -->
+    <!-- GUID required to locate the driver DLL.
+         IMORTANT: This GUID must be equal to the one specified in the 
+         InterfaceGUID= statement in custom.ini. -->
+    <DriverInterfaceGUID>{9a7a4f65-0a10-408a-ab7b-8fe3e6c728a5}</DriverInterfaceGUID>     
+    <!-- ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ -->  
+    <NotificationArea>    
+        <Enable>True</Enable>    
+    </NotificationArea>
+    <!-- ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ -->
+    <PageOptions>
+        <!-- Supported values for this page: Hidden (default), Visible  -->
+        <Visibility>Hidden</Visibility>       
+    </PageOptions>
+    <!-- ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ -->
+    <PageStreamFormats>    
+        <!-- Supported values for this page: Hidden, Visible, Auto (default) -->
+        <Visibility>Auto</Visibility>         
+    </PageStreamFormats>
+    <!-- ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ -->
+    <PageClockSource>  
+        <!-- Supported values for this page: Hidden, Visible, Auto (default) -->
+        <Visibility>Auto</Visibility>
+    </PageClockSource>
+    <!-- ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ -->
+    <PageBufferSettings>    
+        <!-- Supported values for this page: Hidden, Visible (default) -->
+        <Visibility>Visible</Visibility>
+        <!-- ................................................................ -->
+        <BufferSettingsSection>
+            <DisplaySafeMode>True</DisplaySafeMode>
+        </BufferSettingsSection>
+    </PageBufferSettings>
+    <!-- ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ -->
+    <PageVolumeControl>    
+        <!-- Supported values for this page: Hidden, Visible, Auto (default) -->
+        <Visibility>Auto</Visibility>       
+    </PageVolumeControl>
+    <!-- ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ -->
+    <PageClientInfo>
+        <!-- Supported values for this page: Hidden, Visible (default) -->
+        <Visibility>Hidden</Visibility>   
+    </PageClientInfo>
+    <!-- ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ -->
+    <PageInfo>
+        <!-- Supported values for this page: Hidden, Visible (default) -->
+        <Visibility>Visible</Visibility>
+        <!-- ................................................................ -->
+        <TableDriverInfo>
+            <DisplayVersion>True</DisplayVersion>
+            <DisplayCopyright>False</DisplayCopyright>                
+        </TableDriverInfo>
+    </PageInfo>
+    <!-- ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ -->
+</ControlPanel>

@@ -1,0 +1,153 @@
+; 
+; GENERATED FILE. DO NOT EDIT!
+; 
+; setup information file
+; 
+; Copyright (c) 2009-2017 
+;
+
+;******************************************************************************
+; Version section
+;------------------------------------------------------------------------------
+[Version]
+Signature = "$Windows NT$"
+DriverVer = 02/20/2018,4.38.0.0
+Provider = %S_Provider%
+CatalogFile = blender_audioks.cat
+Class = MEDIA
+ClassGuid = {4d36e96c-e325-11ce-bfc1-08002be10318}
+
+[SignatureAttributes]
+blender_audioks.sys = SignatureAttributes.DRM
+
+[SignatureAttributes.DRM]
+DRMLevel = 1300
+
+;******************************************************************************
+; Manufacturer
+;------------------------------------------------------------------------------
+[Manufacturer]
+%S_Mfg% = _Models,ntamd64
+
+;******************************************************************************
+; Device Models
+;------------------------------------------------------------------------------
+[_Models.ntamd64]
+"TC-HELICON Blender" = _Install_0,TUSBAUDIO_ENUM\VID_1220&PID_8FE1&KS
+
+[_Install_0.ntamd64]
+Include = ks.inf,wdmaudio.inf
+Needs = KS.Registration,WDMAUDIO.Registration,mssysfx.CopyFilesAndRegister
+CopyFiles = _CopyFiles_sys
+AddReg = _AddReg_Common
+
+[_Install_0.ntamd64.HW]
+AddReg = _AddReg_0
+
+[_Install_0.ntamd64.Services]
+AddService = blender_audioks,0x00000002,_ServiceInst,_EventLog
+
+[_Install_0.ntamd64.Interfaces]
+AddInterface = %KSCATEGORY_AUDIO%,%KSNAME_Topology%,_KSTopology
+
+;******************************************************************************
+; Service installation
+;------------------------------------------------------------------------------
+[_ServiceInst]
+ServiceType = 1
+StartType = 3
+ErrorControl = 1
+ServiceBinary = %12%\blender_audioks.sys
+
+[_EventLog]
+AddReg = _AddReg_EventLog
+
+[_AddReg_EventLog]
+HKR,,"EventMessageFile",%REG_EXPAND_SZ%,"%%SystemRoot%%\System32\IoLogMsg.dll;%%SystemRoot%%\System32\drivers\blender_audioks.sys"
+HKR,,"TypesSupported",%REG_DWORD%,0x00000007
+
+;******************************************************************************
+; Interface registration
+;------------------------------------------------------------------------------
+[_KSTopology]
+AddReg = _AddReg_KSTopology
+
+[_AddReg_KSTopology]
+HKR,,"FriendlyName",,%S_TopologyDeviceName%
+HKR,,"CLSID",,%Proxy.CLSID%
+
+;******************************************************************************
+; Common settings
+;------------------------------------------------------------------------------
+[_AddReg_Common]
+HKR,,"Driver",,"blender_audioks.sys"
+HKR,,"AssociatedFilters",,"wdmaud,swmidi,redbook"
+HKR,Drivers,"SubClasses",,"wave,midi,mixer,aux"
+HKR,Drivers\wave\wdmaud.drv,"Driver",,"wdmaud.drv"
+HKR,Drivers\midi\wdmaud.drv,"Driver",,"wdmaud.drv"
+HKR,Drivers\mixer\wdmaud.drv,"Driver",,"wdmaud.drv"
+HKR,Drivers\aux\wdmaud.drv,"Driver",,"wdmaud.drv"
+HKR,Drivers\wave\wdmaud.drv,"Description",,%S_WdmAudDescription%
+HKR,Drivers\midi\wdmaud.drv,"Description",,%S_WdmAudDescription%
+HKR,Drivers\mixer\wdmaud.drv,"Description",,%S_WdmAudDescription%
+HKR,Drivers\aux\wdmaud.drv,"Description",,%S_WdmAudDescription%
+
+;******************************************************************************
+; Device settings for TC-HELICON Blender
+;------------------------------------------------------------------------------
+[_AddReg_0]
+
+;******************************************************************************
+; 0x00004000 = COPYFLG_IN_USE_RENAME, rename driver if in use
+;------------------------------------------------------------------------------
+[_CopyFiles_sys]
+blender_audioks.sys,,,0x00004000
+
+;******************************************************************************
+; Destination Directories
+;------------------------------------------------------------------------------
+[DestinationDirs]
+_CopyFiles_sys = 12
+
+;******************************************************************************
+; Installation Disk
+;------------------------------------------------------------------------------
+[SourceDisksNames.amd64]
+1 = %S_DiskName%
+
+;******************************************************************************
+; Files on the Installation Disk
+;------------------------------------------------------------------------------
+[SourceDisksFiles.amd64]
+blender_audioks.sys = 1
+
+;******************************************************************************
+; Strings
+;------------------------------------------------------------------------------
+[Strings]
+; 
+; Registry value types. DO NOT MODIFY!
+;
+REG_SZ = 0x00000000
+REG_EXPAND_SZ = 0x00020000
+REG_MULTI_SZ = 0x00010000
+REG_MULTI_SZ_APPEND = 0x00010008
+REG_DWORD = 0x00010001
+REG_BINARY = 0x00000001
+
+KSCATEGORY_AUDIO = "{6994AD04-93EF-11D0-A3CC-00A0C9223196}"
+KSCATEGORY_RENDER = "{65E8773E-8F56-11D0-A3B9-00A0C9223196}"
+KSCATEGORY_CAPTURE = "{65E8773D-8F56-11D0-A3B9-00A0C9223196}"
+KSCATEGORY_TOPOLOGY = "{DDA54A40-1E4C-11D1-A050-405705C10000}"
+Proxy.CLSID = "{17CCA71B-ECD7-11D0-B908-00A0C9223196}"
+KSNAME_Topology = "Topology"
+S_WdmAudDescription = "USB Audio Driver"
+S_TopologyDeviceName = "USB Audio Mixer"
+
+S_Provider = "TC-HELICON"
+S_Mfg = "TC-HELICON"
+S_DiskName = "Driver Installation Disk"
+
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;; EOF ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;

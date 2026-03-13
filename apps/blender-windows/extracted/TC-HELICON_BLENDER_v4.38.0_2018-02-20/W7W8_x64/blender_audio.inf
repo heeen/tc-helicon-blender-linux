@@ -1,0 +1,747 @@
+; 
+; GENERATED FILE. DO NOT EDIT!
+; 
+; setup information file
+; 
+; Copyright (c) 2009-2017 
+; 
+; built 2018-02-20 00:00:00
+;
+
+;******************************************************************************
+; Version section
+;------------------------------------------------------------------------------
+[Version]
+Signature = "$Windows NT$"
+DriverVer = 02/20/2018,4.38.0.0
+Provider = %S_Provider%
+CatalogFile = blender_audio.cat
+Class = blender_audio_sc
+ClassGuid = {3733c292-78c1-49be-a3ae-649eb94c07b6}
+
+[ClassInstall32.ntamd64]
+AddReg = _AddReg_ClassInstall
+
+[_AddReg_ClassInstall]
+HKR,,,,"TC-HELICON USB 2.0 Audio Devices"
+HKR,,"Icon",,"-20"
+
+;******************************************************************************
+; Manufacturer
+;------------------------------------------------------------------------------
+[Manufacturer]
+%S_Mfg% = _Models,ntamd64
+
+;******************************************************************************
+; Device Models
+;------------------------------------------------------------------------------
+[_Models.ntamd64]
+"TC-HELICON Blender" = _Install_0,USB\VID_1220&PID_8FE1
+
+[_Install_0.ntamd64]
+CopyFiles = _CopyFiles_sys
+
+[_Install_0.ntamd64.HW]
+AddReg = _AddReg_0
+
+[_Install_0.ntamd64.Services]
+AddService = blender_audio,0x00000002,_ServiceInst,_EventLog
+
+;******************************************************************************
+; Service installation
+;------------------------------------------------------------------------------
+[_ServiceInst]
+ServiceType = 1
+StartType = 3
+ErrorControl = 1
+ServiceBinary = %12%\blender_audio.sys
+DelReg = _DelReg_DriverParameters
+AddReg = _AddReg_MediaCategories,_AddReg_DriverParameters,_AddReg_LicenseData
+
+[_EventLog]
+AddReg = _AddReg_EventLog
+
+[_AddReg_EventLog]
+HKR,,"EventMessageFile",%REG_EXPAND_SZ%,"%%SystemRoot%%\System32\IoLogMsg.dll;%%SystemRoot%%\System32\drivers\blender_audio.sys"
+HKR,,"TypesSupported",%REG_DWORD%,0x00000007
+
+;******************************************************************************
+; Device settings for TC-HELICON Blender
+;------------------------------------------------------------------------------
+[_AddReg_0]
+HKR,,"InterfaceGUID",%REG_SZ%,"{9a7a4f65-0a10-408a-ab7b-8fe3e6c728a5}"
+
+
+;******************************************************************************
+; Custom names registration
+;------------------------------------------------------------------------------
+[_AddReg_MediaCategories]
+
+;******************************************************************************
+; Driver parameters
+;------------------------------------------------------------------------------
+[_DelReg_DriverParameters]
+HKR,Parameters
+HKR,ParametersDriver
+
+[_AddReg_DriverParameters]
+
+;******************************************************************************
+; License data
+;------------------------------------------------------------------------------
+[_AddReg_LicenseData]
+; license data record, created 2017-12-06 11:37:56
+HKR, ParametersDriver\License, format, %REG_DWORD%, 2
+HKR, ParametersDriver\License, customer, %REG_DWORD%, 1522
+HKR, ParametersDriver\License, options, %REG_DWORD%, 0x00000104  ; Version VidPid 
+HKR, ParametersDriver\License, begin, %REG_BINARY%, 00,00,00,00,00,00,00,00
+HKR, ParametersDriver\License, end, %REG_BINARY%, 00,00,00,00,00,00,00,00
+HKR, ParametersDriver\License, version, %REG_DWORD%, 0x00040026  ; v4.38
+HKR, ParametersDriver\License, features, %REG_BINARY%, 00,00,00,00,00,00,00,00  ; 0x0000000000000000
+HKR, ParametersDriver\License, restrictions, %REG_BINARY%, 00,00,00,00,00,00,00,00  ; 0x0000000000000000
+HKR, ParametersDriver\License, salt, %REG_BINARY%, 70,C2,11,6B,A9,C1,8A,9B
+HKR, ParametersDriver\License, tag, %REG_BINARY%, 1F,A1,26,42,EF,0E,DA,1A,DD,2F,A8,F0,5A,D4,76,78,D5,18,4B,56,41,15,DE,70,A9,BC,AA,C4,1C,C3,14,3D
+HKR, ParametersDriver\License\vidpid, count, %REG_DWORD%, 549
+HKR, ParametersDriver\License\vidpid\0000, vidpid, %REG_DWORD%, 0x139700D3  ; VID=0x1397 PID=0x00D3
+HKR, ParametersDriver\License\vidpid\0001, vidpid, %REG_DWORD%, 0x139700D4  ; VID=0x1397 PID=0x00D4
+HKR, ParametersDriver\License\vidpid\0002, vidpid, %REG_DWORD%, 0x13970500  ; VID=0x1397 PID=0x0500
+HKR, ParametersDriver\License\vidpid\0003, vidpid, %REG_DWORD%, 0x13970501  ; VID=0x1397 PID=0x0501
+HKR, ParametersDriver\License\vidpid\0004, vidpid, %REG_DWORD%, 0x13970502  ; VID=0x1397 PID=0x0502
+HKR, ParametersDriver\License\vidpid\0005, vidpid, %REG_DWORD%, 0x13970503  ; VID=0x1397 PID=0x0503
+HKR, ParametersDriver\License\vidpid\0006, vidpid, %REG_DWORD%, 0x13970504  ; VID=0x1397 PID=0x0504
+HKR, ParametersDriver\License\vidpid\0007, vidpid, %REG_DWORD%, 0x13970505  ; VID=0x1397 PID=0x0505
+HKR, ParametersDriver\License\vidpid\0008, vidpid, %REG_DWORD%, 0x13970506  ; VID=0x1397 PID=0x0506
+HKR, ParametersDriver\License\vidpid\0009, vidpid, %REG_DWORD%, 0x13970507  ; VID=0x1397 PID=0x0507
+HKR, ParametersDriver\License\vidpid\0010, vidpid, %REG_DWORD%, 0x13970508  ; VID=0x1397 PID=0x0508
+HKR, ParametersDriver\License\vidpid\0011, vidpid, %REG_DWORD%, 0x13970509  ; VID=0x1397 PID=0x0509
+HKR, ParametersDriver\License\vidpid\0012, vidpid, %REG_DWORD%, 0x1397050A  ; VID=0x1397 PID=0x050A
+HKR, ParametersDriver\License\vidpid\0013, vidpid, %REG_DWORD%, 0x1397050B  ; VID=0x1397 PID=0x050B
+HKR, ParametersDriver\License\vidpid\0014, vidpid, %REG_DWORD%, 0x1397050C  ; VID=0x1397 PID=0x050C
+HKR, ParametersDriver\License\vidpid\0015, vidpid, %REG_DWORD%, 0x1397050D  ; VID=0x1397 PID=0x050D
+HKR, ParametersDriver\License\vidpid\0016, vidpid, %REG_DWORD%, 0x1397050E  ; VID=0x1397 PID=0x050E
+HKR, ParametersDriver\License\vidpid\0017, vidpid, %REG_DWORD%, 0x1397050F  ; VID=0x1397 PID=0x050F
+HKR, ParametersDriver\License\vidpid\0018, vidpid, %REG_DWORD%, 0x13970510  ; VID=0x1397 PID=0x0510
+HKR, ParametersDriver\License\vidpid\0019, vidpid, %REG_DWORD%, 0x13970511  ; VID=0x1397 PID=0x0511
+HKR, ParametersDriver\License\vidpid\0020, vidpid, %REG_DWORD%, 0x13970512  ; VID=0x1397 PID=0x0512
+HKR, ParametersDriver\License\vidpid\0021, vidpid, %REG_DWORD%, 0x13970513  ; VID=0x1397 PID=0x0513
+HKR, ParametersDriver\License\vidpid\0022, vidpid, %REG_DWORD%, 0x13970514  ; VID=0x1397 PID=0x0514
+HKR, ParametersDriver\License\vidpid\0023, vidpid, %REG_DWORD%, 0x13970515  ; VID=0x1397 PID=0x0515
+HKR, ParametersDriver\License\vidpid\0024, vidpid, %REG_DWORD%, 0x13970516  ; VID=0x1397 PID=0x0516
+HKR, ParametersDriver\License\vidpid\0025, vidpid, %REG_DWORD%, 0x13970517  ; VID=0x1397 PID=0x0517
+HKR, ParametersDriver\License\vidpid\0026, vidpid, %REG_DWORD%, 0x13970518  ; VID=0x1397 PID=0x0518
+HKR, ParametersDriver\License\vidpid\0027, vidpid, %REG_DWORD%, 0x13970519  ; VID=0x1397 PID=0x0519
+HKR, ParametersDriver\License\vidpid\0028, vidpid, %REG_DWORD%, 0x1397051A  ; VID=0x1397 PID=0x051A
+HKR, ParametersDriver\License\vidpid\0029, vidpid, %REG_DWORD%, 0x1397051B  ; VID=0x1397 PID=0x051B
+HKR, ParametersDriver\License\vidpid\0030, vidpid, %REG_DWORD%, 0x1397051C  ; VID=0x1397 PID=0x051C
+HKR, ParametersDriver\License\vidpid\0031, vidpid, %REG_DWORD%, 0x1397051D  ; VID=0x1397 PID=0x051D
+HKR, ParametersDriver\License\vidpid\0032, vidpid, %REG_DWORD%, 0x1397051E  ; VID=0x1397 PID=0x051E
+HKR, ParametersDriver\License\vidpid\0033, vidpid, %REG_DWORD%, 0x1397051F  ; VID=0x1397 PID=0x051F
+HKR, ParametersDriver\License\vidpid\0034, vidpid, %REG_DWORD%, 0x13970520  ; VID=0x1397 PID=0x0520
+HKR, ParametersDriver\License\vidpid\0035, vidpid, %REG_DWORD%, 0x13970521  ; VID=0x1397 PID=0x0521
+HKR, ParametersDriver\License\vidpid\0036, vidpid, %REG_DWORD%, 0x13970522  ; VID=0x1397 PID=0x0522
+HKR, ParametersDriver\License\vidpid\0037, vidpid, %REG_DWORD%, 0x13970523  ; VID=0x1397 PID=0x0523
+HKR, ParametersDriver\License\vidpid\0038, vidpid, %REG_DWORD%, 0x13970524  ; VID=0x1397 PID=0x0524
+HKR, ParametersDriver\License\vidpid\0039, vidpid, %REG_DWORD%, 0x13970525  ; VID=0x1397 PID=0x0525
+HKR, ParametersDriver\License\vidpid\0040, vidpid, %REG_DWORD%, 0x13970526  ; VID=0x1397 PID=0x0526
+HKR, ParametersDriver\License\vidpid\0041, vidpid, %REG_DWORD%, 0x13970527  ; VID=0x1397 PID=0x0527
+HKR, ParametersDriver\License\vidpid\0042, vidpid, %REG_DWORD%, 0x13970528  ; VID=0x1397 PID=0x0528
+HKR, ParametersDriver\License\vidpid\0043, vidpid, %REG_DWORD%, 0x13970529  ; VID=0x1397 PID=0x0529
+HKR, ParametersDriver\License\vidpid\0044, vidpid, %REG_DWORD%, 0x1397052A  ; VID=0x1397 PID=0x052A
+HKR, ParametersDriver\License\vidpid\0045, vidpid, %REG_DWORD%, 0x1397052B  ; VID=0x1397 PID=0x052B
+HKR, ParametersDriver\License\vidpid\0046, vidpid, %REG_DWORD%, 0x1397052C  ; VID=0x1397 PID=0x052C
+HKR, ParametersDriver\License\vidpid\0047, vidpid, %REG_DWORD%, 0x1397052D  ; VID=0x1397 PID=0x052D
+HKR, ParametersDriver\License\vidpid\0048, vidpid, %REG_DWORD%, 0x1397052E  ; VID=0x1397 PID=0x052E
+HKR, ParametersDriver\License\vidpid\0049, vidpid, %REG_DWORD%, 0x1397052F  ; VID=0x1397 PID=0x052F
+HKR, ParametersDriver\License\vidpid\0050, vidpid, %REG_DWORD%, 0x13970530  ; VID=0x1397 PID=0x0530
+HKR, ParametersDriver\License\vidpid\0051, vidpid, %REG_DWORD%, 0x13970531  ; VID=0x1397 PID=0x0531
+HKR, ParametersDriver\License\vidpid\0052, vidpid, %REG_DWORD%, 0x13970532  ; VID=0x1397 PID=0x0532
+HKR, ParametersDriver\License\vidpid\0053, vidpid, %REG_DWORD%, 0x13970533  ; VID=0x1397 PID=0x0533
+HKR, ParametersDriver\License\vidpid\0054, vidpid, %REG_DWORD%, 0x13970534  ; VID=0x1397 PID=0x0534
+HKR, ParametersDriver\License\vidpid\0055, vidpid, %REG_DWORD%, 0x13970535  ; VID=0x1397 PID=0x0535
+HKR, ParametersDriver\License\vidpid\0056, vidpid, %REG_DWORD%, 0x13970536  ; VID=0x1397 PID=0x0536
+HKR, ParametersDriver\License\vidpid\0057, vidpid, %REG_DWORD%, 0x13970537  ; VID=0x1397 PID=0x0537
+HKR, ParametersDriver\License\vidpid\0058, vidpid, %REG_DWORD%, 0x13970538  ; VID=0x1397 PID=0x0538
+HKR, ParametersDriver\License\vidpid\0059, vidpid, %REG_DWORD%, 0x13970539  ; VID=0x1397 PID=0x0539
+HKR, ParametersDriver\License\vidpid\0060, vidpid, %REG_DWORD%, 0x1397053A  ; VID=0x1397 PID=0x053A
+HKR, ParametersDriver\License\vidpid\0061, vidpid, %REG_DWORD%, 0x1397053B  ; VID=0x1397 PID=0x053B
+HKR, ParametersDriver\License\vidpid\0062, vidpid, %REG_DWORD%, 0x1397053C  ; VID=0x1397 PID=0x053C
+HKR, ParametersDriver\License\vidpid\0063, vidpid, %REG_DWORD%, 0x1397053D  ; VID=0x1397 PID=0x053D
+HKR, ParametersDriver\License\vidpid\0064, vidpid, %REG_DWORD%, 0x1397053E  ; VID=0x1397 PID=0x053E
+HKR, ParametersDriver\License\vidpid\0065, vidpid, %REG_DWORD%, 0x1397053F  ; VID=0x1397 PID=0x053F
+HKR, ParametersDriver\License\vidpid\0066, vidpid, %REG_DWORD%, 0x13970540  ; VID=0x1397 PID=0x0540
+HKR, ParametersDriver\License\vidpid\0067, vidpid, %REG_DWORD%, 0x13970541  ; VID=0x1397 PID=0x0541
+HKR, ParametersDriver\License\vidpid\0068, vidpid, %REG_DWORD%, 0x13970542  ; VID=0x1397 PID=0x0542
+HKR, ParametersDriver\License\vidpid\0069, vidpid, %REG_DWORD%, 0x13970543  ; VID=0x1397 PID=0x0543
+HKR, ParametersDriver\License\vidpid\0070, vidpid, %REG_DWORD%, 0x13970544  ; VID=0x1397 PID=0x0544
+HKR, ParametersDriver\License\vidpid\0071, vidpid, %REG_DWORD%, 0x13970545  ; VID=0x1397 PID=0x0545
+HKR, ParametersDriver\License\vidpid\0072, vidpid, %REG_DWORD%, 0x13970546  ; VID=0x1397 PID=0x0546
+HKR, ParametersDriver\License\vidpid\0073, vidpid, %REG_DWORD%, 0x13970547  ; VID=0x1397 PID=0x0547
+HKR, ParametersDriver\License\vidpid\0074, vidpid, %REG_DWORD%, 0x13970548  ; VID=0x1397 PID=0x0548
+HKR, ParametersDriver\License\vidpid\0075, vidpid, %REG_DWORD%, 0x13970549  ; VID=0x1397 PID=0x0549
+HKR, ParametersDriver\License\vidpid\0076, vidpid, %REG_DWORD%, 0x1397054A  ; VID=0x1397 PID=0x054A
+HKR, ParametersDriver\License\vidpid\0077, vidpid, %REG_DWORD%, 0x1397054B  ; VID=0x1397 PID=0x054B
+HKR, ParametersDriver\License\vidpid\0078, vidpid, %REG_DWORD%, 0x1397054C  ; VID=0x1397 PID=0x054C
+HKR, ParametersDriver\License\vidpid\0079, vidpid, %REG_DWORD%, 0x1397054D  ; VID=0x1397 PID=0x054D
+HKR, ParametersDriver\License\vidpid\0080, vidpid, %REG_DWORD%, 0x1397054E  ; VID=0x1397 PID=0x054E
+HKR, ParametersDriver\License\vidpid\0081, vidpid, %REG_DWORD%, 0x1397054F  ; VID=0x1397 PID=0x054F
+HKR, ParametersDriver\License\vidpid\0082, vidpid, %REG_DWORD%, 0x13970550  ; VID=0x1397 PID=0x0550
+HKR, ParametersDriver\License\vidpid\0083, vidpid, %REG_DWORD%, 0x13970551  ; VID=0x1397 PID=0x0551
+HKR, ParametersDriver\License\vidpid\0084, vidpid, %REG_DWORD%, 0x13970552  ; VID=0x1397 PID=0x0552
+HKR, ParametersDriver\License\vidpid\0085, vidpid, %REG_DWORD%, 0x13970553  ; VID=0x1397 PID=0x0553
+HKR, ParametersDriver\License\vidpid\0086, vidpid, %REG_DWORD%, 0x13970554  ; VID=0x1397 PID=0x0554
+HKR, ParametersDriver\License\vidpid\0087, vidpid, %REG_DWORD%, 0x13970555  ; VID=0x1397 PID=0x0555
+HKR, ParametersDriver\License\vidpid\0088, vidpid, %REG_DWORD%, 0x13970556  ; VID=0x1397 PID=0x0556
+HKR, ParametersDriver\License\vidpid\0089, vidpid, %REG_DWORD%, 0x13970557  ; VID=0x1397 PID=0x0557
+HKR, ParametersDriver\License\vidpid\0090, vidpid, %REG_DWORD%, 0x13970558  ; VID=0x1397 PID=0x0558
+HKR, ParametersDriver\License\vidpid\0091, vidpid, %REG_DWORD%, 0x13970559  ; VID=0x1397 PID=0x0559
+HKR, ParametersDriver\License\vidpid\0092, vidpid, %REG_DWORD%, 0x1397055A  ; VID=0x1397 PID=0x055A
+HKR, ParametersDriver\License\vidpid\0093, vidpid, %REG_DWORD%, 0x1397055B  ; VID=0x1397 PID=0x055B
+HKR, ParametersDriver\License\vidpid\0094, vidpid, %REG_DWORD%, 0x1397055C  ; VID=0x1397 PID=0x055C
+HKR, ParametersDriver\License\vidpid\0095, vidpid, %REG_DWORD%, 0x1397055D  ; VID=0x1397 PID=0x055D
+HKR, ParametersDriver\License\vidpid\0096, vidpid, %REG_DWORD%, 0x1397055E  ; VID=0x1397 PID=0x055E
+HKR, ParametersDriver\License\vidpid\0097, vidpid, %REG_DWORD%, 0x1397055F  ; VID=0x1397 PID=0x055F
+HKR, ParametersDriver\License\vidpid\0098, vidpid, %REG_DWORD%, 0x13970560  ; VID=0x1397 PID=0x0560
+HKR, ParametersDriver\License\vidpid\0099, vidpid, %REG_DWORD%, 0x13970561  ; VID=0x1397 PID=0x0561
+HKR, ParametersDriver\License\vidpid\0100, vidpid, %REG_DWORD%, 0x13970562  ; VID=0x1397 PID=0x0562
+HKR, ParametersDriver\License\vidpid\0101, vidpid, %REG_DWORD%, 0x13970563  ; VID=0x1397 PID=0x0563
+HKR, ParametersDriver\License\vidpid\0102, vidpid, %REG_DWORD%, 0x13970564  ; VID=0x1397 PID=0x0564
+HKR, ParametersDriver\License\vidpid\0103, vidpid, %REG_DWORD%, 0x13970565  ; VID=0x1397 PID=0x0565
+HKR, ParametersDriver\License\vidpid\0104, vidpid, %REG_DWORD%, 0x13970566  ; VID=0x1397 PID=0x0566
+HKR, ParametersDriver\License\vidpid\0105, vidpid, %REG_DWORD%, 0x13970567  ; VID=0x1397 PID=0x0567
+HKR, ParametersDriver\License\vidpid\0106, vidpid, %REG_DWORD%, 0x13970568  ; VID=0x1397 PID=0x0568
+HKR, ParametersDriver\License\vidpid\0107, vidpid, %REG_DWORD%, 0x13970569  ; VID=0x1397 PID=0x0569
+HKR, ParametersDriver\License\vidpid\0108, vidpid, %REG_DWORD%, 0x1397056A  ; VID=0x1397 PID=0x056A
+HKR, ParametersDriver\License\vidpid\0109, vidpid, %REG_DWORD%, 0x1397056B  ; VID=0x1397 PID=0x056B
+HKR, ParametersDriver\License\vidpid\0110, vidpid, %REG_DWORD%, 0x1397056C  ; VID=0x1397 PID=0x056C
+HKR, ParametersDriver\License\vidpid\0111, vidpid, %REG_DWORD%, 0x1397056D  ; VID=0x1397 PID=0x056D
+HKR, ParametersDriver\License\vidpid\0112, vidpid, %REG_DWORD%, 0x1397056E  ; VID=0x1397 PID=0x056E
+HKR, ParametersDriver\License\vidpid\0113, vidpid, %REG_DWORD%, 0x1397056F  ; VID=0x1397 PID=0x056F
+HKR, ParametersDriver\License\vidpid\0114, vidpid, %REG_DWORD%, 0x13970570  ; VID=0x1397 PID=0x0570
+HKR, ParametersDriver\License\vidpid\0115, vidpid, %REG_DWORD%, 0x13970571  ; VID=0x1397 PID=0x0571
+HKR, ParametersDriver\License\vidpid\0116, vidpid, %REG_DWORD%, 0x13970572  ; VID=0x1397 PID=0x0572
+HKR, ParametersDriver\License\vidpid\0117, vidpid, %REG_DWORD%, 0x13970573  ; VID=0x1397 PID=0x0573
+HKR, ParametersDriver\License\vidpid\0118, vidpid, %REG_DWORD%, 0x13970574  ; VID=0x1397 PID=0x0574
+HKR, ParametersDriver\License\vidpid\0119, vidpid, %REG_DWORD%, 0x13970575  ; VID=0x1397 PID=0x0575
+HKR, ParametersDriver\License\vidpid\0120, vidpid, %REG_DWORD%, 0x13970576  ; VID=0x1397 PID=0x0576
+HKR, ParametersDriver\License\vidpid\0121, vidpid, %REG_DWORD%, 0x13970577  ; VID=0x1397 PID=0x0577
+HKR, ParametersDriver\License\vidpid\0122, vidpid, %REG_DWORD%, 0x13970578  ; VID=0x1397 PID=0x0578
+HKR, ParametersDriver\License\vidpid\0123, vidpid, %REG_DWORD%, 0x13970579  ; VID=0x1397 PID=0x0579
+HKR, ParametersDriver\License\vidpid\0124, vidpid, %REG_DWORD%, 0x1397057A  ; VID=0x1397 PID=0x057A
+HKR, ParametersDriver\License\vidpid\0125, vidpid, %REG_DWORD%, 0x1397057B  ; VID=0x1397 PID=0x057B
+HKR, ParametersDriver\License\vidpid\0126, vidpid, %REG_DWORD%, 0x1397057C  ; VID=0x1397 PID=0x057C
+HKR, ParametersDriver\License\vidpid\0127, vidpid, %REG_DWORD%, 0x1397057D  ; VID=0x1397 PID=0x057D
+HKR, ParametersDriver\License\vidpid\0128, vidpid, %REG_DWORD%, 0x1397057E  ; VID=0x1397 PID=0x057E
+HKR, ParametersDriver\License\vidpid\0129, vidpid, %REG_DWORD%, 0x1397057F  ; VID=0x1397 PID=0x057F
+HKR, ParametersDriver\License\vidpid\0130, vidpid, %REG_DWORD%, 0x13970580  ; VID=0x1397 PID=0x0580
+HKR, ParametersDriver\License\vidpid\0131, vidpid, %REG_DWORD%, 0x13970581  ; VID=0x1397 PID=0x0581
+HKR, ParametersDriver\License\vidpid\0132, vidpid, %REG_DWORD%, 0x13970582  ; VID=0x1397 PID=0x0582
+HKR, ParametersDriver\License\vidpid\0133, vidpid, %REG_DWORD%, 0x13970583  ; VID=0x1397 PID=0x0583
+HKR, ParametersDriver\License\vidpid\0134, vidpid, %REG_DWORD%, 0x13970584  ; VID=0x1397 PID=0x0584
+HKR, ParametersDriver\License\vidpid\0135, vidpid, %REG_DWORD%, 0x13970585  ; VID=0x1397 PID=0x0585
+HKR, ParametersDriver\License\vidpid\0136, vidpid, %REG_DWORD%, 0x13970586  ; VID=0x1397 PID=0x0586
+HKR, ParametersDriver\License\vidpid\0137, vidpid, %REG_DWORD%, 0x13970587  ; VID=0x1397 PID=0x0587
+HKR, ParametersDriver\License\vidpid\0138, vidpid, %REG_DWORD%, 0x13970588  ; VID=0x1397 PID=0x0588
+HKR, ParametersDriver\License\vidpid\0139, vidpid, %REG_DWORD%, 0x13970589  ; VID=0x1397 PID=0x0589
+HKR, ParametersDriver\License\vidpid\0140, vidpid, %REG_DWORD%, 0x1397058A  ; VID=0x1397 PID=0x058A
+HKR, ParametersDriver\License\vidpid\0141, vidpid, %REG_DWORD%, 0x1397058B  ; VID=0x1397 PID=0x058B
+HKR, ParametersDriver\License\vidpid\0142, vidpid, %REG_DWORD%, 0x1397058C  ; VID=0x1397 PID=0x058C
+HKR, ParametersDriver\License\vidpid\0143, vidpid, %REG_DWORD%, 0x1397058D  ; VID=0x1397 PID=0x058D
+HKR, ParametersDriver\License\vidpid\0144, vidpid, %REG_DWORD%, 0x1397058E  ; VID=0x1397 PID=0x058E
+HKR, ParametersDriver\License\vidpid\0145, vidpid, %REG_DWORD%, 0x1397058F  ; VID=0x1397 PID=0x058F
+HKR, ParametersDriver\License\vidpid\0146, vidpid, %REG_DWORD%, 0x13970590  ; VID=0x1397 PID=0x0590
+HKR, ParametersDriver\License\vidpid\0147, vidpid, %REG_DWORD%, 0x13970591  ; VID=0x1397 PID=0x0591
+HKR, ParametersDriver\License\vidpid\0148, vidpid, %REG_DWORD%, 0x13970592  ; VID=0x1397 PID=0x0592
+HKR, ParametersDriver\License\vidpid\0149, vidpid, %REG_DWORD%, 0x13970593  ; VID=0x1397 PID=0x0593
+HKR, ParametersDriver\License\vidpid\0150, vidpid, %REG_DWORD%, 0x13970594  ; VID=0x1397 PID=0x0594
+HKR, ParametersDriver\License\vidpid\0151, vidpid, %REG_DWORD%, 0x13970595  ; VID=0x1397 PID=0x0595
+HKR, ParametersDriver\License\vidpid\0152, vidpid, %REG_DWORD%, 0x13970596  ; VID=0x1397 PID=0x0596
+HKR, ParametersDriver\License\vidpid\0153, vidpid, %REG_DWORD%, 0x13970597  ; VID=0x1397 PID=0x0597
+HKR, ParametersDriver\License\vidpid\0154, vidpid, %REG_DWORD%, 0x13970598  ; VID=0x1397 PID=0x0598
+HKR, ParametersDriver\License\vidpid\0155, vidpid, %REG_DWORD%, 0x13970599  ; VID=0x1397 PID=0x0599
+HKR, ParametersDriver\License\vidpid\0156, vidpid, %REG_DWORD%, 0x1397059A  ; VID=0x1397 PID=0x059A
+HKR, ParametersDriver\License\vidpid\0157, vidpid, %REG_DWORD%, 0x1397059B  ; VID=0x1397 PID=0x059B
+HKR, ParametersDriver\License\vidpid\0158, vidpid, %REG_DWORD%, 0x1397059C  ; VID=0x1397 PID=0x059C
+HKR, ParametersDriver\License\vidpid\0159, vidpid, %REG_DWORD%, 0x1397059D  ; VID=0x1397 PID=0x059D
+HKR, ParametersDriver\License\vidpid\0160, vidpid, %REG_DWORD%, 0x1397059E  ; VID=0x1397 PID=0x059E
+HKR, ParametersDriver\License\vidpid\0161, vidpid, %REG_DWORD%, 0x1397059F  ; VID=0x1397 PID=0x059F
+HKR, ParametersDriver\License\vidpid\0162, vidpid, %REG_DWORD%, 0x139705A0  ; VID=0x1397 PID=0x05A0
+HKR, ParametersDriver\License\vidpid\0163, vidpid, %REG_DWORD%, 0x139705A1  ; VID=0x1397 PID=0x05A1
+HKR, ParametersDriver\License\vidpid\0164, vidpid, %REG_DWORD%, 0x139705A2  ; VID=0x1397 PID=0x05A2
+HKR, ParametersDriver\License\vidpid\0165, vidpid, %REG_DWORD%, 0x139705A3  ; VID=0x1397 PID=0x05A3
+HKR, ParametersDriver\License\vidpid\0166, vidpid, %REG_DWORD%, 0x139705A4  ; VID=0x1397 PID=0x05A4
+HKR, ParametersDriver\License\vidpid\0167, vidpid, %REG_DWORD%, 0x139705A5  ; VID=0x1397 PID=0x05A5
+HKR, ParametersDriver\License\vidpid\0168, vidpid, %REG_DWORD%, 0x139705A6  ; VID=0x1397 PID=0x05A6
+HKR, ParametersDriver\License\vidpid\0169, vidpid, %REG_DWORD%, 0x139705A7  ; VID=0x1397 PID=0x05A7
+HKR, ParametersDriver\License\vidpid\0170, vidpid, %REG_DWORD%, 0x139705A8  ; VID=0x1397 PID=0x05A8
+HKR, ParametersDriver\License\vidpid\0171, vidpid, %REG_DWORD%, 0x139705A9  ; VID=0x1397 PID=0x05A9
+HKR, ParametersDriver\License\vidpid\0172, vidpid, %REG_DWORD%, 0x139705AA  ; VID=0x1397 PID=0x05AA
+HKR, ParametersDriver\License\vidpid\0173, vidpid, %REG_DWORD%, 0x139705AB  ; VID=0x1397 PID=0x05AB
+HKR, ParametersDriver\License\vidpid\0174, vidpid, %REG_DWORD%, 0x139705AC  ; VID=0x1397 PID=0x05AC
+HKR, ParametersDriver\License\vidpid\0175, vidpid, %REG_DWORD%, 0x139705AD  ; VID=0x1397 PID=0x05AD
+HKR, ParametersDriver\License\vidpid\0176, vidpid, %REG_DWORD%, 0x139705AE  ; VID=0x1397 PID=0x05AE
+HKR, ParametersDriver\License\vidpid\0177, vidpid, %REG_DWORD%, 0x139705AF  ; VID=0x1397 PID=0x05AF
+HKR, ParametersDriver\License\vidpid\0178, vidpid, %REG_DWORD%, 0x139705B0  ; VID=0x1397 PID=0x05B0
+HKR, ParametersDriver\License\vidpid\0179, vidpid, %REG_DWORD%, 0x139705B1  ; VID=0x1397 PID=0x05B1
+HKR, ParametersDriver\License\vidpid\0180, vidpid, %REG_DWORD%, 0x139705B2  ; VID=0x1397 PID=0x05B2
+HKR, ParametersDriver\License\vidpid\0181, vidpid, %REG_DWORD%, 0x139705B3  ; VID=0x1397 PID=0x05B3
+HKR, ParametersDriver\License\vidpid\0182, vidpid, %REG_DWORD%, 0x139705B4  ; VID=0x1397 PID=0x05B4
+HKR, ParametersDriver\License\vidpid\0183, vidpid, %REG_DWORD%, 0x139705B5  ; VID=0x1397 PID=0x05B5
+HKR, ParametersDriver\License\vidpid\0184, vidpid, %REG_DWORD%, 0x139705B6  ; VID=0x1397 PID=0x05B6
+HKR, ParametersDriver\License\vidpid\0185, vidpid, %REG_DWORD%, 0x139705B7  ; VID=0x1397 PID=0x05B7
+HKR, ParametersDriver\License\vidpid\0186, vidpid, %REG_DWORD%, 0x139705B8  ; VID=0x1397 PID=0x05B8
+HKR, ParametersDriver\License\vidpid\0187, vidpid, %REG_DWORD%, 0x139705B9  ; VID=0x1397 PID=0x05B9
+HKR, ParametersDriver\License\vidpid\0188, vidpid, %REG_DWORD%, 0x139705BA  ; VID=0x1397 PID=0x05BA
+HKR, ParametersDriver\License\vidpid\0189, vidpid, %REG_DWORD%, 0x139705BB  ; VID=0x1397 PID=0x05BB
+HKR, ParametersDriver\License\vidpid\0190, vidpid, %REG_DWORD%, 0x139705BC  ; VID=0x1397 PID=0x05BC
+HKR, ParametersDriver\License\vidpid\0191, vidpid, %REG_DWORD%, 0x139705BD  ; VID=0x1397 PID=0x05BD
+HKR, ParametersDriver\License\vidpid\0192, vidpid, %REG_DWORD%, 0x139705BE  ; VID=0x1397 PID=0x05BE
+HKR, ParametersDriver\License\vidpid\0193, vidpid, %REG_DWORD%, 0x139705BF  ; VID=0x1397 PID=0x05BF
+HKR, ParametersDriver\License\vidpid\0194, vidpid, %REG_DWORD%, 0x139705C0  ; VID=0x1397 PID=0x05C0
+HKR, ParametersDriver\License\vidpid\0195, vidpid, %REG_DWORD%, 0x139705C1  ; VID=0x1397 PID=0x05C1
+HKR, ParametersDriver\License\vidpid\0196, vidpid, %REG_DWORD%, 0x139705C2  ; VID=0x1397 PID=0x05C2
+HKR, ParametersDriver\License\vidpid\0197, vidpid, %REG_DWORD%, 0x139705C3  ; VID=0x1397 PID=0x05C3
+HKR, ParametersDriver\License\vidpid\0198, vidpid, %REG_DWORD%, 0x139705C4  ; VID=0x1397 PID=0x05C4
+HKR, ParametersDriver\License\vidpid\0199, vidpid, %REG_DWORD%, 0x139705C5  ; VID=0x1397 PID=0x05C5
+HKR, ParametersDriver\License\vidpid\0200, vidpid, %REG_DWORD%, 0x139705C6  ; VID=0x1397 PID=0x05C6
+HKR, ParametersDriver\License\vidpid\0201, vidpid, %REG_DWORD%, 0x139705C7  ; VID=0x1397 PID=0x05C7
+HKR, ParametersDriver\License\vidpid\0202, vidpid, %REG_DWORD%, 0x139705C8  ; VID=0x1397 PID=0x05C8
+HKR, ParametersDriver\License\vidpid\0203, vidpid, %REG_DWORD%, 0x139705C9  ; VID=0x1397 PID=0x05C9
+HKR, ParametersDriver\License\vidpid\0204, vidpid, %REG_DWORD%, 0x139705CA  ; VID=0x1397 PID=0x05CA
+HKR, ParametersDriver\License\vidpid\0205, vidpid, %REG_DWORD%, 0x139705CB  ; VID=0x1397 PID=0x05CB
+HKR, ParametersDriver\License\vidpid\0206, vidpid, %REG_DWORD%, 0x139705CC  ; VID=0x1397 PID=0x05CC
+HKR, ParametersDriver\License\vidpid\0207, vidpid, %REG_DWORD%, 0x139705CD  ; VID=0x1397 PID=0x05CD
+HKR, ParametersDriver\License\vidpid\0208, vidpid, %REG_DWORD%, 0x139705CE  ; VID=0x1397 PID=0x05CE
+HKR, ParametersDriver\License\vidpid\0209, vidpid, %REG_DWORD%, 0x139705CF  ; VID=0x1397 PID=0x05CF
+HKR, ParametersDriver\License\vidpid\0210, vidpid, %REG_DWORD%, 0x139705D0  ; VID=0x1397 PID=0x05D0
+HKR, ParametersDriver\License\vidpid\0211, vidpid, %REG_DWORD%, 0x139705D1  ; VID=0x1397 PID=0x05D1
+HKR, ParametersDriver\License\vidpid\0212, vidpid, %REG_DWORD%, 0x139705D2  ; VID=0x1397 PID=0x05D2
+HKR, ParametersDriver\License\vidpid\0213, vidpid, %REG_DWORD%, 0x139705D3  ; VID=0x1397 PID=0x05D3
+HKR, ParametersDriver\License\vidpid\0214, vidpid, %REG_DWORD%, 0x139705D4  ; VID=0x1397 PID=0x05D4
+HKR, ParametersDriver\License\vidpid\0215, vidpid, %REG_DWORD%, 0x139705D5  ; VID=0x1397 PID=0x05D5
+HKR, ParametersDriver\License\vidpid\0216, vidpid, %REG_DWORD%, 0x139705D6  ; VID=0x1397 PID=0x05D6
+HKR, ParametersDriver\License\vidpid\0217, vidpid, %REG_DWORD%, 0x139705D7  ; VID=0x1397 PID=0x05D7
+HKR, ParametersDriver\License\vidpid\0218, vidpid, %REG_DWORD%, 0x139705D8  ; VID=0x1397 PID=0x05D8
+HKR, ParametersDriver\License\vidpid\0219, vidpid, %REG_DWORD%, 0x139705D9  ; VID=0x1397 PID=0x05D9
+HKR, ParametersDriver\License\vidpid\0220, vidpid, %REG_DWORD%, 0x139705DA  ; VID=0x1397 PID=0x05DA
+HKR, ParametersDriver\License\vidpid\0221, vidpid, %REG_DWORD%, 0x139705DB  ; VID=0x1397 PID=0x05DB
+HKR, ParametersDriver\License\vidpid\0222, vidpid, %REG_DWORD%, 0x139705DC  ; VID=0x1397 PID=0x05DC
+HKR, ParametersDriver\License\vidpid\0223, vidpid, %REG_DWORD%, 0x139705DD  ; VID=0x1397 PID=0x05DD
+HKR, ParametersDriver\License\vidpid\0224, vidpid, %REG_DWORD%, 0x139705DE  ; VID=0x1397 PID=0x05DE
+HKR, ParametersDriver\License\vidpid\0225, vidpid, %REG_DWORD%, 0x139705DF  ; VID=0x1397 PID=0x05DF
+HKR, ParametersDriver\License\vidpid\0226, vidpid, %REG_DWORD%, 0x139705E0  ; VID=0x1397 PID=0x05E0
+HKR, ParametersDriver\License\vidpid\0227, vidpid, %REG_DWORD%, 0x139705E1  ; VID=0x1397 PID=0x05E1
+HKR, ParametersDriver\License\vidpid\0228, vidpid, %REG_DWORD%, 0x139705E2  ; VID=0x1397 PID=0x05E2
+HKR, ParametersDriver\License\vidpid\0229, vidpid, %REG_DWORD%, 0x139705E3  ; VID=0x1397 PID=0x05E3
+HKR, ParametersDriver\License\vidpid\0230, vidpid, %REG_DWORD%, 0x139705E4  ; VID=0x1397 PID=0x05E4
+HKR, ParametersDriver\License\vidpid\0231, vidpid, %REG_DWORD%, 0x139705E5  ; VID=0x1397 PID=0x05E5
+HKR, ParametersDriver\License\vidpid\0232, vidpid, %REG_DWORD%, 0x139705E6  ; VID=0x1397 PID=0x05E6
+HKR, ParametersDriver\License\vidpid\0233, vidpid, %REG_DWORD%, 0x139705E7  ; VID=0x1397 PID=0x05E7
+HKR, ParametersDriver\License\vidpid\0234, vidpid, %REG_DWORD%, 0x139705E8  ; VID=0x1397 PID=0x05E8
+HKR, ParametersDriver\License\vidpid\0235, vidpid, %REG_DWORD%, 0x139705E9  ; VID=0x1397 PID=0x05E9
+HKR, ParametersDriver\License\vidpid\0236, vidpid, %REG_DWORD%, 0x139705EA  ; VID=0x1397 PID=0x05EA
+HKR, ParametersDriver\License\vidpid\0237, vidpid, %REG_DWORD%, 0x139705EB  ; VID=0x1397 PID=0x05EB
+HKR, ParametersDriver\License\vidpid\0238, vidpid, %REG_DWORD%, 0x139705EC  ; VID=0x1397 PID=0x05EC
+HKR, ParametersDriver\License\vidpid\0239, vidpid, %REG_DWORD%, 0x139705ED  ; VID=0x1397 PID=0x05ED
+HKR, ParametersDriver\License\vidpid\0240, vidpid, %REG_DWORD%, 0x139705EE  ; VID=0x1397 PID=0x05EE
+HKR, ParametersDriver\License\vidpid\0241, vidpid, %REG_DWORD%, 0x139705EF  ; VID=0x1397 PID=0x05EF
+HKR, ParametersDriver\License\vidpid\0242, vidpid, %REG_DWORD%, 0x139705F0  ; VID=0x1397 PID=0x05F0
+HKR, ParametersDriver\License\vidpid\0243, vidpid, %REG_DWORD%, 0x139705F1  ; VID=0x1397 PID=0x05F1
+HKR, ParametersDriver\License\vidpid\0244, vidpid, %REG_DWORD%, 0x139705F2  ; VID=0x1397 PID=0x05F2
+HKR, ParametersDriver\License\vidpid\0245, vidpid, %REG_DWORD%, 0x139705F3  ; VID=0x1397 PID=0x05F3
+HKR, ParametersDriver\License\vidpid\0246, vidpid, %REG_DWORD%, 0x139705F4  ; VID=0x1397 PID=0x05F4
+HKR, ParametersDriver\License\vidpid\0247, vidpid, %REG_DWORD%, 0x139705F5  ; VID=0x1397 PID=0x05F5
+HKR, ParametersDriver\License\vidpid\0248, vidpid, %REG_DWORD%, 0x139705F6  ; VID=0x1397 PID=0x05F6
+HKR, ParametersDriver\License\vidpid\0249, vidpid, %REG_DWORD%, 0x139705F7  ; VID=0x1397 PID=0x05F7
+HKR, ParametersDriver\License\vidpid\0250, vidpid, %REG_DWORD%, 0x139705F8  ; VID=0x1397 PID=0x05F8
+HKR, ParametersDriver\License\vidpid\0251, vidpid, %REG_DWORD%, 0x139705F9  ; VID=0x1397 PID=0x05F9
+HKR, ParametersDriver\License\vidpid\0252, vidpid, %REG_DWORD%, 0x139705FA  ; VID=0x1397 PID=0x05FA
+HKR, ParametersDriver\License\vidpid\0253, vidpid, %REG_DWORD%, 0x139705FB  ; VID=0x1397 PID=0x05FB
+HKR, ParametersDriver\License\vidpid\0254, vidpid, %REG_DWORD%, 0x139705FC  ; VID=0x1397 PID=0x05FC
+HKR, ParametersDriver\License\vidpid\0255, vidpid, %REG_DWORD%, 0x139705FD  ; VID=0x1397 PID=0x05FD
+HKR, ParametersDriver\License\vidpid\0256, vidpid, %REG_DWORD%, 0x139705FE  ; VID=0x1397 PID=0x05FE
+HKR, ParametersDriver\License\vidpid\0257, vidpid, %REG_DWORD%, 0x139705FF  ; VID=0x1397 PID=0x05FF
+HKR, ParametersDriver\License\vidpid\0258, vidpid, %REG_DWORD%, 0x26A00003  ; VID=0x26A0 PID=0x0003
+HKR, ParametersDriver\License\vidpid\0259, vidpid, %REG_DWORD%, 0x26A00004  ; VID=0x26A0 PID=0x0004
+HKR, ParametersDriver\License\vidpid\0260, vidpid, %REG_DWORD%, 0x26A00009  ; VID=0x26A0 PID=0x0009
+HKR, ParametersDriver\License\vidpid\0261, vidpid, %REG_DWORD%, 0x26A00500  ; VID=0x26A0 PID=0x0500
+HKR, ParametersDriver\License\vidpid\0262, vidpid, %REG_DWORD%, 0x26A00501  ; VID=0x26A0 PID=0x0501
+HKR, ParametersDriver\License\vidpid\0263, vidpid, %REG_DWORD%, 0x26A00502  ; VID=0x26A0 PID=0x0502
+HKR, ParametersDriver\License\vidpid\0264, vidpid, %REG_DWORD%, 0x26A00503  ; VID=0x26A0 PID=0x0503
+HKR, ParametersDriver\License\vidpid\0265, vidpid, %REG_DWORD%, 0x26A00504  ; VID=0x26A0 PID=0x0504
+HKR, ParametersDriver\License\vidpid\0266, vidpid, %REG_DWORD%, 0x26A00505  ; VID=0x26A0 PID=0x0505
+HKR, ParametersDriver\License\vidpid\0267, vidpid, %REG_DWORD%, 0x26A00506  ; VID=0x26A0 PID=0x0506
+HKR, ParametersDriver\License\vidpid\0268, vidpid, %REG_DWORD%, 0x26A00507  ; VID=0x26A0 PID=0x0507
+HKR, ParametersDriver\License\vidpid\0269, vidpid, %REG_DWORD%, 0x26A00508  ; VID=0x26A0 PID=0x0508
+HKR, ParametersDriver\License\vidpid\0270, vidpid, %REG_DWORD%, 0x26A00509  ; VID=0x26A0 PID=0x0509
+HKR, ParametersDriver\License\vidpid\0271, vidpid, %REG_DWORD%, 0x26A0050A  ; VID=0x26A0 PID=0x050A
+HKR, ParametersDriver\License\vidpid\0272, vidpid, %REG_DWORD%, 0x26A0050B  ; VID=0x26A0 PID=0x050B
+HKR, ParametersDriver\License\vidpid\0273, vidpid, %REG_DWORD%, 0x26A0050C  ; VID=0x26A0 PID=0x050C
+HKR, ParametersDriver\License\vidpid\0274, vidpid, %REG_DWORD%, 0x26A0050D  ; VID=0x26A0 PID=0x050D
+HKR, ParametersDriver\License\vidpid\0275, vidpid, %REG_DWORD%, 0x26A0050E  ; VID=0x26A0 PID=0x050E
+HKR, ParametersDriver\License\vidpid\0276, vidpid, %REG_DWORD%, 0x26A0050F  ; VID=0x26A0 PID=0x050F
+HKR, ParametersDriver\License\vidpid\0277, vidpid, %REG_DWORD%, 0x26A00510  ; VID=0x26A0 PID=0x0510
+HKR, ParametersDriver\License\vidpid\0278, vidpid, %REG_DWORD%, 0x26A00511  ; VID=0x26A0 PID=0x0511
+HKR, ParametersDriver\License\vidpid\0279, vidpid, %REG_DWORD%, 0x26A00512  ; VID=0x26A0 PID=0x0512
+HKR, ParametersDriver\License\vidpid\0280, vidpid, %REG_DWORD%, 0x26A00513  ; VID=0x26A0 PID=0x0513
+HKR, ParametersDriver\License\vidpid\0281, vidpid, %REG_DWORD%, 0x26A00514  ; VID=0x26A0 PID=0x0514
+HKR, ParametersDriver\License\vidpid\0282, vidpid, %REG_DWORD%, 0x26A00515  ; VID=0x26A0 PID=0x0515
+HKR, ParametersDriver\License\vidpid\0283, vidpid, %REG_DWORD%, 0x26A00516  ; VID=0x26A0 PID=0x0516
+HKR, ParametersDriver\License\vidpid\0284, vidpid, %REG_DWORD%, 0x26A00517  ; VID=0x26A0 PID=0x0517
+HKR, ParametersDriver\License\vidpid\0285, vidpid, %REG_DWORD%, 0x26A00518  ; VID=0x26A0 PID=0x0518
+HKR, ParametersDriver\License\vidpid\0286, vidpid, %REG_DWORD%, 0x26A00519  ; VID=0x26A0 PID=0x0519
+HKR, ParametersDriver\License\vidpid\0287, vidpid, %REG_DWORD%, 0x26A0051A  ; VID=0x26A0 PID=0x051A
+HKR, ParametersDriver\License\vidpid\0288, vidpid, %REG_DWORD%, 0x26A0051B  ; VID=0x26A0 PID=0x051B
+HKR, ParametersDriver\License\vidpid\0289, vidpid, %REG_DWORD%, 0x26A0051C  ; VID=0x26A0 PID=0x051C
+HKR, ParametersDriver\License\vidpid\0290, vidpid, %REG_DWORD%, 0x26A0051D  ; VID=0x26A0 PID=0x051D
+HKR, ParametersDriver\License\vidpid\0291, vidpid, %REG_DWORD%, 0x26A0051E  ; VID=0x26A0 PID=0x051E
+HKR, ParametersDriver\License\vidpid\0292, vidpid, %REG_DWORD%, 0x26A0051F  ; VID=0x26A0 PID=0x051F
+HKR, ParametersDriver\License\vidpid\0293, vidpid, %REG_DWORD%, 0x26A00520  ; VID=0x26A0 PID=0x0520
+HKR, ParametersDriver\License\vidpid\0294, vidpid, %REG_DWORD%, 0x26A00521  ; VID=0x26A0 PID=0x0521
+HKR, ParametersDriver\License\vidpid\0295, vidpid, %REG_DWORD%, 0x26A00522  ; VID=0x26A0 PID=0x0522
+HKR, ParametersDriver\License\vidpid\0296, vidpid, %REG_DWORD%, 0x26A00523  ; VID=0x26A0 PID=0x0523
+HKR, ParametersDriver\License\vidpid\0297, vidpid, %REG_DWORD%, 0x26A00524  ; VID=0x26A0 PID=0x0524
+HKR, ParametersDriver\License\vidpid\0298, vidpid, %REG_DWORD%, 0x26A00525  ; VID=0x26A0 PID=0x0525
+HKR, ParametersDriver\License\vidpid\0299, vidpid, %REG_DWORD%, 0x26A00526  ; VID=0x26A0 PID=0x0526
+HKR, ParametersDriver\License\vidpid\0300, vidpid, %REG_DWORD%, 0x26A00527  ; VID=0x26A0 PID=0x0527
+HKR, ParametersDriver\License\vidpid\0301, vidpid, %REG_DWORD%, 0x26A00528  ; VID=0x26A0 PID=0x0528
+HKR, ParametersDriver\License\vidpid\0302, vidpid, %REG_DWORD%, 0x26A00529  ; VID=0x26A0 PID=0x0529
+HKR, ParametersDriver\License\vidpid\0303, vidpid, %REG_DWORD%, 0x26A0052A  ; VID=0x26A0 PID=0x052A
+HKR, ParametersDriver\License\vidpid\0304, vidpid, %REG_DWORD%, 0x26A0052B  ; VID=0x26A0 PID=0x052B
+HKR, ParametersDriver\License\vidpid\0305, vidpid, %REG_DWORD%, 0x26A0052C  ; VID=0x26A0 PID=0x052C
+HKR, ParametersDriver\License\vidpid\0306, vidpid, %REG_DWORD%, 0x26A0052D  ; VID=0x26A0 PID=0x052D
+HKR, ParametersDriver\License\vidpid\0307, vidpid, %REG_DWORD%, 0x26A0052E  ; VID=0x26A0 PID=0x052E
+HKR, ParametersDriver\License\vidpid\0308, vidpid, %REG_DWORD%, 0x26A0052F  ; VID=0x26A0 PID=0x052F
+HKR, ParametersDriver\License\vidpid\0309, vidpid, %REG_DWORD%, 0x26A00530  ; VID=0x26A0 PID=0x0530
+HKR, ParametersDriver\License\vidpid\0310, vidpid, %REG_DWORD%, 0x26A00531  ; VID=0x26A0 PID=0x0531
+HKR, ParametersDriver\License\vidpid\0311, vidpid, %REG_DWORD%, 0x26A00532  ; VID=0x26A0 PID=0x0532
+HKR, ParametersDriver\License\vidpid\0312, vidpid, %REG_DWORD%, 0x26A00533  ; VID=0x26A0 PID=0x0533
+HKR, ParametersDriver\License\vidpid\0313, vidpid, %REG_DWORD%, 0x26A00534  ; VID=0x26A0 PID=0x0534
+HKR, ParametersDriver\License\vidpid\0314, vidpid, %REG_DWORD%, 0x26A00535  ; VID=0x26A0 PID=0x0535
+HKR, ParametersDriver\License\vidpid\0315, vidpid, %REG_DWORD%, 0x26A00536  ; VID=0x26A0 PID=0x0536
+HKR, ParametersDriver\License\vidpid\0316, vidpid, %REG_DWORD%, 0x26A00537  ; VID=0x26A0 PID=0x0537
+HKR, ParametersDriver\License\vidpid\0317, vidpid, %REG_DWORD%, 0x26A00538  ; VID=0x26A0 PID=0x0538
+HKR, ParametersDriver\License\vidpid\0318, vidpid, %REG_DWORD%, 0x26A00539  ; VID=0x26A0 PID=0x0539
+HKR, ParametersDriver\License\vidpid\0319, vidpid, %REG_DWORD%, 0x26A0053A  ; VID=0x26A0 PID=0x053A
+HKR, ParametersDriver\License\vidpid\0320, vidpid, %REG_DWORD%, 0x26A0053B  ; VID=0x26A0 PID=0x053B
+HKR, ParametersDriver\License\vidpid\0321, vidpid, %REG_DWORD%, 0x26A0053C  ; VID=0x26A0 PID=0x053C
+HKR, ParametersDriver\License\vidpid\0322, vidpid, %REG_DWORD%, 0x26A0053D  ; VID=0x26A0 PID=0x053D
+HKR, ParametersDriver\License\vidpid\0323, vidpid, %REG_DWORD%, 0x26A0053E  ; VID=0x26A0 PID=0x053E
+HKR, ParametersDriver\License\vidpid\0324, vidpid, %REG_DWORD%, 0x26A0053F  ; VID=0x26A0 PID=0x053F
+HKR, ParametersDriver\License\vidpid\0325, vidpid, %REG_DWORD%, 0x26A00540  ; VID=0x26A0 PID=0x0540
+HKR, ParametersDriver\License\vidpid\0326, vidpid, %REG_DWORD%, 0x26A00541  ; VID=0x26A0 PID=0x0541
+HKR, ParametersDriver\License\vidpid\0327, vidpid, %REG_DWORD%, 0x26A00542  ; VID=0x26A0 PID=0x0542
+HKR, ParametersDriver\License\vidpid\0328, vidpid, %REG_DWORD%, 0x26A00543  ; VID=0x26A0 PID=0x0543
+HKR, ParametersDriver\License\vidpid\0329, vidpid, %REG_DWORD%, 0x26A00544  ; VID=0x26A0 PID=0x0544
+HKR, ParametersDriver\License\vidpid\0330, vidpid, %REG_DWORD%, 0x26A00545  ; VID=0x26A0 PID=0x0545
+HKR, ParametersDriver\License\vidpid\0331, vidpid, %REG_DWORD%, 0x26A00546  ; VID=0x26A0 PID=0x0546
+HKR, ParametersDriver\License\vidpid\0332, vidpid, %REG_DWORD%, 0x26A00547  ; VID=0x26A0 PID=0x0547
+HKR, ParametersDriver\License\vidpid\0333, vidpid, %REG_DWORD%, 0x26A00548  ; VID=0x26A0 PID=0x0548
+HKR, ParametersDriver\License\vidpid\0334, vidpid, %REG_DWORD%, 0x26A00549  ; VID=0x26A0 PID=0x0549
+HKR, ParametersDriver\License\vidpid\0335, vidpid, %REG_DWORD%, 0x26A0054A  ; VID=0x26A0 PID=0x054A
+HKR, ParametersDriver\License\vidpid\0336, vidpid, %REG_DWORD%, 0x26A0054B  ; VID=0x26A0 PID=0x054B
+HKR, ParametersDriver\License\vidpid\0337, vidpid, %REG_DWORD%, 0x26A0054C  ; VID=0x26A0 PID=0x054C
+HKR, ParametersDriver\License\vidpid\0338, vidpid, %REG_DWORD%, 0x26A0054D  ; VID=0x26A0 PID=0x054D
+HKR, ParametersDriver\License\vidpid\0339, vidpid, %REG_DWORD%, 0x26A0054E  ; VID=0x26A0 PID=0x054E
+HKR, ParametersDriver\License\vidpid\0340, vidpid, %REG_DWORD%, 0x26A0054F  ; VID=0x26A0 PID=0x054F
+HKR, ParametersDriver\License\vidpid\0341, vidpid, %REG_DWORD%, 0x26A00550  ; VID=0x26A0 PID=0x0550
+HKR, ParametersDriver\License\vidpid\0342, vidpid, %REG_DWORD%, 0x26A00551  ; VID=0x26A0 PID=0x0551
+HKR, ParametersDriver\License\vidpid\0343, vidpid, %REG_DWORD%, 0x26A00552  ; VID=0x26A0 PID=0x0552
+HKR, ParametersDriver\License\vidpid\0344, vidpid, %REG_DWORD%, 0x26A00553  ; VID=0x26A0 PID=0x0553
+HKR, ParametersDriver\License\vidpid\0345, vidpid, %REG_DWORD%, 0x26A00554  ; VID=0x26A0 PID=0x0554
+HKR, ParametersDriver\License\vidpid\0346, vidpid, %REG_DWORD%, 0x26A00555  ; VID=0x26A0 PID=0x0555
+HKR, ParametersDriver\License\vidpid\0347, vidpid, %REG_DWORD%, 0x26A00556  ; VID=0x26A0 PID=0x0556
+HKR, ParametersDriver\License\vidpid\0348, vidpid, %REG_DWORD%, 0x26A00557  ; VID=0x26A0 PID=0x0557
+HKR, ParametersDriver\License\vidpid\0349, vidpid, %REG_DWORD%, 0x26A00558  ; VID=0x26A0 PID=0x0558
+HKR, ParametersDriver\License\vidpid\0350, vidpid, %REG_DWORD%, 0x26A00559  ; VID=0x26A0 PID=0x0559
+HKR, ParametersDriver\License\vidpid\0351, vidpid, %REG_DWORD%, 0x26A0055A  ; VID=0x26A0 PID=0x055A
+HKR, ParametersDriver\License\vidpid\0352, vidpid, %REG_DWORD%, 0x26A0055B  ; VID=0x26A0 PID=0x055B
+HKR, ParametersDriver\License\vidpid\0353, vidpid, %REG_DWORD%, 0x26A0055C  ; VID=0x26A0 PID=0x055C
+HKR, ParametersDriver\License\vidpid\0354, vidpid, %REG_DWORD%, 0x26A0055D  ; VID=0x26A0 PID=0x055D
+HKR, ParametersDriver\License\vidpid\0355, vidpid, %REG_DWORD%, 0x26A0055E  ; VID=0x26A0 PID=0x055E
+HKR, ParametersDriver\License\vidpid\0356, vidpid, %REG_DWORD%, 0x26A0055F  ; VID=0x26A0 PID=0x055F
+HKR, ParametersDriver\License\vidpid\0357, vidpid, %REG_DWORD%, 0x26A00560  ; VID=0x26A0 PID=0x0560
+HKR, ParametersDriver\License\vidpid\0358, vidpid, %REG_DWORD%, 0x26A00561  ; VID=0x26A0 PID=0x0561
+HKR, ParametersDriver\License\vidpid\0359, vidpid, %REG_DWORD%, 0x26A00562  ; VID=0x26A0 PID=0x0562
+HKR, ParametersDriver\License\vidpid\0360, vidpid, %REG_DWORD%, 0x26A00563  ; VID=0x26A0 PID=0x0563
+HKR, ParametersDriver\License\vidpid\0361, vidpid, %REG_DWORD%, 0x26A00564  ; VID=0x26A0 PID=0x0564
+HKR, ParametersDriver\License\vidpid\0362, vidpid, %REG_DWORD%, 0x26A00565  ; VID=0x26A0 PID=0x0565
+HKR, ParametersDriver\License\vidpid\0363, vidpid, %REG_DWORD%, 0x26A00566  ; VID=0x26A0 PID=0x0566
+HKR, ParametersDriver\License\vidpid\0364, vidpid, %REG_DWORD%, 0x26A00567  ; VID=0x26A0 PID=0x0567
+HKR, ParametersDriver\License\vidpid\0365, vidpid, %REG_DWORD%, 0x26A00568  ; VID=0x26A0 PID=0x0568
+HKR, ParametersDriver\License\vidpid\0366, vidpid, %REG_DWORD%, 0x26A00569  ; VID=0x26A0 PID=0x0569
+HKR, ParametersDriver\License\vidpid\0367, vidpid, %REG_DWORD%, 0x26A0056A  ; VID=0x26A0 PID=0x056A
+HKR, ParametersDriver\License\vidpid\0368, vidpid, %REG_DWORD%, 0x26A0056B  ; VID=0x26A0 PID=0x056B
+HKR, ParametersDriver\License\vidpid\0369, vidpid, %REG_DWORD%, 0x26A0056C  ; VID=0x26A0 PID=0x056C
+HKR, ParametersDriver\License\vidpid\0370, vidpid, %REG_DWORD%, 0x26A0056D  ; VID=0x26A0 PID=0x056D
+HKR, ParametersDriver\License\vidpid\0371, vidpid, %REG_DWORD%, 0x26A0056E  ; VID=0x26A0 PID=0x056E
+HKR, ParametersDriver\License\vidpid\0372, vidpid, %REG_DWORD%, 0x26A0056F  ; VID=0x26A0 PID=0x056F
+HKR, ParametersDriver\License\vidpid\0373, vidpid, %REG_DWORD%, 0x26A00570  ; VID=0x26A0 PID=0x0570
+HKR, ParametersDriver\License\vidpid\0374, vidpid, %REG_DWORD%, 0x26A00571  ; VID=0x26A0 PID=0x0571
+HKR, ParametersDriver\License\vidpid\0375, vidpid, %REG_DWORD%, 0x26A00572  ; VID=0x26A0 PID=0x0572
+HKR, ParametersDriver\License\vidpid\0376, vidpid, %REG_DWORD%, 0x26A00573  ; VID=0x26A0 PID=0x0573
+HKR, ParametersDriver\License\vidpid\0377, vidpid, %REG_DWORD%, 0x26A00574  ; VID=0x26A0 PID=0x0574
+HKR, ParametersDriver\License\vidpid\0378, vidpid, %REG_DWORD%, 0x26A00575  ; VID=0x26A0 PID=0x0575
+HKR, ParametersDriver\License\vidpid\0379, vidpid, %REG_DWORD%, 0x26A00576  ; VID=0x26A0 PID=0x0576
+HKR, ParametersDriver\License\vidpid\0380, vidpid, %REG_DWORD%, 0x26A00577  ; VID=0x26A0 PID=0x0577
+HKR, ParametersDriver\License\vidpid\0381, vidpid, %REG_DWORD%, 0x26A00578  ; VID=0x26A0 PID=0x0578
+HKR, ParametersDriver\License\vidpid\0382, vidpid, %REG_DWORD%, 0x26A00579  ; VID=0x26A0 PID=0x0579
+HKR, ParametersDriver\License\vidpid\0383, vidpid, %REG_DWORD%, 0x26A0057A  ; VID=0x26A0 PID=0x057A
+HKR, ParametersDriver\License\vidpid\0384, vidpid, %REG_DWORD%, 0x26A0057B  ; VID=0x26A0 PID=0x057B
+HKR, ParametersDriver\License\vidpid\0385, vidpid, %REG_DWORD%, 0x26A0057C  ; VID=0x26A0 PID=0x057C
+HKR, ParametersDriver\License\vidpid\0386, vidpid, %REG_DWORD%, 0x26A0057D  ; VID=0x26A0 PID=0x057D
+HKR, ParametersDriver\License\vidpid\0387, vidpid, %REG_DWORD%, 0x26A0057E  ; VID=0x26A0 PID=0x057E
+HKR, ParametersDriver\License\vidpid\0388, vidpid, %REG_DWORD%, 0x26A0057F  ; VID=0x26A0 PID=0x057F
+HKR, ParametersDriver\License\vidpid\0389, vidpid, %REG_DWORD%, 0x26A00580  ; VID=0x26A0 PID=0x0580
+HKR, ParametersDriver\License\vidpid\0390, vidpid, %REG_DWORD%, 0x26A00581  ; VID=0x26A0 PID=0x0581
+HKR, ParametersDriver\License\vidpid\0391, vidpid, %REG_DWORD%, 0x26A00582  ; VID=0x26A0 PID=0x0582
+HKR, ParametersDriver\License\vidpid\0392, vidpid, %REG_DWORD%, 0x26A00583  ; VID=0x26A0 PID=0x0583
+HKR, ParametersDriver\License\vidpid\0393, vidpid, %REG_DWORD%, 0x26A00584  ; VID=0x26A0 PID=0x0584
+HKR, ParametersDriver\License\vidpid\0394, vidpid, %REG_DWORD%, 0x26A00585  ; VID=0x26A0 PID=0x0585
+HKR, ParametersDriver\License\vidpid\0395, vidpid, %REG_DWORD%, 0x26A00586  ; VID=0x26A0 PID=0x0586
+HKR, ParametersDriver\License\vidpid\0396, vidpid, %REG_DWORD%, 0x26A00587  ; VID=0x26A0 PID=0x0587
+HKR, ParametersDriver\License\vidpid\0397, vidpid, %REG_DWORD%, 0x26A00588  ; VID=0x26A0 PID=0x0588
+HKR, ParametersDriver\License\vidpid\0398, vidpid, %REG_DWORD%, 0x26A00589  ; VID=0x26A0 PID=0x0589
+HKR, ParametersDriver\License\vidpid\0399, vidpid, %REG_DWORD%, 0x26A0058A  ; VID=0x26A0 PID=0x058A
+HKR, ParametersDriver\License\vidpid\0400, vidpid, %REG_DWORD%, 0x26A0058B  ; VID=0x26A0 PID=0x058B
+HKR, ParametersDriver\License\vidpid\0401, vidpid, %REG_DWORD%, 0x26A0058C  ; VID=0x26A0 PID=0x058C
+HKR, ParametersDriver\License\vidpid\0402, vidpid, %REG_DWORD%, 0x26A0058D  ; VID=0x26A0 PID=0x058D
+HKR, ParametersDriver\License\vidpid\0403, vidpid, %REG_DWORD%, 0x26A0058E  ; VID=0x26A0 PID=0x058E
+HKR, ParametersDriver\License\vidpid\0404, vidpid, %REG_DWORD%, 0x26A0058F  ; VID=0x26A0 PID=0x058F
+HKR, ParametersDriver\License\vidpid\0405, vidpid, %REG_DWORD%, 0x26A00590  ; VID=0x26A0 PID=0x0590
+HKR, ParametersDriver\License\vidpid\0406, vidpid, %REG_DWORD%, 0x26A00591  ; VID=0x26A0 PID=0x0591
+HKR, ParametersDriver\License\vidpid\0407, vidpid, %REG_DWORD%, 0x26A00592  ; VID=0x26A0 PID=0x0592
+HKR, ParametersDriver\License\vidpid\0408, vidpid, %REG_DWORD%, 0x26A00593  ; VID=0x26A0 PID=0x0593
+HKR, ParametersDriver\License\vidpid\0409, vidpid, %REG_DWORD%, 0x26A00594  ; VID=0x26A0 PID=0x0594
+HKR, ParametersDriver\License\vidpid\0410, vidpid, %REG_DWORD%, 0x26A00595  ; VID=0x26A0 PID=0x0595
+HKR, ParametersDriver\License\vidpid\0411, vidpid, %REG_DWORD%, 0x26A00596  ; VID=0x26A0 PID=0x0596
+HKR, ParametersDriver\License\vidpid\0412, vidpid, %REG_DWORD%, 0x26A00597  ; VID=0x26A0 PID=0x0597
+HKR, ParametersDriver\License\vidpid\0413, vidpid, %REG_DWORD%, 0x26A00598  ; VID=0x26A0 PID=0x0598
+HKR, ParametersDriver\License\vidpid\0414, vidpid, %REG_DWORD%, 0x26A00599  ; VID=0x26A0 PID=0x0599
+HKR, ParametersDriver\License\vidpid\0415, vidpid, %REG_DWORD%, 0x26A0059A  ; VID=0x26A0 PID=0x059A
+HKR, ParametersDriver\License\vidpid\0416, vidpid, %REG_DWORD%, 0x26A0059B  ; VID=0x26A0 PID=0x059B
+HKR, ParametersDriver\License\vidpid\0417, vidpid, %REG_DWORD%, 0x26A0059C  ; VID=0x26A0 PID=0x059C
+HKR, ParametersDriver\License\vidpid\0418, vidpid, %REG_DWORD%, 0x26A0059D  ; VID=0x26A0 PID=0x059D
+HKR, ParametersDriver\License\vidpid\0419, vidpid, %REG_DWORD%, 0x26A0059E  ; VID=0x26A0 PID=0x059E
+HKR, ParametersDriver\License\vidpid\0420, vidpid, %REG_DWORD%, 0x26A0059F  ; VID=0x26A0 PID=0x059F
+HKR, ParametersDriver\License\vidpid\0421, vidpid, %REG_DWORD%, 0x26A005A0  ; VID=0x26A0 PID=0x05A0
+HKR, ParametersDriver\License\vidpid\0422, vidpid, %REG_DWORD%, 0x26A005A1  ; VID=0x26A0 PID=0x05A1
+HKR, ParametersDriver\License\vidpid\0423, vidpid, %REG_DWORD%, 0x26A005A2  ; VID=0x26A0 PID=0x05A2
+HKR, ParametersDriver\License\vidpid\0424, vidpid, %REG_DWORD%, 0x26A005A3  ; VID=0x26A0 PID=0x05A3
+HKR, ParametersDriver\License\vidpid\0425, vidpid, %REG_DWORD%, 0x26A005A4  ; VID=0x26A0 PID=0x05A4
+HKR, ParametersDriver\License\vidpid\0426, vidpid, %REG_DWORD%, 0x26A005A5  ; VID=0x26A0 PID=0x05A5
+HKR, ParametersDriver\License\vidpid\0427, vidpid, %REG_DWORD%, 0x26A005A6  ; VID=0x26A0 PID=0x05A6
+HKR, ParametersDriver\License\vidpid\0428, vidpid, %REG_DWORD%, 0x26A005A7  ; VID=0x26A0 PID=0x05A7
+HKR, ParametersDriver\License\vidpid\0429, vidpid, %REG_DWORD%, 0x26A005A8  ; VID=0x26A0 PID=0x05A8
+HKR, ParametersDriver\License\vidpid\0430, vidpid, %REG_DWORD%, 0x26A005A9  ; VID=0x26A0 PID=0x05A9
+HKR, ParametersDriver\License\vidpid\0431, vidpid, %REG_DWORD%, 0x26A005AA  ; VID=0x26A0 PID=0x05AA
+HKR, ParametersDriver\License\vidpid\0432, vidpid, %REG_DWORD%, 0x26A005AB  ; VID=0x26A0 PID=0x05AB
+HKR, ParametersDriver\License\vidpid\0433, vidpid, %REG_DWORD%, 0x26A005AC  ; VID=0x26A0 PID=0x05AC
+HKR, ParametersDriver\License\vidpid\0434, vidpid, %REG_DWORD%, 0x26A005AD  ; VID=0x26A0 PID=0x05AD
+HKR, ParametersDriver\License\vidpid\0435, vidpid, %REG_DWORD%, 0x26A005AE  ; VID=0x26A0 PID=0x05AE
+HKR, ParametersDriver\License\vidpid\0436, vidpid, %REG_DWORD%, 0x26A005AF  ; VID=0x26A0 PID=0x05AF
+HKR, ParametersDriver\License\vidpid\0437, vidpid, %REG_DWORD%, 0x26A005B0  ; VID=0x26A0 PID=0x05B0
+HKR, ParametersDriver\License\vidpid\0438, vidpid, %REG_DWORD%, 0x26A005B1  ; VID=0x26A0 PID=0x05B1
+HKR, ParametersDriver\License\vidpid\0439, vidpid, %REG_DWORD%, 0x26A005B2  ; VID=0x26A0 PID=0x05B2
+HKR, ParametersDriver\License\vidpid\0440, vidpid, %REG_DWORD%, 0x26A005B3  ; VID=0x26A0 PID=0x05B3
+HKR, ParametersDriver\License\vidpid\0441, vidpid, %REG_DWORD%, 0x26A005B4  ; VID=0x26A0 PID=0x05B4
+HKR, ParametersDriver\License\vidpid\0442, vidpid, %REG_DWORD%, 0x26A005B5  ; VID=0x26A0 PID=0x05B5
+HKR, ParametersDriver\License\vidpid\0443, vidpid, %REG_DWORD%, 0x26A005B6  ; VID=0x26A0 PID=0x05B6
+HKR, ParametersDriver\License\vidpid\0444, vidpid, %REG_DWORD%, 0x26A005B7  ; VID=0x26A0 PID=0x05B7
+HKR, ParametersDriver\License\vidpid\0445, vidpid, %REG_DWORD%, 0x26A005B8  ; VID=0x26A0 PID=0x05B8
+HKR, ParametersDriver\License\vidpid\0446, vidpid, %REG_DWORD%, 0x26A005B9  ; VID=0x26A0 PID=0x05B9
+HKR, ParametersDriver\License\vidpid\0447, vidpid, %REG_DWORD%, 0x26A005BA  ; VID=0x26A0 PID=0x05BA
+HKR, ParametersDriver\License\vidpid\0448, vidpid, %REG_DWORD%, 0x26A005BB  ; VID=0x26A0 PID=0x05BB
+HKR, ParametersDriver\License\vidpid\0449, vidpid, %REG_DWORD%, 0x26A005BC  ; VID=0x26A0 PID=0x05BC
+HKR, ParametersDriver\License\vidpid\0450, vidpid, %REG_DWORD%, 0x26A005BD  ; VID=0x26A0 PID=0x05BD
+HKR, ParametersDriver\License\vidpid\0451, vidpid, %REG_DWORD%, 0x26A005BE  ; VID=0x26A0 PID=0x05BE
+HKR, ParametersDriver\License\vidpid\0452, vidpid, %REG_DWORD%, 0x26A005BF  ; VID=0x26A0 PID=0x05BF
+HKR, ParametersDriver\License\vidpid\0453, vidpid, %REG_DWORD%, 0x26A005C0  ; VID=0x26A0 PID=0x05C0
+HKR, ParametersDriver\License\vidpid\0454, vidpid, %REG_DWORD%, 0x26A005C1  ; VID=0x26A0 PID=0x05C1
+HKR, ParametersDriver\License\vidpid\0455, vidpid, %REG_DWORD%, 0x26A005C2  ; VID=0x26A0 PID=0x05C2
+HKR, ParametersDriver\License\vidpid\0456, vidpid, %REG_DWORD%, 0x26A005C3  ; VID=0x26A0 PID=0x05C3
+HKR, ParametersDriver\License\vidpid\0457, vidpid, %REG_DWORD%, 0x26A005C4  ; VID=0x26A0 PID=0x05C4
+HKR, ParametersDriver\License\vidpid\0458, vidpid, %REG_DWORD%, 0x26A005C5  ; VID=0x26A0 PID=0x05C5
+HKR, ParametersDriver\License\vidpid\0459, vidpid, %REG_DWORD%, 0x26A005C6  ; VID=0x26A0 PID=0x05C6
+HKR, ParametersDriver\License\vidpid\0460, vidpid, %REG_DWORD%, 0x26A005C7  ; VID=0x26A0 PID=0x05C7
+HKR, ParametersDriver\License\vidpid\0461, vidpid, %REG_DWORD%, 0x26A005C8  ; VID=0x26A0 PID=0x05C8
+HKR, ParametersDriver\License\vidpid\0462, vidpid, %REG_DWORD%, 0x26A005C9  ; VID=0x26A0 PID=0x05C9
+HKR, ParametersDriver\License\vidpid\0463, vidpid, %REG_DWORD%, 0x26A005CA  ; VID=0x26A0 PID=0x05CA
+HKR, ParametersDriver\License\vidpid\0464, vidpid, %REG_DWORD%, 0x26A005CB  ; VID=0x26A0 PID=0x05CB
+HKR, ParametersDriver\License\vidpid\0465, vidpid, %REG_DWORD%, 0x26A005CC  ; VID=0x26A0 PID=0x05CC
+HKR, ParametersDriver\License\vidpid\0466, vidpid, %REG_DWORD%, 0x26A005CD  ; VID=0x26A0 PID=0x05CD
+HKR, ParametersDriver\License\vidpid\0467, vidpid, %REG_DWORD%, 0x26A005CE  ; VID=0x26A0 PID=0x05CE
+HKR, ParametersDriver\License\vidpid\0468, vidpid, %REG_DWORD%, 0x26A005CF  ; VID=0x26A0 PID=0x05CF
+HKR, ParametersDriver\License\vidpid\0469, vidpid, %REG_DWORD%, 0x26A005D0  ; VID=0x26A0 PID=0x05D0
+HKR, ParametersDriver\License\vidpid\0470, vidpid, %REG_DWORD%, 0x26A005D1  ; VID=0x26A0 PID=0x05D1
+HKR, ParametersDriver\License\vidpid\0471, vidpid, %REG_DWORD%, 0x26A005D2  ; VID=0x26A0 PID=0x05D2
+HKR, ParametersDriver\License\vidpid\0472, vidpid, %REG_DWORD%, 0x26A005D3  ; VID=0x26A0 PID=0x05D3
+HKR, ParametersDriver\License\vidpid\0473, vidpid, %REG_DWORD%, 0x26A005D4  ; VID=0x26A0 PID=0x05D4
+HKR, ParametersDriver\License\vidpid\0474, vidpid, %REG_DWORD%, 0x26A005D5  ; VID=0x26A0 PID=0x05D5
+HKR, ParametersDriver\License\vidpid\0475, vidpid, %REG_DWORD%, 0x26A005D6  ; VID=0x26A0 PID=0x05D6
+HKR, ParametersDriver\License\vidpid\0476, vidpid, %REG_DWORD%, 0x26A005D7  ; VID=0x26A0 PID=0x05D7
+HKR, ParametersDriver\License\vidpid\0477, vidpid, %REG_DWORD%, 0x26A005D8  ; VID=0x26A0 PID=0x05D8
+HKR, ParametersDriver\License\vidpid\0478, vidpid, %REG_DWORD%, 0x26A005D9  ; VID=0x26A0 PID=0x05D9
+HKR, ParametersDriver\License\vidpid\0479, vidpid, %REG_DWORD%, 0x26A005DA  ; VID=0x26A0 PID=0x05DA
+HKR, ParametersDriver\License\vidpid\0480, vidpid, %REG_DWORD%, 0x26A005DB  ; VID=0x26A0 PID=0x05DB
+HKR, ParametersDriver\License\vidpid\0481, vidpid, %REG_DWORD%, 0x26A005DC  ; VID=0x26A0 PID=0x05DC
+HKR, ParametersDriver\License\vidpid\0482, vidpid, %REG_DWORD%, 0x26A005DD  ; VID=0x26A0 PID=0x05DD
+HKR, ParametersDriver\License\vidpid\0483, vidpid, %REG_DWORD%, 0x26A005DE  ; VID=0x26A0 PID=0x05DE
+HKR, ParametersDriver\License\vidpid\0484, vidpid, %REG_DWORD%, 0x26A005DF  ; VID=0x26A0 PID=0x05DF
+HKR, ParametersDriver\License\vidpid\0485, vidpid, %REG_DWORD%, 0x26A005E0  ; VID=0x26A0 PID=0x05E0
+HKR, ParametersDriver\License\vidpid\0486, vidpid, %REG_DWORD%, 0x26A005E1  ; VID=0x26A0 PID=0x05E1
+HKR, ParametersDriver\License\vidpid\0487, vidpid, %REG_DWORD%, 0x26A005E2  ; VID=0x26A0 PID=0x05E2
+HKR, ParametersDriver\License\vidpid\0488, vidpid, %REG_DWORD%, 0x26A005E3  ; VID=0x26A0 PID=0x05E3
+HKR, ParametersDriver\License\vidpid\0489, vidpid, %REG_DWORD%, 0x26A005E4  ; VID=0x26A0 PID=0x05E4
+HKR, ParametersDriver\License\vidpid\0490, vidpid, %REG_DWORD%, 0x26A005E5  ; VID=0x26A0 PID=0x05E5
+HKR, ParametersDriver\License\vidpid\0491, vidpid, %REG_DWORD%, 0x26A005E6  ; VID=0x26A0 PID=0x05E6
+HKR, ParametersDriver\License\vidpid\0492, vidpid, %REG_DWORD%, 0x26A005E7  ; VID=0x26A0 PID=0x05E7
+HKR, ParametersDriver\License\vidpid\0493, vidpid, %REG_DWORD%, 0x26A005E8  ; VID=0x26A0 PID=0x05E8
+HKR, ParametersDriver\License\vidpid\0494, vidpid, %REG_DWORD%, 0x26A005E9  ; VID=0x26A0 PID=0x05E9
+HKR, ParametersDriver\License\vidpid\0495, vidpid, %REG_DWORD%, 0x26A005EA  ; VID=0x26A0 PID=0x05EA
+HKR, ParametersDriver\License\vidpid\0496, vidpid, %REG_DWORD%, 0x26A005EB  ; VID=0x26A0 PID=0x05EB
+HKR, ParametersDriver\License\vidpid\0497, vidpid, %REG_DWORD%, 0x26A005EC  ; VID=0x26A0 PID=0x05EC
+HKR, ParametersDriver\License\vidpid\0498, vidpid, %REG_DWORD%, 0x26A005ED  ; VID=0x26A0 PID=0x05ED
+HKR, ParametersDriver\License\vidpid\0499, vidpid, %REG_DWORD%, 0x26A005EE  ; VID=0x26A0 PID=0x05EE
+HKR, ParametersDriver\License\vidpid\0500, vidpid, %REG_DWORD%, 0x26A005EF  ; VID=0x26A0 PID=0x05EF
+HKR, ParametersDriver\License\vidpid\0501, vidpid, %REG_DWORD%, 0x26A005F0  ; VID=0x26A0 PID=0x05F0
+HKR, ParametersDriver\License\vidpid\0502, vidpid, %REG_DWORD%, 0x26A005F1  ; VID=0x26A0 PID=0x05F1
+HKR, ParametersDriver\License\vidpid\0503, vidpid, %REG_DWORD%, 0x26A005F2  ; VID=0x26A0 PID=0x05F2
+HKR, ParametersDriver\License\vidpid\0504, vidpid, %REG_DWORD%, 0x26A005F3  ; VID=0x26A0 PID=0x05F3
+HKR, ParametersDriver\License\vidpid\0505, vidpid, %REG_DWORD%, 0x26A005F4  ; VID=0x26A0 PID=0x05F4
+HKR, ParametersDriver\License\vidpid\0506, vidpid, %REG_DWORD%, 0x26A005F5  ; VID=0x26A0 PID=0x05F5
+HKR, ParametersDriver\License\vidpid\0507, vidpid, %REG_DWORD%, 0x26A005F6  ; VID=0x26A0 PID=0x05F6
+HKR, ParametersDriver\License\vidpid\0508, vidpid, %REG_DWORD%, 0x26A005F7  ; VID=0x26A0 PID=0x05F7
+HKR, ParametersDriver\License\vidpid\0509, vidpid, %REG_DWORD%, 0x26A005F8  ; VID=0x26A0 PID=0x05F8
+HKR, ParametersDriver\License\vidpid\0510, vidpid, %REG_DWORD%, 0x26A005F9  ; VID=0x26A0 PID=0x05F9
+HKR, ParametersDriver\License\vidpid\0511, vidpid, %REG_DWORD%, 0x26A005FA  ; VID=0x26A0 PID=0x05FA
+HKR, ParametersDriver\License\vidpid\0512, vidpid, %REG_DWORD%, 0x26A005FB  ; VID=0x26A0 PID=0x05FB
+HKR, ParametersDriver\License\vidpid\0513, vidpid, %REG_DWORD%, 0x26A005FC  ; VID=0x26A0 PID=0x05FC
+HKR, ParametersDriver\License\vidpid\0514, vidpid, %REG_DWORD%, 0x26A005FD  ; VID=0x26A0 PID=0x05FD
+HKR, ParametersDriver\License\vidpid\0515, vidpid, %REG_DWORD%, 0x26A005FE  ; VID=0x26A0 PID=0x05FE
+HKR, ParametersDriver\License\vidpid\0516, vidpid, %REG_DWORD%, 0x26A005FF  ; VID=0x26A0 PID=0x05FF
+HKR, ParametersDriver\License\vidpid\0517, vidpid, %REG_DWORD%, 0x12208FE0  ; VID=0x1220 PID=0x8FE0
+HKR, ParametersDriver\License\vidpid\0518, vidpid, %REG_DWORD%, 0x12208FE1  ; VID=0x1220 PID=0x8FE1
+HKR, ParametersDriver\License\vidpid\0519, vidpid, %REG_DWORD%, 0x12208FE2  ; VID=0x1220 PID=0x8FE2
+HKR, ParametersDriver\License\vidpid\0520, vidpid, %REG_DWORD%, 0x12208FE3  ; VID=0x1220 PID=0x8FE3
+HKR, ParametersDriver\License\vidpid\0521, vidpid, %REG_DWORD%, 0x12208FE4  ; VID=0x1220 PID=0x8FE4
+HKR, ParametersDriver\License\vidpid\0522, vidpid, %REG_DWORD%, 0x12208FE5  ; VID=0x1220 PID=0x8FE5
+HKR, ParametersDriver\License\vidpid\0523, vidpid, %REG_DWORD%, 0x12208FE6  ; VID=0x1220 PID=0x8FE6
+HKR, ParametersDriver\License\vidpid\0524, vidpid, %REG_DWORD%, 0x12208FE7  ; VID=0x1220 PID=0x8FE7
+HKR, ParametersDriver\License\vidpid\0525, vidpid, %REG_DWORD%, 0x12208FE8  ; VID=0x1220 PID=0x8FE8
+HKR, ParametersDriver\License\vidpid\0526, vidpid, %REG_DWORD%, 0x12208FE9  ; VID=0x1220 PID=0x8FE9
+HKR, ParametersDriver\License\vidpid\0527, vidpid, %REG_DWORD%, 0x12208FEA  ; VID=0x1220 PID=0x8FEA
+HKR, ParametersDriver\License\vidpid\0528, vidpid, %REG_DWORD%, 0x12208FEB  ; VID=0x1220 PID=0x8FEB
+HKR, ParametersDriver\License\vidpid\0529, vidpid, %REG_DWORD%, 0x12208FEC  ; VID=0x1220 PID=0x8FEC
+HKR, ParametersDriver\License\vidpid\0530, vidpid, %REG_DWORD%, 0x12208FED  ; VID=0x1220 PID=0x8FED
+HKR, ParametersDriver\License\vidpid\0531, vidpid, %REG_DWORD%, 0x12208FEE  ; VID=0x1220 PID=0x8FEE
+HKR, ParametersDriver\License\vidpid\0532, vidpid, %REG_DWORD%, 0x12208FEF  ; VID=0x1220 PID=0x8FEF
+HKR, ParametersDriver\License\vidpid\0533, vidpid, %REG_DWORD%, 0x12208FF0  ; VID=0x1220 PID=0x8FF0
+HKR, ParametersDriver\License\vidpid\0534, vidpid, %REG_DWORD%, 0x12208FF1  ; VID=0x1220 PID=0x8FF1
+HKR, ParametersDriver\License\vidpid\0535, vidpid, %REG_DWORD%, 0x12208FF2  ; VID=0x1220 PID=0x8FF2
+HKR, ParametersDriver\License\vidpid\0536, vidpid, %REG_DWORD%, 0x12208FF3  ; VID=0x1220 PID=0x8FF3
+HKR, ParametersDriver\License\vidpid\0537, vidpid, %REG_DWORD%, 0x12208FF4  ; VID=0x1220 PID=0x8FF4
+HKR, ParametersDriver\License\vidpid\0538, vidpid, %REG_DWORD%, 0x12208FF5  ; VID=0x1220 PID=0x8FF5
+HKR, ParametersDriver\License\vidpid\0539, vidpid, %REG_DWORD%, 0x12208FF6  ; VID=0x1220 PID=0x8FF6
+HKR, ParametersDriver\License\vidpid\0540, vidpid, %REG_DWORD%, 0x12208FF7  ; VID=0x1220 PID=0x8FF7
+HKR, ParametersDriver\License\vidpid\0541, vidpid, %REG_DWORD%, 0x12208FF8  ; VID=0x1220 PID=0x8FF8
+HKR, ParametersDriver\License\vidpid\0542, vidpid, %REG_DWORD%, 0x12208FF9  ; VID=0x1220 PID=0x8FF9
+HKR, ParametersDriver\License\vidpid\0543, vidpid, %REG_DWORD%, 0x12208FFA  ; VID=0x1220 PID=0x8FFA
+HKR, ParametersDriver\License\vidpid\0544, vidpid, %REG_DWORD%, 0x12208FFB  ; VID=0x1220 PID=0x8FFB
+HKR, ParametersDriver\License\vidpid\0545, vidpid, %REG_DWORD%, 0x12208FFC  ; VID=0x1220 PID=0x8FFC
+HKR, ParametersDriver\License\vidpid\0546, vidpid, %REG_DWORD%, 0x12208FFD  ; VID=0x1220 PID=0x8FFD
+HKR, ParametersDriver\License\vidpid\0547, vidpid, %REG_DWORD%, 0x12208FFE  ; VID=0x1220 PID=0x8FFE
+HKR, ParametersDriver\License\vidpid\0548, vidpid, %REG_DWORD%, 0x12208FFF  ; VID=0x1220 PID=0x8FFF
+
+;******************************************************************************
+; 0x00004000 = COPYFLG_IN_USE_RENAME, rename driver if in use
+;------------------------------------------------------------------------------
+[_CopyFiles_sys]
+blender_audio.sys,,,0x00004000
+
+;******************************************************************************
+; Destination Directories
+;------------------------------------------------------------------------------
+[DestinationDirs]
+_CopyFiles_sys = 12
+
+;******************************************************************************
+; Installation Disk
+;------------------------------------------------------------------------------
+[SourceDisksNames.amd64]
+1 = %S_DiskName%
+
+;******************************************************************************
+; Files on the Installation Disk
+;------------------------------------------------------------------------------
+[SourceDisksFiles.amd64]
+blender_audio.sys = 1
+
+;******************************************************************************
+; Strings
+;------------------------------------------------------------------------------
+[Strings]
+; 
+; Registry value types. DO NOT MODIFY!
+;
+REG_SZ = 0x00000000
+REG_EXPAND_SZ = 0x00020000
+REG_MULTI_SZ = 0x00010000
+REG_MULTI_SZ_APPEND = 0x00010008
+REG_DWORD = 0x00010001
+REG_BINARY = 0x00000001
+
+GUID_Microphone = "{DFF21BE1-F70F-11D0-B917-00A0C9223196}"
+GUID_DesktopMicrophone = "{DFF21BE2-F70F-11D0-B917-00A0C9223196}"
+GUID_PersonalMicrophone = "{DFF21BE3-F70F-11D0-B917-00A0C9223196}"
+GUID_OmniDirectionalMicrophone = "{DFF21BE4-F70F-11D0-B917-00A0C9223196}"
+GUID_MicrophoneArray = "{DFF21BE5-F70F-11D0-B917-00A0C9223196}"
+GUID_ProcessingMicrophoneArray = "{DFF21BE6-F70F-11D0-B917-00A0C9223196}"
+GUID_Speaker = "{DFF21CE1-F70F-11D0-B917-00A0C9223196}"
+GUID_Headphones = "{DFF21CE2-F70F-11D0-B917-00A0C9223196}"
+GUID_HeadMountedDisplayAudio = "{DFF21CE3-F70F-11D0-B917-00A0C9223196}"
+GUID_DesktopSpeaker = "{DFF21CE4-F70F-11D0-B917-00A0C9223196}"
+GUID_RoomSpeaker = "{DFF21CE5-F70F-11D0-B917-00A0C9223196}"
+GUID_CommunicationSpeaker = "{DFF21CE6-F70F-11D0-B917-00A0C9223196}"
+GUID_LowFrequencyEffectsSpeaker = "{DFF21CE7-F70F-11D0-B917-00A0C9223196}"
+GUID_Handset = "{DFF21DE1-F70F-11D0-B917-00A0C9223196}"
+GUID_Headset = "{DFF21DE2-F70F-11D0-B917-00A0C9223196}"
+GUID_SpeakerphoneNoEchoReduction = "{DFF21DE3-F70F-11D0-B917-00A0C9223196}"
+GUID_EchoSuppressingSpeakerphone = "{DFF21DE4-F70F-11D0-B917-00A0C9223196}"
+GUID_EchoCancelingSpeakerphone = "{DFF21DE5-F70F-11D0-B917-00A0C9223196}"
+GUID_PhoneLine = "{DFF21EE1-F70F-11D0-B917-00A0C9223196}"
+GUID_Telephone = "{DFF21EE2-F70F-11D0-B917-00A0C9223196}"
+GUID_DownLinePhone = "{DFF21EE3-F70F-11D0-B917-00A0C9223196}"
+GUID_AnalogConnector = "{DFF21FE1-F70F-11D0-B917-00A0C9223196}"
+GUID_DigitalAudioInterface = "{DFF21FE2-F70F-11D0-B917-00A0C9223196}"
+GUID_Line = "{DFF21FE3-F70F-11D0-B917-00A0C9223196}"
+GUID_LegacyAudioConnecter = "{DFF21FE4-F70F-11D0-B917-00A0C9223196}"
+GUID_SPDIFInterface = "{DFF21FE5-F70F-11D0-B917-00A0C9223196}"
+GUID_DaStream1394 = "{DFF21FE6-F70F-11D0-B917-00A0C9223196}"
+GUID_DvStreamSoundtrack1394 = "{DFF21FE7-F70F-11D0-B917-00A0C9223196}"
+GUID_LevelCalibrationNoiseSource = "{DFF220E1-F70F-11D0-B917-00A0C9223196}"
+GUID_EqualizationNoise = "{DFF220E2-F70F-11D0-B917-00A0C9223196}"
+GUID_CdPlayer = "{DFF220E3-F70F-11D0-B917-00A0C9223196}"
+GUID_DatIoDigitalAudioTape = "{DFF220E4-F70F-11D0-B917-00A0C9223196}"
+GUID_DccIoDigitalCompactCassette = "{DFF220E5-F70F-11D0-B917-00A0C9223196}"
+GUID_Minidisk = "{DFF220E6-F70F-11D0-B917-00A0C9223196}"
+GUID_AnalogTape = "{DFF220E7-F70F-11D0-B917-00A0C9223196}"
+GUID_Phonograph = "{DFF220E8-F70F-11D0-B917-00A0C9223196}"
+GUID_VcrAudio = "{DFF220E9-F70F-11D0-B917-00A0C9223196}"
+GUID_VideoDiscAudio = "{DFF220EA-F70F-11D0-B917-00A0C9223196}"
+GUID_DvdAudio = "{DFF220EB-F70F-11D0-B917-00A0C9223196}"
+GUID_TvTunerAudio = "{DFF220EC-F70F-11D0-B917-00A0C9223196}"
+GUID_SatelliteReceiverAudio = "{DFF220ED-F70F-11D0-B917-00A0C9223196}"
+GUID_CableTunerAudio = "{DFF220EE-F70F-11D0-B917-00A0C9223196}"
+GUID_DssAudio = "{DFF220EF-F70F-11D0-B917-00A0C9223196}"
+GUID_RadioReceiver = "{DFF220F0-F70F-11D0-B917-00A0C9223196}"
+GUID_RadioTransmitter = "{DFF220F1-F70F-11D0-B917-00A0C9223196}"
+GUID_MultitrackRecorder = "{DFF220F2-F70F-11D0-B917-00A0C9223196}"
+GUID_Synthesizer = "{DFF220F3-F70F-11D0-B917-00A0C9223196}"
+
+S_Provider = "TC-HELICON"
+S_Mfg = "TC-HELICON"
+S_DiskName = "Driver Installation Disk"
+
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;; EOF ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
