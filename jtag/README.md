@@ -7,12 +7,12 @@ Pin mapping: TXD=TCK, RXD=TDI, RTS=TDO, CTS=TMS
 
 - DICE3 core: ARM926EJ-S
 - JTAG IDCODE: `0x17900F0F` (verified)
-- Config: `../dice3-openocd.cfg`
+- Config: `dice3-openocd.cfg`
 
 ## Triggering the BT/PAIR button
 
 ```bash
-openocd -f dice3-openocd.cfg -f jtag/trigger_bt.tcl
+openocd -f jtag/dice3-openocd.cfg -f jtag/trigger_bt.tcl
 ```
 
 Then in telnet (`telnet localhost 4444`):
@@ -31,7 +31,7 @@ Then in telnet (`telnet localhost 4444`):
 ## Reading the flash
 
 ```bash
-openocd -f dice3-openocd.cfg \
+openocd -f jtag/dice3-openocd.cfg \
   -c "halt" \
   -c "dump_image blender_flash_dump.bin 0x00000000 0x100000" \
   -c shutdown
