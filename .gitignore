@@ -17,9 +17,13 @@ apps/GoXLR-App-1.6.4.014.exe
 # Tools (not project artifacts)
 apps/jadx/
 
-# Ghidra lock files
+# Ghidra lock files and mutable session data
 *.lock~
 apps/**/*.lock
+apps/blender-windows/blender-windows.rep/**/~*.db/
+apps/blender-windows/blender-windows.rep/**/~index.*
+apps/blender-windows/blender-windows.rep/**/~journal.*
+apps/blender-windows/blender-windows.rep/projectState
 
 # DKMS build artifacts (will be replaced by patch series)
 snd-usb-audio-tc-helicon-dkms/
