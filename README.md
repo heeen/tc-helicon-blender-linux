@@ -173,12 +173,13 @@ OpenOCD config and scripts for the DICE3 ARM core are in [`jtag/`](jtag/). The `
 kernel-patches/          Kernel patches + DKMS build script
 blender-ctl/             Rust workspace (CLI, TUI, BLE, USB, protocol)
 pipewire/                PipeWire/WirePlumber channel splitting configs
+udev/                    udev rules + init script (fallback for unpatched kernels)
 images/                  Screenshots
 apps/blender-windows/    Ghidra project (Windows driver RE)
 apps/firmware/           GoXLR firmware (sister device, for comparison)
 blender_flash_dump.bin   Blender firmware flash dump (JTAG)
 Protocol.md              Full BLE + USB protocol reference
-jtag/                    OpenOCD configs and JTAG scripts
+jtag/                    OpenOCD config, JTAG scripts, and scan captures
 blender_ble.py           Python BLE client prototype (bleak)
 ```
 

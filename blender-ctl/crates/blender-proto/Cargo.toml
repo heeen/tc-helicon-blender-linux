@@ -2,5 +2,3 @@
 name = "blender-proto"
 edition.workspace = true
 version.workspace = true
-
-[dev-dependencies]
