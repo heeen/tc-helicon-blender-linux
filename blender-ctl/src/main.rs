@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tokio::io::{self, AsyncBufReadExt, BufReader};
@@ -53,6 +55,53 @@ enum UsbCommand {
         cmd_id: String,
         /// Body as hex bytes (e.g. "01 02 03")
         body: Option<String>,
+    },
+    /// SPI flash operations (requires patched firmware)
+    #[command(subcommand)]
+    Flash(FlashCommand),
+}
+
+#[derive(Subcommand)]
+enum FlashCommand {
+    /// Query flash info (JEDEC ID, sector/flash size)
+    Info,
+    /// Read flash region
+    Read {
+        /// Start address (hex, e.g. 0x50000)
+        addr: String,
+        /// Length in bytes (hex or decimal)
+        len: String,
+        /// Output file (omit for hexdump to stdout)
+        file: Option<String>,
+    },
+    /// Erase flash sectors
+    Erase {
+        /// Start address (sector-aligned)
+        addr: String,
+        /// Length in bytes
+        len: String,
+    },
+    /// Write file to flash (must be erased first!)
+    Write {
+        /// Start address
+        addr: String,
+        /// Input file
+        file: String,
+    },
+    /// Full 1MB flash dump
+    Dump {
+        /// Output file (default: flash_dump.bin)
+        file: Option<String>,
+    },
+    /// Erase + write + verify firmware update (primary copy only)
+    Update {
+        /// Firmware image file
+        file: String,
+    },
+    /// Erase + write multiple sectors in one session (addr:file pairs)
+    WriteSectors {
+        /// Sector specifications: 0xADDR:path [0xADDR:path ...]
+        specs: Vec<String>,
     },
 }
 
@@ -110,6 +159,7 @@ async fn main() -> Result<()> {
                 UsbCommand::Init => cmd_usb_init(),
                 UsbCommand::Info => cmd_usb_info(),
                 UsbCommand::Dcp { cmd_id, body } => cmd_usb_dcp(&cmd_id, body.as_deref()),
+                UsbCommand::Flash(flash) => cmd_usb_flash(flash),
             })
             .await?
         }
@@ -421,6 +471,99 @@ fn cmd_usb_init() -> Result<()> {
 
 fn cmd_usb_info() -> Result<()> {
     blender_usb::BlenderUsb::print_info()
+}
+
+fn cmd_usb_flash(cmd: FlashCommand) -> Result<()> {
+    let mut dev = blender_usb::BlenderUsb::open()?;
+    println!("Found {} at {}", dev.name(), dev.addr);
+    dev.claim()?;
+
+    // Skip boot init for recovery PID — it doesn't support the normal init sequence.
+    // For flash commands, init failure is non-fatal: the device may already be
+    // running (e.g. after JTAG injection) and just needs DCP reset.
+    if dev.pid != blender_usb::PID_BLENDER_BOOT {
+        if let Err(_) = dev.ping() {
+            log::info!("Device not initialized, running boot sequence...");
+            if let Err(e) = dev.init() {
+                log::warn!("Boot init failed ({e}), proceeding anyway — device may already be running");
+            }
+        }
+        let _ = dev.dcp_flush();
+        let _ = dev.dcp_reset();
+    }
+
+    let result = match cmd {
+        FlashCommand::Info => {
+            let info = dev.flash_info()?;
+            println!("{info}");
+            Ok(())
+        }
+        FlashCommand::Read { addr, len, file } => {
+            let addr = parse_u32(&addr)?;
+            let len = parse_u32(&len)?;
+            let data = dev.flash_read(addr, len)?;
+            if let Some(path) = file {
+                std::fs::write(&path, &data)?;
+                println!("Wrote {} bytes to {path}", data.len());
+            } else {
+                blender_usb::hexdump("", &data);
+            }
+            Ok(())
+        }
+        FlashCommand::Erase { addr, len } => {
+            let addr = parse_u32(&addr)?;
+            let len = parse_u32(&len)?;
+            println!("Erasing {len:#x} bytes at {addr:#x}...");
+            dev.flash_erase(addr, len)?;
+            println!("Erase OK");
+            Ok(())
+        }
+        FlashCommand::Write { addr, file } => {
+            let addr = parse_u32(&addr)?;
+            let data = std::fs::read(&file)?;
+            println!("Writing {} bytes to {addr:#x}...", data.len());
+            dev.flash_write(addr, &data)?;
+            println!("Write OK");
+            Ok(())
+        }
+        FlashCommand::Dump { file } => {
+            let path = PathBuf::from(file.as_deref().unwrap_or("flash_dump.bin"));
+            dev.flash_dump(&path)?;
+            Ok(())
+        }
+        FlashCommand::Update { file } => {
+            dev.flash_update(&PathBuf::from(file))?;
+            Ok(())
+        }
+        FlashCommand::WriteSectors { specs } => {
+            for spec in &specs {
+                let (addr_str, path) = spec.split_once(':')
+                    .ok_or_else(|| anyhow::anyhow!("Bad spec '{}', expected 0xADDR:path", spec))?;
+                let addr = parse_u32(addr_str)?;
+                let data = std::fs::read(path)
+                    .map_err(|e| anyhow::anyhow!("Failed to read {}: {}", path, e))?;
+                let sector_size = 0x1000u32;
+                println!("[{addr:#x}] erase {sector_size:#x}...");
+                dev.flash_erase(addr, sector_size)?;
+                println!("[{addr:#x}] write {} bytes...", data.len());
+                dev.flash_write(addr, &data)?;
+                println!("[{addr:#x}] OK");
+            }
+            Ok(())
+        }
+    };
+
+    dev.release();
+    result
+}
+
+fn parse_u32(s: &str) -> Result<u32> {
+    let s = s.trim();
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        Ok(u32::from_str_radix(hex, 16)?)
+    } else {
+        Ok(s.parse()?)
+    }
 }
 
 fn cmd_usb_dcp(cmd_id_str: &str, body_str: Option<&str>) -> Result<()> {

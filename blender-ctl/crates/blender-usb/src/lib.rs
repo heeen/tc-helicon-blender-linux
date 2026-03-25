@@ -1,3 +1,5 @@
+pub mod flash;
+
 use std::thread;
 use std::time::Duration;
 
@@ -8,14 +10,16 @@ use blender_proto::dcp;
 
 pub const VID_TC_HELICON: u16 = 0x1220;
 pub const PID_BLENDER: u16 = 0x8fe1;
+pub const PID_BLENDER_BOOT: u16 = 0x802a;
 pub const PID_GOXLR: u16 = 0x8fe0;
 pub const PID_GOXLR_MINI: u16 = 0x8fe4;
 
-const SUPPORTED_PIDS: &[u16] = &[PID_BLENDER, PID_GOXLR, PID_GOXLR_MINI];
+const SUPPORTED_PIDS: &[u16] = &[PID_BLENDER, PID_BLENDER_BOOT, PID_GOXLR, PID_GOXLR_MINI];
 
 pub fn pid_name(pid: u16) -> &'static str {
     match pid {
         PID_BLENDER => "Blender",
+        PID_BLENDER_BOOT => "Blender (boot/recovery)",
         PID_GOXLR => "GoXLR",
         PID_GOXLR_MINI => "GoXLR Mini",
         _ => "Unknown",
@@ -248,20 +252,28 @@ impl BlenderUsb {
         unreachable!()
     }
 
-    /// Flush the DCP pipe (read any pending response).
+    /// Drain the DCP pipe — read all pending responses until empty.
     pub fn dcp_flush(&self) -> Result<()> {
         let bmreq_in =
             rusb::request_type(Direction::In, RequestType::Vendor, Recipient::Interface);
         let mut buf = vec![0u8; 1040];
-        let _ = self
-            .handle
-            .read_control(bmreq_in, 3, 0, 0, &mut buf, Duration::from_millis(500));
+        for _ in 0..10 {
+            match self
+                .handle
+                .read_control(bmreq_in, 3, 0, 0, &mut buf, Duration::from_millis(100))
+            {
+                Ok(n) => log::debug!("Flushed {n} bytes from DCP pipe"),
+                Err(_) => break, // timeout = pipe is empty
+            }
+        }
         Ok(())
     }
 
     /// Reset the DCP command index.
     pub fn dcp_reset(&mut self) -> Result<Vec<u8>> {
         self.cmd_idx = 0;
+        // Drain any stale responses first
+        self.dcp_flush()?;
         self.dcp_command(0, &[])
     }
 
