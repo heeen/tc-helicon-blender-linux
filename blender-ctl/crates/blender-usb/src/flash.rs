@@ -18,8 +18,10 @@ const FLASH_CATEGORY: u16 = 0x81F;
 /// Maximum bytes per READ operation (DCP body limit).
 const MAX_READ_CHUNK: usize = 1024;
 
-/// Maximum data bytes per WRITE operation (DCP body = 4 addr + data).
-const MAX_WRITE_CHUNK: usize = 1020;
+/// Maximum data bytes per WRITE operation.
+/// USB control endpoint buffer on DICE3 is limited — 1040-byte transfers
+/// timeout. 256 bytes data + 4 addr + 16 header = 276 bytes works reliably.
+const MAX_WRITE_CHUNK: usize = 256;
 
 /// Golden copy / recovery partition: SPI 0x10000–0x3FFFF.
 /// The firmware handler also enforces this server-side.

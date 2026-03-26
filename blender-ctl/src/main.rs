@@ -545,6 +545,11 @@ fn cmd_usb_flash(cmd: FlashCommand) -> Result<()> {
                 let sector_size = 0x1000u32;
                 println!("[{addr:#x}] erase {sector_size:#x}...");
                 dev.flash_erase(addr, sector_size)?;
+                // Flush stale DCP state + settle after erase
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                dev.dcp_flush()?;
+                dev.ping()?;
+                std::thread::sleep(std::time::Duration::from_millis(100));
                 println!("[{addr:#x}] write {} bytes...", data.len());
                 dev.flash_write(addr, &data)?;
                 println!("[{addr:#x}] OK");
