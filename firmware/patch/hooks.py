@@ -37,8 +37,26 @@ PATCHED_SPI = FIRMWARE_DIR / 'blender_spi_patched.bin'
 
 OLD_SIZE_WORDS = 0xAA22
 BODY_CONTENT_SIZE = OLD_SIZE_WORDS * 4 - 4  # 174212 bytes
-PATCH_ZONE_SRAM = 0x200 + BODY_CONTENT_SIZE  # 0x2AA84 (append to body)
-PATCH_ZONE_SIZE = 0x800                       # 2KB for future growth
+
+# Handler runs from SRAM 0x80000 — second SRAM bank, untouched by eCos.
+#
+# DICE3 has ≥1MB SRAM. Firmware uses 0x00000-0x50000 (320KB).
+# Addresses 0x80000+ survive reboot (confirmed) and are never touched
+# by eCos (BSS clear, heap, thread stacks, DEADBEEF fill).
+#
+# BUT: bootloader DMA can't copy to 0x80000 (different bus). So the body
+# carries the handler blob in BSS range, and a .ctors init function
+# memcpy's it to 0x80000 during boot (before thread creation).
+#
+# Layout in body:
+#   0x2AA84: .ctors entry (4B) → points to ctor_init at 0x2AA88
+#   0x2AA88: ctor_init function (~100B) — copies handler + calls originals
+#   0x2AB20: handler blob (~960B) — compiled for 0x80000, copied there by ctor_init
+#
+# BSS_start patched to 0x2AB20 + handler_size (protects ctor_init + handler blob).
+# After ctor_init copies handler, the blob at 0x2AB20 can be overwritten by threads.
+PATCH_ZONE_SRAM = 0x80000
+PATCH_ZONE_SIZE = 0x1000
 
 # eCos BSS start pointer location (in body, SRAM address 0x698)
 BSS_START_PTR_SRAM = 0x698
