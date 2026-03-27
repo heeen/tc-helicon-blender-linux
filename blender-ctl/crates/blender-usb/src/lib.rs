@@ -209,8 +209,10 @@ impl BlenderUsb {
         Ok(())
     }
 
-    /// Send a DCP command and read the response.
-    /// Uses the correct protocol: bReq=2 write, bReq=3 read, with retry loop.
+    /// Send a DCP command and read the matching response.
+    ///
+    /// If a stale response (wrong cmd_idx) is read, it is discarded and
+    /// the read retries. This handles desynchronization from prior sessions.
     pub fn dcp_command(&mut self, cmd_id: u32, body: &[u8]) -> Result<Vec<u8>> {
         let bmreq_out =
             rusb::request_type(Direction::Out, RequestType::Vendor, Recipient::Interface);
@@ -225,13 +227,17 @@ impl BlenderUsb {
 
         let pkt = dcp::build_packet(cmd_id, body, self.cmd_idx);
 
+        // Small settle delay before sending — DICE3 EP0 needs time between
+        // control transfers, especially after flash operations.
+        thread::sleep(Duration::from_millis(20));
+
         self.handle
             .write_control(bmreq_out, 2, 0, 0, &pkt, timeout)
             .context("DCP write (bReq=2) failed")?;
 
-        // Retry loop: up to 20 attempts with 10ms sleep (matching goxlr-utility)
-        for attempt in 0..20 {
-            thread::sleep(Duration::from_millis(10));
+        // Retry loop: read responses, skip stale ones (wrong cmd_idx)
+        for attempt in 0..30 {
+            thread::sleep(Duration::from_millis(15));
             let mut resp = vec![0u8; 1040];
             match self
                 .handle
@@ -239,13 +245,24 @@ impl BlenderUsb {
             {
                 Ok(n) => {
                     resp.truncate(n);
+                    // Check cmd_idx match (skip stale responses)
+                    if resp.len() >= 8 && cmd_id != 0 {
+                        let resp_idx = u16::from_le_bytes([resp[6], resp[7]]);
+                        if resp_idx != self.cmd_idx {
+                            log::debug!(
+                                "DCP stale response: idx {} != expected {}",
+                                resp_idx, self.cmd_idx
+                            );
+                            continue;
+                        }
+                    }
                     return Ok(resp);
                 }
                 Err(e) => {
-                    if attempt < 19 {
+                    if attempt < 29 {
                         continue;
                     }
-                    bail!("DCP response read failed after 20 attempts: {e}");
+                    bail!("DCP response read failed after 30 attempts: {e}");
                 }
             }
         }

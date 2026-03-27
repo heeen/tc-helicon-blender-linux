@@ -19,8 +19,7 @@ const FLASH_CATEGORY: u16 = 0x81F;
 const MAX_READ_CHUNK: usize = 1024;
 
 /// Maximum data bytes per WRITE operation.
-/// USB control endpoint buffer on DICE3 is limited — 1040-byte transfers
-/// timeout. 256 bytes data + 4 addr + 16 header = 276 bytes works reliably.
+/// USB control endpoint buffer limit: 256 data + 4 addr + 16 header = 276 bytes.
 const MAX_WRITE_CHUNK: usize = 256;
 
 /// Golden copy / recovery partition: SPI 0x10000–0x3FFFF.
@@ -185,9 +184,6 @@ impl BlenderUsb {
             }
 
             offset += chunk;
-            if offset < data.len() && offset % 0x10000 == 0 {
-                log::info!("  written {:#x}/{:#x}...", offset, data.len());
-            }
         }
         Ok(())
     }
