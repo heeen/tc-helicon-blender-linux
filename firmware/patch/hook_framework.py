@@ -661,6 +661,11 @@ class HookEngine:
         print(f"Spliced hook binary: {len(hook_bin)} bytes at SRAM "
               f"0x{self.patch_zone_start:05X}")
 
+        # Pad content to 4-byte alignment (required: bootloader reads size_words*4)
+        pad = (4 - len(content) % 4) % 4
+        if pad:
+            content.extend(b'\x00' * pad)
+
         # Write trampolines for each hook
         for hook in self.hooks:
             off = sram_to_file(hook.target)
@@ -879,8 +884,10 @@ class PatchProject:
         if self.bss_start_ptr:
             body_arr = bytearray(new_body[:-4])  # strip CRC
             old_bss = struct.unpack_from('<I', body_arr, sram_to_file(self.bss_start_ptr))[0]
-            # New bss_start = patch_zone_start + hook_bin size, aligned to 16
-            new_bss = (engine.patch_zone_start + len(hook_bin_data) + 15) & ~15
+            # bss_start = body content end (same convention as original firmware).
+            # The CRC checkword (last 4 body bytes) gets overwritten by BSS clear,
+            # which is fine — bootloader has already verified it at this point.
+            new_bss = SRAM_LOAD_ADDR + len(new_body) - 4  # content end
             if new_bss > old_bss:
                 struct.pack_into('<I', body_arr, sram_to_file(self.bss_start_ptr), new_bss)
                 print(f"  bss_start: 0x{old_bss:05X} → 0x{new_bss:05X} "
