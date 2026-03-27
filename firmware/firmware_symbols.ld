@@ -43,6 +43,22 @@ dcp_state            = 0x30F78;
 /* Displaced function — original target of `bl` at 0x4FAC (primary event loop) */
 FUN_2f38 = 0x2F38;
 
+/* Mixer hardware functions (primary firmware) */
+channel_level_apply    = 0x1468;  /* (bus 0-3, input 0-6, level 0-31) → DICE mixer coeff */
+master_level_apply     = 0x45C0;  /* (bus 0-3, level 0-31) → master output */
+compressor_level_apply = 0x13F0;  /* (bus 0-3, level 0-31) → compressor amount */
+mute_set               = 0x4570;  /* (bus 0-3, on/off) */
+led_mute_update        = 0x68F4;  /* (input 0-5, on/off) → LED via SPI to coprocessor */
+
+/* Mixer state (SRAM BSS) — inputs[4][7] + compressor[4] + master[4] = 36 bytes */
+mixer_state = 0x2D81C;
+
+/* MIDI subsystem (primary firmware) */
+midi_parser_ctx         = 0x29764;  /* MIDI parser state: status+0, cb_channel+0x28, cb_sysex+0x2C */
+midi_channel_msg_cb_orig = 0x2A44; /* original channel message callback (chains to this) */
+midi_tx_write           = 0x1114;  /* (ringbuf+0x2C, data, len) → USB MIDI EP IN */
+midi_rx_ringbuf         = 0x29404; /* ring buffer: base+0, len+4, woff+8, roff+C */
+
 /*
  * ════════════════════════════════════════════════════════════
  * GOLDEN FIRMWARE addresses (used by sram_flash_restore.c)
