@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Flash patched firmware and reboot via JTAG.
+"""Flash patched firmware and reboot via JTAG + USB.
 
 Reliable flash-reboot-test cycle:
   1. JTAG inject handler (halt → load SRAM → resume)
-  2. USB replug (automatic via JTAG reset + re-enumerate)
-  3. Flash sectors via USB DCP (one chunk per USB session, retry on failure)
+  2. Replug USB (JTAG halt disrupts USB; device is self-powered)
+  3. Flash sectors via blender-ctl USB DCP
   4. Reboot via JTAG nRST
 
 Usage:
@@ -14,7 +14,6 @@ Usage:
 """
 
 import argparse
-import struct
 import subprocess
 import sys
 import time
@@ -29,16 +28,38 @@ HOOKS_ELF = PATCH_DIR / 'hooks.elf'
 OPENOCD_CFG = FIRMWARE_DIR.parent / 'jtag' / 'miolink-dice3-openocd.cfg'
 
 SECTOR_SIZE = 0x1000
-VID, PID = 0x1220, 0x8FE1
 
-# Patch zone and identity from hooks.py
-PATCH_ZONE_SRAM = 0x2AA84
+# Firmware constants (not patch addresses)
 IDENTITY_ADDR = 0x8968
 IDENTITY_WORD = 0xE92D4FF0
 HOOK_TARGET = 0x4FAC
 
+BLENDER_CTL = FIRMWARE_DIR.parent / 'blender-ctl' / 'target' / 'release' / 'blender-ctl'
 
-# ── OpenOCD helpers ──────────────────────────────────────────────────────
+
+def _flash_cmd():
+    if BLENDER_CTL.exists():
+        return [str(BLENDER_CTL)]
+    return ['cargo', 'run', '-q', '--manifest-path',
+            str(FIRMWARE_DIR.parent / 'blender-ctl' / 'Cargo.toml'), '--']
+
+
+def read_elf_symbols():
+    """Read symbol addresses from hooks.elf."""
+    result = subprocess.run(
+        ['arm-none-eabi-nm', str(HOOKS_ELF)],
+        capture_output=True, text=True)
+    if result.returncode != 0:
+        return {}
+    symbols = {}
+    for line in result.stdout.strip().split('\n'):
+        parts = line.strip().split()
+        if len(parts) == 3:
+            symbols[parts[2]] = int(parts[0], 16)
+    return symbols
+
+
+# ── OpenOCD ──────────────────────────────────────────────────────────────
 
 class OpenOCD:
     def __init__(self, host='localhost', port=6666, timeout=10):
@@ -85,7 +106,7 @@ class OpenOCD:
 
 
 def ensure_openocd():
-    """Start OpenOCD if not running, return True if available."""
+    """Start OpenOCD if not running."""
     import socket
     try:
         s = socket.create_connection(('localhost', 6666), timeout=2)
@@ -126,7 +147,15 @@ def encode_arm_bl(from_addr, to_addr):
 
 def jtag_inject(ocd):
     """Inject handler into SRAM via JTAG. Returns True on success."""
-    print("\n── JTAG Inject ──")
+    symbols = read_elf_symbols()
+    patch_zone = symbols.get('_hook_dcp_flash_stub')
+    done_flag = symbols.get('done_flag')
+    mailbox = symbols.get('jtag_mailbox')
+    if not patch_zone:
+        print("  ERROR: Can't find _hook_dcp_flash_stub in ELF")
+        return False
+
+    print(f"\n── JTAG Inject (stub@0x{patch_zone:05X}) ──")
 
     ocd.halt()
     time.sleep(0.2)
@@ -140,163 +169,49 @@ def jtag_inject(ocd):
     print(f"  Identity OK")
 
     # Load hook binary
-    result = ocd.load_image(str(HOOKS_BIN.resolve()), PATCH_ZONE_SRAM)
+    result = ocd.load_image(str(HOOKS_BIN.resolve()), patch_zone)
     print(f"  Load: {result}")
 
     # Write trampoline
-    tramp = encode_arm_bl(HOOK_TARGET, PATCH_ZONE_SRAM)
+    tramp = encode_arm_bl(HOOK_TARGET, patch_zone)
     ocd.mww(HOOK_TARGET, tramp)
-    print(f"  Trampoline: {HOOK_TARGET:#x} → BL {PATCH_ZONE_SRAM:#x} ({tramp:#010x})")
+    print(f"  Trampoline: {HOOK_TARGET:#x} → BL {patch_zone:#x} ({tramp:#010x})")
 
-    # I-cache invalidate + resume
+    # Clear done flag and mailbox
+    if done_flag:
+        ocd.mww(done_flag, 0)
+    if mailbox:
+        for off in range(0, 24, 4):
+            ocd.mww(mailbox + off, 0)
+
+    # I-cache + D-cache invalidate, resume
     ocd.invalidate_icache()
+    ocd.cmd("arm mcr 15 0 7 6 0 0")  # D-cache
     ocd.resume()
     print("  Resumed — handler live")
     return True
 
 
-# ── USB flash ────────────────────────────────────────────────────────────
-
-def usb_find():
-    """Find Blender USB device."""
-    import usb.core
-    return usb.core.find(idVendor=VID, idProduct=PID)
-
-
-def usb_reset_and_wait(max_wait=10):
-    """Reset USB device and wait for re-enumeration."""
-    dev = usb_find()
-    if dev:
-        try:
-            dev.reset()
-        except Exception:
-            pass
-    for _ in range(max_wait * 2):
-        time.sleep(0.5)
-        if usb_find():
-            time.sleep(0.5)
-            return True
-    return False
-
-
-def dcp_command_oneshot(cmd_id, body=b'', timeout_ms=5000):
-    """Open USB, send one DCP command, read response, close. Ultra-reliable."""
-    import usb.core
-    dev = usb.core.find(idVendor=VID, idProduct=PID)
-    if not dev:
-        raise RuntimeError("Device not found")
-
-    # Detach kernel drivers
-    for cfg in dev:
-        for intf in cfg:
-            try:
-                dev.detach_kernel_driver(intf.bInterfaceNumber)
-            except Exception:
-                pass
-    dev.set_configuration()
-
-    # Build DCP packet (cmd_idx=1, doesn't matter for single-shot)
-    hdr = struct.pack('<IHH', cmd_id, len(body), 1) + b'\x00' * 8
-    pkt = hdr + body
-
-    # Send command
-    dev.ctrl_transfer(0x41, 2, 0, 0, pkt, timeout=timeout_ms)
-
-    # Read response with retries
-    for _ in range(40):
-        time.sleep(0.025)
-        try:
-            resp = bytes(dev.ctrl_transfer(0xC1, 3, 0, 0, 1040, timeout=timeout_ms))
-            if len(resp) > 16:
-                return resp[16:]  # strip DCP header
-        except Exception:
-            pass
-
-    # Fallback: return empty
-    return b''
-
+# ── USB flash via blender-ctl ────────────────────────────────────────────
 
 def flash_info():
-    """Query flash info via DCP."""
-    resp = dcp_command_oneshot(0x81F000)
-    if len(resp) >= 12:
-        jedec = struct.unpack_from('<I', resp, 0)[0]
-        return jedec
-    return 0
-
-
-def flash_erase_sector(spi_addr):
-    """Erase one sector."""
-    body = struct.pack('<II', spi_addr, SECTOR_SIZE)
-    resp = dcp_command_oneshot(0x81F002, body)
-    if len(resp) >= 4:
-        return struct.unpack_from('<I', resp, 0)[0]
-    return -1
-
-
-def flash_write_chunk(spi_addr, data):
-    """Write a small chunk (≤256 bytes)."""
-    body = struct.pack('<I', spi_addr) + data
-    resp = dcp_command_oneshot(0x81F003, body, timeout_ms=10000)
-    if len(resp) >= 4:
-        return struct.unpack_from('<I', resp, 0)[0]
-    return -1
-
-
-def flash_sectors(sectors_to_write):
-    """Write sectors to SPI flash. Each DCP command is a fresh USB session."""
-    CHUNK = 128  # bytes per write — conservative for reliability
-
-    print("\n── Flash Sectors ──")
-    jedec = flash_info()
-    if jedec != 0xBF2541:
-        print(f"  Flash handler not responding (JEDEC={jedec:#x})")
+    """Check flash handler via blender-ctl."""
+    cmd = _flash_cmd() + ['usb', 'flash', 'info']
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    if r.returncode != 0:
         return False
+    print(f"  {r.stdout.strip()}")
+    return True
 
-    print(f"  Flash handler OK (JEDEC {jedec:#06x})")
 
-    patched = SPI_PATCHED.read_bytes()
-
-    for spi_addr in sectors_to_write:
-        sector = patched[spi_addr:spi_addr + SECTOR_SIZE]
-        if len(sector) < SECTOR_SIZE:
-            sector += b'\xff' * (SECTOR_SIZE - len(sector))
-
-        # Erase
-        print(f"  [{spi_addr:#07x}] erase...", end=' ', flush=True)
-        for attempt in range(3):
-            status = flash_erase_sector(spi_addr)
-            if status == 0:
-                print("OK")
-                break
-            print(f"retry({status:#x})...", end=' ', flush=True)
-            usb_reset_and_wait(5)
-        else:
-            print("FAILED")
-            return False
-
-        time.sleep(0.3)
-
-        # Write in chunks
-        print(f"  [{spi_addr:#07x}] write ", end='', flush=True)
-        for off in range(0, SECTOR_SIZE, CHUNK):
-            chunk = sector[off:off + CHUNK]
-            for attempt in range(3):
-                try:
-                    status = flash_write_chunk(spi_addr + off, chunk)
-                    if status == 0:
-                        break
-                except Exception:
-                    status = -1
-                if attempt < 2:
-                    usb_reset_and_wait(3)
-            else:
-                print(f" FAIL@+{off:#x}")
-                return False
-            print('.', end='', flush=True)
-        print(" OK")
-        time.sleep(0.3)
-
+def flash_update():
+    """Flash the patched SPI image via blender-ctl."""
+    cmd = _flash_cmd() + ['usb', 'flash', 'update', str(SPI_PATCHED)]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    print(r.stdout)
+    if r.returncode != 0:
+        print(f"ERROR: {r.stderr}")
+        return False
     return True
 
 
@@ -307,18 +222,6 @@ def jtag_reboot(ocd):
     print("\n── Reboot ──")
     ocd.reset_run()
     print("  nRST asserted — device rebooting")
-    time.sleep(3)
-    if usb_find():
-        print("  USB re-enumerated — device up")
-        return True
-    # Wait longer
-    for _ in range(10):
-        time.sleep(1)
-        if usb_find():
-            print("  USB re-enumerated — device up")
-            return True
-    print("  WARNING: USB not re-enumerated after 13s")
-    return False
 
 
 # ── Main ─────────────────────────────────────────────────────────────────
@@ -338,7 +241,7 @@ def find_changed_sectors():
 def main():
     parser = argparse.ArgumentParser(description='Flash + reboot via JTAG')
     parser.add_argument('--reboot', action='store_true', help='Just reboot')
-    parser.add_argument('--inject', action='store_true', help='Just JTAG inject (no flash)')
+    parser.add_argument('--inject', action='store_true', help='Just JTAG inject')
     args = parser.parse_args()
 
     if not ensure_openocd():
@@ -356,60 +259,41 @@ def main():
 
         if args.inject:
             print("\nHandler injected (SRAM only, not persistent).")
-            print("Replug USB to test, or run without --inject to flash.")
+            print("Replug USB, then test: blender-ctl usb flash info")
             return
 
-        # After inject, device USB is disrupted. Reset to get clean USB.
+        # After inject, USB is disrupted. Prompt for replug.
         print("\n── USB Recovery ──")
-        ocd.reset_run()
-        print("  Device reset via nRST")
-        time.sleep(2)
+        print("  JTAG halt disrupted USB. Please replug the USB cable.")
+        input("  Press Enter when USB is replugged...")
 
-        # Re-inject after reset (SRAM was cleared)
-        print("  Re-injecting after reset...")
-        time.sleep(1)
-        if not jtag_inject(ocd):
+        # Verify flash handler
+        print("\nChecking flash handler...")
+        if not flash_info():
+            print("Flash handler not responding after replug.")
             sys.exit(1)
 
-        # Now we need USB. The inject halted briefly — try USB reset.
-        print("  Waiting for USB...", end=' ', flush=True)
-        time.sleep(2)
-        if not usb_find():
-            # Try nRST to get USB back, but that clears SRAM...
-            # Instead, just wait longer
-            for _ in range(10):
-                time.sleep(1)
-                if usb_find():
-                    break
-        if usb_find():
-            print("OK")
-        else:
-            print("FAIL — please replug USB cable")
-            input("Press Enter when USB is replugged...")
-
-        # Flash
+        # Show what will change
         sectors = find_changed_sectors()
         print(f"\nSectors to flash: {[f'{s:#07x}' for s in sectors]}")
-        if not flash_sectors(sectors):
-            print("\nFlash FAILED. Device may need recovery.")
+
+        resp = input("Proceed? [y/N] ")
+        if resp.lower() != 'y':
+            print("Aborted.")
+            return
+
+        # Flash via blender-ctl
+        if not flash_update():
+            print("Flash FAILED.")
             sys.exit(1)
 
         # Reboot to activate persistent patch
         jtag_reboot(ocd)
 
-        # Verify
-        print("\n── Verify ──")
-        time.sleep(2)
-        jedec = flash_info()
-        if jedec == 0xBF2541:
-            print("  Flash handler alive after reboot — persistent patch WORKS")
-        else:
-            print(f"  Flash handler not responding (JEDEC={jedec:#x})")
-            print("  Persistent patch may not have installed correctly")
-
         print("\n" + "=" * 50)
-        print("Done. Test MIDI CCs:")
-        print("  amidi -p hw:1,0,0 -S 'B0 07 40'  # master bus A ~50%")
+        print("Done. Power cycle to test persistent patch.")
+        print("  blender-ctl usb flash info")
+        print("  amidi -p hw:1,0,0 -S 'B0 07 40'")
         print("=" * 50)
 
     finally:

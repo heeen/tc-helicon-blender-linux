@@ -781,11 +781,10 @@ class PatchProject:
         engine_kwargs: dict | None = None,
         firmware_symbols: str | Path | None = None,
         identity_check: tuple[int, int] | None = None,
-        bss_start_ptr: int | None = None,
+        dcp_handler_list: int | None = None,
     ):
         self.hooks = hooks
         self.binary_patches = binary_patches or []
-        self.bss_start_ptr = bss_start_ptr  # SRAM addr of __bss_start pointer
         self.spi_image = Path(spi_image) if spi_image else None
         self.patched_spi = Path(patched_spi) if patched_spi else None
         self.hook_bin = Path(hook_bin)
@@ -795,7 +794,8 @@ class PatchProject:
         self.patch_ld = self.build_dir / "patch.ld"
         self.engine_kwargs = engine_kwargs or {}
         self.firmware_symbols = firmware_symbols
-        self.identity_check = identity_check  # (sram_addr, expected_word)
+        self.identity_check = identity_check
+        self.dcp_handler_list = dcp_handler_list
 
     def _load_body(self, require_crc: bool = False) -> bytes:
         if not self.spi_image or not self.spi_image.exists():
@@ -880,22 +880,6 @@ class PatchProject:
         hook_bin_data = self.hook_bin.read_bytes()
         new_body = engine.patch_body(hook_bin_data)
 
-        # Patch bss_start pointer if body was extended
-        if self.bss_start_ptr:
-            body_arr = bytearray(new_body[:-4])  # strip CRC
-            old_bss = struct.unpack_from('<I', body_arr, sram_to_file(self.bss_start_ptr))[0]
-            # bss_start = body content end (same convention as original firmware).
-            # The CRC checkword (last 4 body bytes) gets overwritten by BSS clear,
-            # which is fine — bootloader has already verified it at this point.
-            new_bss = SRAM_LOAD_ADDR + len(new_body) - 4  # content end
-            if new_bss > old_bss:
-                struct.pack_into('<I', body_arr, sram_to_file(self.bss_start_ptr), new_bss)
-                print(f"  bss_start: 0x{old_bss:05X} → 0x{new_bss:05X} "
-                      f"(+{new_bss - old_bss} bytes, protects handler)")
-                # Recompute CRC
-                new_crc = compute_crc_checkword(bytes(body_arr))
-                new_body = bytes(body_arr) + new_crc
-
         # Apply binary patches
         if self.binary_patches:
             body_arr = bytearray(new_body[:-4])  # strip CRC
@@ -976,6 +960,22 @@ class PatchProject:
         check = ocd.mdw(engine.patch_zone_start)[0]
         print(f"  Verify: 0x{engine.patch_zone_start:05X} = {check:#010x}")
 
+        # Clear BSS (done_flag, mailbox, handler node — must be zero for init)
+        # Read BSS section bounds from ELF via objdump
+        import subprocess as _sp
+        _r = _sp.run(['arm-none-eabi-objdump', '-h', str(self.elf_path)],
+                     capture_output=True, text=True)
+        for line in _r.stdout.splitlines():
+            if '.bss' in line:
+                parts = line.split()
+                # Format: idx name size vma lma offset align
+                bss_size = int(parts[2], 16)
+                bss_addr = int(parts[3], 16)
+                print(f"\nClearing BSS: 0x{bss_addr:05X} ({bss_size} bytes)")
+                for addr in range(bss_addr, bss_addr + bss_size, 4):
+                    ocd.mww(addr, 0)
+                break
+
         # Write trampolines
         print("\nWriting trampolines...")
         for hook in engine.hooks:
@@ -987,9 +987,45 @@ class PatchProject:
             insn = "BL" if hook._is_bl else "B"
             print(f"  0x{hook.target:05X}: {insn} 0x{hook._stub_addr:05X} ({tramp:#010x})")
 
-        # Invalidate I-cache and resume
+        # Direct DCP handler registration via memory writes.
+        # The main loop may be blocked in cyg_flag_wait, so the trampoline
+        # hook at 0x4FAC may never fire. Register the handler directly by
+        # building a node in BSS and linking it into the DCP handler list.
+        symbols = self.read_elf_symbols()
+        flash_handler_addr = symbols.get('flash_handler')
+        node_addr = symbols.get('node.0') or symbols.get('node')
+        dcp_handler_list = self.dcp_handler_list or symbols.get('dcp_handler_list')
+        if flash_handler_addr and node_addr and dcp_handler_list:
+            old_head = ocd.mdw(dcp_handler_list)[0]
+            # Build node: {next, category(u16), padding(u16), handler, context}
+            ocd.mww(node_addr + 0, old_head)       # next = old list head
+            ocd.mww(node_addr + 4, 0x0000081F)      # category=0x81F (u16 LE), padding=0
+            ocd.mww(node_addr + 8, flash_handler_addr)  # handler
+            ocd.mww(node_addr + 12, 0)              # context = NULL
+            # Link into list
+            ocd.mww(dcp_handler_list, node_addr)
+            print(f"\nDirect DCP registration:")
+            print(f"  node@0x{node_addr:05X}: handler=0x{flash_handler_addr:05X} "
+                  f"cat=0x81F next=0x{old_head:05X}")
+            print(f"  Linked into list at 0x{dcp_handler_list:05X}")
+
+            # Set done_flag so flash_handler_init skips re-registration
+            done_flag_addr = symbols.get('done_flag')
+            if done_flag_addr:
+                ocd.mww(done_flag_addr, 0x444F4E45)  # DONE_MAGIC
+
+            # Install software_reboot as CLI 'reset' callback (BSS pointer at 0x320DC)
+            reboot_addr = symbols.get('software_reboot')
+            if reboot_addr:
+                ocd.mww(0x320DC, reboot_addr)
+                print(f"  CLI 'reset' → software_reboot@0x{reboot_addr:05X}")
+        else:
+            print("\nWARNING: Could not find flash_handler/node symbols for direct DCP registration")
+
+        # Invalidate I-cache + D-cache and resume
         ocd.invalidate_icache()
-        print("\nI-cache invalidated, resuming...")
+        ocd.cmd("arm mcr 15 0 7 6 0 0")  # D-cache
+        print("\nCaches invalidated, resuming...")
         ocd.resume()
 
         print("\n" + "=" * 60)

@@ -43,6 +43,11 @@ extern char midi_parser_ctx;
 #define MIDI_PARSER_CTX     ((volatile uint32_t *)&midi_parser_ctx)
 #define MIDI_CB_OFFSET      0x28  /* offset to channel_msg_cb function pointer */
 
+/* ── UART debug output (firmware functions, resolved via firmware_symbols.ld) ── */
+
+extern void uart_print_string(const char *s);
+extern int  uart_printf(const char *fmt, ...);
+
 /* ── Done flag ───────────────────────────────────────────────────────── */
 /* Placed in BSS — zeroed by C runtime (or by JTAG clear).
  * For body-append mode, the bootloader zeroes BSS on boot.
@@ -181,15 +186,33 @@ chain:
 /* ── Software reboot ─────────────────────────────────────────────────── */
 
 static void __attribute__((noreturn)) software_reboot(void) {
-    /* Disable IRQ + FIQ, jump to reset vector (bootloader entry) */
+    /* Full reboot: reset SPI controller to XIP mode, then jump to
+     * TCAT bootloader at XIP 0x4F000. The bootloader DMA-copies
+     * firmware from SPI to SRAM — equivalent to power cycle.
+     *
+     * Must reset SPI controller first because flash operations leave
+     * it in DMA mode, and XIP instruction fetch requires default mode. */
+    volatile uint32_t *spi = (volatile uint32_t *)0xCC000000;
+
+    /* Disable interrupts */
     __asm__ volatile (
         "mrs r0, cpsr        \n"
-        "orr r0, r0, #0xC0   \n"  /* set I+F bits — disable interrupts */
+        "orr r0, r0, #0xC0   \n"
         "msr cpsr_c, r0      \n"
+        ::: "r0"
+    );
+
+    /* Restore SPI controller to power-on state (XIP mode) */
+    spi[0x08 / 4] = 1;    /* ctrl = 1 (power-on default) */
+    spi[0x10 / 4] = 2;    /* TX count = 2 (power-on default) */
+    spi[0x14 / 4] = 0x38; /* mode = 0x38 (XIP mode, NOT 0x02 DMA) */
+
+    /* Invalidate caches */
+    __asm__ volatile (
         "mov r0, #0          \n"
         "mcr p15, 0, r0, c7, c5, 0 \n"  /* invalidate I-cache */
         "mcr p15, 0, r0, c7, c6, 0 \n"  /* invalidate D-cache */
-        "mov pc, #0          \n"  /* jump to reset vector */
+        "ldr pc, =0x4F000    \n"         /* jump to XIP bootloader */
         ::: "r0", "memory"
     );
     __builtin_unreachable();
@@ -236,21 +259,48 @@ static void process_mailbox(void) {
     jtag_mailbox.command = MBOX_CMD_IDLE;
 }
 
-/* ── Initialization (called from hook stub, "before" mode) ───────────── */
+/* ── Boot-time initialization ────────────────────────────────────────── */
 
-/* The generated stub calls this on every main-loop iteration.
- * First call: register DCP handler + patch MIDI callback.
- * Every call: check JTAG mailbox for flash commands.
- *
- * The handler lives at SRAM 0x29D08 — a 1028-byte zero gap in the
- * firmware's code/data section. This area is loaded by the bootloader
- * and NEVER touched by eCos init (BSS clear, heap, thread stacks).
+/* Called from patched firmware_entry at 0x344 (replaces `bl rtos_app_init`).
+ * Runs AFTER .ctors (DCP state initialized) but BEFORE thread creation.
+ * Registers DCP handler via direct memory writes — no firmware function
+ * calls (dcp_register_handler crashes at this stage).
+ * Then chains to the original rtos_app_init.
+ */
+extern void rtos_app_init(void);
+
+#define DCP_HANDLER_LIST  (*(volatile uint32_t *)0x313C4)
+
+void boot_init(void) {
+    /* Direct DCP handler registration via memory writes.
+     * Equivalent to what JTAG inject does, but runs at boot. */
+    static struct handler_node boot_node;
+    uint32_t old_head = DCP_HANDLER_LIST;
+    boot_node.next     = (void *)old_head;
+    boot_node.category = CATEGORY_FLASH;
+    boot_node.padding  = 0;
+    boot_node.handler  = (void *)flash_handler;
+    boot_node.context  = (void *)0;
+    DCP_HANDLER_LIST = (uint32_t)(void *)&boot_node;
+
+    done_flag = DONE_MAGIC;
+
+    /* Chain to original rtos_app_init */
+    rtos_app_init();
+}
+
+/* ── Main-loop hook (called from trampoline at 0x4FAC) ───────────────── */
+
+/* If the main loop ever reaches 0x4FAC, this handles mailbox polling.
+ * Currently the main loop is blocked in cyg_flag_wait, so this rarely fires.
  */
 void flash_handler_init(void) {
     if (done_flag == DONE_MAGIC) {
         process_mailbox();
         return;
     }
+
+    uart_print_string("A");
 
     /* Register DCP flash handler */
     static struct handler_node node;
@@ -261,11 +311,13 @@ void flash_handler_init(void) {
     node.context  = (void *)0;
 
     dcp_register_handler(&node);
+    uart_print_string("B");
 
     /* Patch MIDI parser's channel_msg_cb to intercept CC messages */
     volatile uint32_t *cb_ptr =
         (volatile uint32_t *)((uint8_t *)MIDI_PARSER_CTX + MIDI_CB_OFFSET);
     *cb_ptr = (uint32_t)(void *)midi_cc_handler;
+    uart_print_string("C");
 
     done_flag = DONE_MAGIC;
 }

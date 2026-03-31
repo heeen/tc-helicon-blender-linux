@@ -43,6 +43,9 @@ dcp_state            = 0x30F78;
 /* Displaced function — original target of `bl` at 0x4FAC (primary event loop) */
 FUN_2f38 = 0x2F38;
 
+/* eCos RTOS app init — called from firmware_entry at 0x344 */
+rtos_app_init = 0x9CD4;
+
 /* Mixer hardware functions (primary firmware) */
 channel_level_apply    = 0x1468;  /* (bus 0-3, input 0-6, level 0-31) → DICE mixer coeff */
 master_level_apply     = 0x45C0;  /* (bus 0-3, level 0-31) → master output */
@@ -52,6 +55,14 @@ led_mute_update        = 0x68F4;  /* (input 0-5, on/off) → LED via SPI to copr
 
 /* Mixer state (SRAM BSS) — inputs[4][7] + compressor[4] + master[4] = 36 bytes */
 mixer_state = 0x2D81C;
+
+/* DCP handler list (primary firmware) */
+dcp_handler_list        = 0x313C4;  /* dcp_state + 0x44C — linked list of handler nodes */
+
+/* UART output (primary firmware) */
+uart_putc               = 0x971C;   /* void uart_putc(char c) — polls status bit 5, writes to 0xC5000000 */
+uart_print_string       = 0x9E48;   /* void uart_print_string(const char *s) — null-terminated, handles \n→\r\n */
+uart_printf             = 0x9E68;   /* int uart_printf(const char *fmt, ...) — variadic, full printf */
 
 /* MIDI subsystem (primary firmware) */
 midi_parser_ctx         = 0x29764;  /* MIDI parser state: status+0, cb_channel+0x28, cb_sysex+0x2C */

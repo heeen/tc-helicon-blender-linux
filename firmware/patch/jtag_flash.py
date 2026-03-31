@@ -12,7 +12,7 @@ Usage:
 """
 
 import argparse
-import struct
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -22,13 +22,17 @@ PATCH_DIR = Path(__file__).resolve().parent
 SPI_RESTORED = FIRMWARE_DIR / 'blender_spi_flash_restored.bin'
 SPI_PATCHED = FIRMWARE_DIR / 'blender_spi_patched.bin'
 HOOKS_BIN = PATCH_DIR / 'hooks.bin'
+HOOKS_ELF = PATCH_DIR / 'hooks.elf'
 
-# From ELF symbols
-PATCH_ZONE  = 0x2B000
+# Firmware constants (these are in the original firmware, not the patch)
 HOOK_TARGET = 0x4FAC
 IDENTITY_ADDR = 0x8968
 IDENTITY_WORD = 0xE92D4FF0
-MAILBOX_ADDR  = 0x2B39C  # jtag_mailbox BSS address
+
+# SRAM buffer for sector data (DEADBEEF free zone, doesn't overlap handler)
+DATA_BUFFER = 0x2B800
+
+SECTOR_SIZE = 0x1000
 
 # Mailbox field offsets
 MBOX_COMMAND   = 0x00
@@ -49,10 +53,33 @@ RESULT_PENDING = 0
 RESULT_OK      = 1
 RESULT_ERROR   = 2
 
-# SRAM buffer for sector data (DEADBEEF free zone)
-DATA_BUFFER = 0x2B000  # 4KB buffer at known-free location
 
-SECTOR_SIZE = 0x1000
+def read_elf_symbols():
+    """Read symbol addresses from hooks.elf via nm."""
+    if not HOOKS_ELF.exists():
+        print(f"ERROR: {HOOKS_ELF} not found. Run: make -C firmware/patch")
+        sys.exit(1)
+    result = subprocess.run(
+        ['arm-none-eabi-nm', str(HOOKS_ELF)],
+        capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"ERROR: nm failed: {result.stderr}")
+        sys.exit(1)
+    symbols = {}
+    for line in result.stdout.strip().split('\n'):
+        parts = line.strip().split()
+        if len(parts) == 3:
+            symbols[parts[2]] = int(parts[0], 16)
+    return symbols
+
+
+# Read addresses from ELF at module load time
+_symbols = read_elf_symbols()
+PATCH_ZONE = _symbols['_hook_dcp_flash_stub']
+MAILBOX_ADDR = _symbols['jtag_mailbox']
+DONE_FLAG_ADDR = _symbols['done_flag']
+print(f"ELF symbols: stub=0x{PATCH_ZONE:05X} mailbox=0x{MAILBOX_ADDR:05X} "
+      f"done=0x{DONE_FLAG_ADDR:05X}")
 
 
 class OpenOCD:
@@ -114,10 +141,10 @@ def inject(ocd):
     tramp = encode_arm_bl(HOOK_TARGET, PATCH_ZONE)
     ocd.mww(HOOK_TARGET, tramp)
 
-    # Clear mailbox + done flag
-    for off in range(0, 28, 4):
+    # Clear done flag and mailbox
+    ocd.mww(DONE_FLAG_ADDR, 0)
+    for off in range(0, 24, 4):
         ocd.mww(MAILBOX_ADDR + off, 0)
-    ocd.mww(MAILBOX_ADDR - 4, 0)  # done_flag (just before mailbox)
 
     # Invalidate BOTH I-cache and D-cache, then resume
     ocd.cmd("arm mcr 15 0 7 5 0 0")  # invalidate I-cache
@@ -131,17 +158,13 @@ def inject(ocd):
 
 
 def mailbox_exec(ocd, command, spi_addr=0, data_addr=0, data_len=0,
-                  wait_secs=2, timeout=10):
+                  wait_secs=2):
     """Post a command to the mailbox and wait for result.
 
     ARM926EJ-S requires halt for JTAG memory access. We:
     1. Halt to write command parameters
     2. Resume and wait WITHOUT halting (critical for SPI flash timing)
     3. Halt to read result
-
-    The wait_secs parameter should be long enough for the operation to
-    complete. SPI erase ~25ms, SPI write 4KB ~100ms. We default to 2s
-    for safety.
     """
     # Halt to write mailbox
     ocd.cmd('halt')
@@ -152,19 +175,17 @@ def mailbox_exec(ocd, command, spi_addr=0, data_addr=0, data_len=0,
     ocd.mww(MAILBOX_ADDR + MBOX_RESULT, RESULT_PENDING)
     ocd.mww(MAILBOX_ADDR + MBOX_ERROR, 0)
     ocd.mww(MAILBOX_ADDR + MBOX_COMMAND, command)
-    # Invalidate D-cache so CPU sees our JTAG writes (bypass cache coherency)
-    ocd.cmd("arm mcr 15 0 7 6 0 0")  # invalidate entire D-cache
+    # Invalidate D-cache so CPU sees our JTAG writes
+    ocd.cmd("arm mcr 15 0 7 6 0 0")
     ocd.cmd('resume')
 
-    # Wait for operation to complete — NO HALTING during this time!
-    # SPI flash AAI write requires uninterrupted CPU for timing.
+    # Wait for operation — NO HALTING during SPI flash ops
     time.sleep(wait_secs)
 
-    # Now halt to read the result
+    # Halt to read result
     ocd.cmd('halt')
     time.sleep(0.02)
-    # Flush D-cache so we read what the CPU wrote (not stale JTAG view)
-    ocd.cmd("arm mcr 15 0 7 10 0 0")  # clean entire D-cache (writeback)
+    ocd.cmd("arm mcr 15 0 7 10 0 0")  # clean D-cache (writeback)
     result = ocd.mdw(MAILBOX_ADDR + MBOX_RESULT)
     error = ocd.mdw(MAILBOX_ADDR + MBOX_ERROR)
     ocd.cmd('resume')
@@ -172,8 +193,6 @@ def mailbox_exec(ocd, command, spi_addr=0, data_addr=0, data_len=0,
     if result is not None and result != RESULT_PENDING:
         return result, error if error is not None else 0
 
-    # If still pending, command might not have been picked up yet.
-    # The main loop runs at ~100Hz, so 2s should be plenty.
     return None, 0
 
 
@@ -201,8 +220,7 @@ def flash_sector(ocd, spi_addr, data):
     result, error = mailbox_exec(ocd, CMD_WRITE,
                                   spi_addr=spi_addr,
                                   data_addr=DATA_BUFFER,
-                                  data_len=len(data),
-                                  timeout=30)
+                                  data_len=len(data))
     if result != RESULT_OK:
         print(f" write FAIL (result={result}, error={error:#x})")
         return False
@@ -279,7 +297,7 @@ def main():
 
         # Quick verify: re-inject and check mailbox responds
         if inject(ocd):
-            result, _ = mailbox_exec(ocd, CMD_ERASE, spi_addr=0xFFFFFFFF, timeout=2)
+            result, _ = mailbox_exec(ocd, CMD_ERASE, spi_addr=0xFFFFFFFF)
             # Erasing invalid addr should return error but proves mailbox works
             if result is not None:
                 print("\n  Persistent patch VERIFIED — mailbox responds after reboot")
