@@ -212,6 +212,17 @@ impl BlenderUsb {
         Ok(true)
     }
 
+    /// Reboot the device via DCP (opcode 4).
+    /// Jumps to XIP bootloader — full DMA reload from SPI.
+    pub fn flash_reboot(&mut self) -> Result<()> {
+        // Send reboot command; response may or may not arrive before device resets
+        match self.flash_cmd(4, &[]) {
+            Ok(_) => {}
+            Err(_) => {} // Expected: device resets before response
+        }
+        Ok(())
+    }
+
     /// Dump entire memory-mapped flash (1MB) to a file.
     pub fn flash_dump(&mut self, path: &Path) -> Result<()> {
         let info = self.flash_info()?;

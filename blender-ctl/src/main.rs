@@ -103,6 +103,8 @@ enum FlashCommand {
         /// Sector specifications: 0xADDR:path [0xADDR:path ...]
         specs: Vec<String>,
     },
+    /// Reboot device (jumps to XIP bootloader, full DMA reload from SPI)
+    Reboot,
 }
 
 fn parse_value(s: &str) -> Result<u8> {
@@ -533,6 +535,12 @@ fn cmd_usb_flash(cmd: FlashCommand) -> Result<()> {
         }
         FlashCommand::Update { file } => {
             dev.flash_update(&PathBuf::from(file))?;
+            Ok(())
+        }
+        FlashCommand::Reboot => {
+            println!("Rebooting device...");
+            dev.flash_reboot()?;
+            println!("Reboot command sent. Device will reload from SPI.");
             Ok(())
         }
         FlashCommand::WriteSectors { specs } => {
