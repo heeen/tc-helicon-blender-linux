@@ -134,17 +134,29 @@ impl BlenderUsb {
             );
         }
 
-        let mut body = Vec::with_capacity(8);
-        body.extend_from_slice(&addr.to_le_bytes());
-        body.extend_from_slice(&len.to_le_bytes());
+        // Erase one sector at a time — the firmware handler blocks during erase,
+        // which can desynchronize the DCP state machine for multi-sector erases.
+        let sector_size = 0x1000u32;
+        let mut cur = addr;
+        while cur < end {
+            let chunk = sector_size.min(end - cur);
+            let mut body = Vec::with_capacity(8);
+            body.extend_from_slice(&cur.to_le_bytes());
+            body.extend_from_slice(&chunk.to_le_bytes());
 
-        let resp = self.flash_cmd(2, &body)?;
-        if resp.len() < 4 {
-            bail!("Flash ERASE: short response");
-        }
-        let status = u32::from_le_bytes([resp[0], resp[1], resp[2], resp[3]]);
-        if status != 0 {
-            bail!("Flash ERASE failed at {:#x}: status {:#x}", addr, status);
+            let resp = self.flash_cmd(2, &body)?;
+            if resp.len() < 4 {
+                bail!("Flash ERASE: short response");
+            }
+            let status = u32::from_le_bytes([resp[0], resp[1], resp[2], resp[3]]);
+            if status != 0 {
+                bail!("Flash ERASE failed at {:#x}: status {:#x}", cur, status);
+            }
+            cur += chunk;
+
+            // Settle time after each sector erase — SPI controller needs to
+            // return to idle before the next DCP command.
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }
         Ok(())
     }

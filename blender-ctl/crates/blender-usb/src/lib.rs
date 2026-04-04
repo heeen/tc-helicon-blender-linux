@@ -68,10 +68,22 @@ impl BlenderUsb {
 
     /// Claim interfaces and enable auto-detach.
     pub fn claim(&self) -> Result<()> {
-        self.handle
-            .set_auto_detach_kernel_driver(true)
-            .context("Couldn't enable auto-detach")?;
-        for iface in 0..5 {
+        self.claim_except(&[])
+    }
+
+    /// Claim all interfaces except the ones in `skip`.
+    /// Manually detaches kernel driver only for claimed interfaces,
+    /// leaving skipped interfaces (e.g. MIDI) for the kernel.
+    pub fn claim_except(&self, skip: &[u8]) -> Result<()> {
+        for iface in 0..5u8 {
+            if skip.contains(&iface) {
+                continue;
+            }
+            // Manually detach kernel driver if active
+            match self.handle.kernel_driver_active(iface) {
+                Ok(true) => { let _ = self.handle.detach_kernel_driver(iface); }
+                _ => {}
+            }
             match self.handle.claim_interface(iface) {
                 Ok(()) => log::debug!("Claimed interface {iface}"),
                 Err(e) => log::debug!("Interface {iface}: {e} (skipping)"),
@@ -231,9 +243,15 @@ impl BlenderUsb {
         // control transfers, especially after flash operations.
         thread::sleep(Duration::from_millis(20));
 
-        self.handle
-            .write_control(bmreq_out, 2, 0, 0, &pkt, timeout)
-            .context("DCP write (bReq=2) failed")?;
+        // Write with pipe-error recovery: flush stale state and retry once
+        if let Err(e) = self.handle.write_control(bmreq_out, 2, 0, 0, &pkt, timeout) {
+            log::warn!("DCP write failed ({e}), flushing and retrying...");
+            let _ = self.dcp_flush();
+            thread::sleep(Duration::from_millis(50));
+            self.handle
+                .write_control(bmreq_out, 2, 0, 0, &pkt, timeout)
+                .context("DCP write (bReq=2) failed after recovery")?;
+        }
 
         // Retry loop: read responses, skip stale ones (wrong cmd_idx)
         for attempt in 0..30 {
@@ -259,6 +277,11 @@ impl BlenderUsb {
                     return Ok(resp);
                 }
                 Err(e) => {
+                    if attempt == 14 {
+                        // Midway through retries, try flushing the pipe
+                        log::debug!("DCP read retry {attempt}: flushing pipe...");
+                        let _ = self.dcp_flush();
+                    }
                     if attempt < 29 {
                         continue;
                     }
