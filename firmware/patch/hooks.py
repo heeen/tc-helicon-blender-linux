@@ -35,12 +35,12 @@ PATCHED_SPI = FIRMWARE_DIR / 'blender_spi_patched.bin'
 # DCP registration still needs JTAG inject (main loop blocked in cyg_flag_wait).
 
 PATCH_ZONE_SRAM = 0x32600
-PATCH_ZONE_SIZE = 0x400  # 1024 bytes (gap: 0x32600-0x329FF)
+PATCH_ZONE_SIZE = 0xA00  # 2560 bytes (gap: 0x32600-0x32FFF)
 
 # Heap base literal in code section (patched for persistent mode)
 HEAP_LITERAL_SRAM = 0xC570     # mempool_var_init loads heap_start from here
 HEAP_BASE_ORIG    = 0x325F8    # original heap_start = BSS_end
-HEAP_BASE_NEW     = 0x32A00    # new heap_start (after handler zone)
+HEAP_BASE_NEW     = 0x33000    # new heap_start (after handler zone)
 
 # Firmware identity
 IDENTITY_ADDR = 0x8968

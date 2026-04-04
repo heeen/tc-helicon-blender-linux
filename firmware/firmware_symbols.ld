@@ -64,6 +64,22 @@ uart_putc               = 0x971C;   /* void uart_putc(char c) — polls status b
 uart_print_string       = 0x9E48;   /* void uart_print_string(const char *s) — null-terminated, handles \n→\r\n */
 uart_printf             = 0x9E68;   /* int uart_printf(const char *fmt, ...) — variadic, full printf */
 
+/* eCos kernel API (primary firmware = golden + 0x430) */
+cyg_real_time_clock    = 0xAB08;
+cyg_clock_to_counter   = 0xAB00;
+cyg_alarm_create       = 0xAB2C;
+cyg_alarm_initialize   = 0xAB64;
+cyg_current_time       = 0xAAF0;
+
+/* USB MIDI streaming (primary firmware) */
+usb_endpoint_submit_transfer = 0x2077C;  /* (ep, buf, size, callback, ctx) → primes EP */
+usb_midi_rx_complete         = 0x1B9E4;  /* bulk OUT DMA completion callback */
+usb_midi_rx_start            = 0x1BE50;  /* (ep_handle, num_cables) → arms EP for receive */
+usb_iface_get_rx_endpoint    = 0x20754;  /* (conn, type) → EP handle via vtable dispatch */
+usb_midi_conn                = 0x2A230;  /* USB MIDI connection object (vtable at word 0) */
+midi_rx_ep_handle            = 0x2A7E8;  /* EP handle struct for EP 0x03 OUT (expected addr) */
+midi_pkt_buf                 = 0x30D64;  /* USB-MIDI packet buffer (0x210 bytes + metadata) */
+
 /* MIDI subsystem (primary firmware) */
 midi_parser_ctx         = 0x29764;  /* MIDI parser state: status+0, cb_channel+0x28, cb_sysex+0x2C */
 midi_channel_msg_cb_orig = 0x2A44; /* original channel message callback (chains to this) */

@@ -31,20 +31,36 @@ extern void led_mute_update(int input, int on_off);
 /* Original MIDI channel message callback (we chain to it) */
 extern void midi_channel_msg_cb_orig(void *parser_ctx, void *parser_ctx2);
 
-extern char sst25xx_driver_ctx;  /* linker symbol — use &sst25xx_driver_ctx */
-#define DRIVER_CTX  ((void *)&sst25xx_driver_ctx)
+
+/* MIDI TX — sends MIDI data out USB MIDI EP IN (device → host). */
+extern int midi_tx_write(const void *data, int len);
+
+/* USB endpoint transfer submission — bypasses streaming state checks.
+ * Programs the USB controller queue head and primes the endpoint. */
+extern void usb_endpoint_submit_transfer(void *ep, void *buf, int size,
+                                          void *callback, int ctx);
+extern void usb_midi_rx_complete(void *param1, int param2);
+
+/* USB MIDI RX endpoint arming */
+extern void usb_midi_rx_start(void *ep_handle, int num_cables);
+extern void *usb_iface_get_rx_endpoint(void *conn, int type);
+extern uint8_t usb_midi_conn[];  /* connection object at 0x2A230 */
+
+extern uint8_t sst25xx_driver_ctx[];  /* SPI flash driver context at 0x2A93C */
+#define DRIVER_CTX  ((void *)sst25xx_driver_ctx)
 
 /* Mixer state in firmware BSS — inputs[4][7] + compressor[4] + master[4] */
-extern char mixer_state;
-#define MIXER_STATE  ((volatile uint8_t *)&mixer_state)
+extern uint8_t mixer_state[36];
+#define MIXER_STATE  ((volatile uint8_t *)mixer_state)
 
 /* MIDI parser context — channel_msg_cb pointer at offset +0x28 */
-extern char midi_parser_ctx;
-#define MIDI_PARSER_CTX     ((volatile uint32_t *)&midi_parser_ctx)
+extern uint8_t midi_parser_ctx[0x34];
+#define MIDI_PARSER_CTX     ((volatile uint32_t *)midi_parser_ctx)
 #define MIDI_CB_OFFSET      0x28  /* offset to channel_msg_cb function pointer */
 
 /* ── UART debug output (firmware functions, resolved via firmware_symbols.ld) ── */
 
+extern void uart_putc(char c);
 extern void uart_print_string(const char *s);
 extern int  uart_printf(const char *fmt, ...);
 
@@ -143,10 +159,92 @@ static void flash_handler(void *ctx, uint16_t category, uint16_t opcode,
 #define MIX_INPUT_STRIDE  7     /* 7 inputs per bus */
 #define MIX_COMP_OFFSET   0x1C  /* compressor[4] starts here */
 #define MIX_MASTER_OFFSET 0x20  /* master[4] starts here */
+#define MIX_STATE_SIZE    0x24  /* total: 4*7 + 4 + 4 = 36 bytes */
+
+/* ── MIDI CC output ─────────────────────────────────────────────────── */
+
+static void midi_send_cc(uint8_t channel, uint8_t cc_num, uint8_t cc_val) {
+    uint8_t msg[3] = { (uint8_t)(0xB0 | (channel & 0x0F)), cc_num & 0x7F, cc_val & 0x7F };
+    int ret = midi_tx_write(msg, 3);
+    {
+        static const char hex[] = "0123456789ABCDEF";
+        uart_putc('<');
+        uart_putc(hex[(msg[0] >> 4) & 0xF]);
+        uart_putc(hex[msg[0] & 0xF]);
+        uart_putc(' ');
+        uart_putc(hex[(msg[1] >> 4) & 0xF]);
+        uart_putc(hex[msg[1] & 0xF]);
+        uart_putc(' ');
+        uart_putc(hex[(msg[2] >> 4) & 0xF]);
+        uart_putc(hex[msg[2] & 0xF]);
+        uart_putc(' ');
+        uart_putc(ret > 0 ? 'k' : 'E');
+        uart_putc('>');
+        uart_putc('\r');
+        uart_putc('\n');
+    }
+}
+
+/* Snapshot of mixer_state for change detection.
+ * Compared against live mixer_state to emit MIDI CCs for BLE/knob changes. */
+static uint8_t mixer_snapshot[MIX_STATE_SIZE];
+
+static void midi_emit_state_diff(void) {
+    volatile uint8_t *live = MIXER_STATE;
+
+    for (int bus = 0; bus < 4; bus++) {
+        /* Inputs 0-6 → CC 16-22 */
+        for (int input = 0; input < 7; input++) {
+            int off = bus * MIX_INPUT_STRIDE + input;
+            uint8_t cur = live[off];
+            if (cur != mixer_snapshot[off]) {
+                mixer_snapshot[off] = cur;
+                midi_send_cc((uint8_t)bus, (uint8_t)(16 + input), (uint8_t)(cur << 2));
+            }
+        }
+        /* Compressor → CC 23 */
+        {
+            int off = MIX_COMP_OFFSET + bus;
+            uint8_t cur = live[off];
+            if (cur != mixer_snapshot[off]) {
+                mixer_snapshot[off] = cur;
+                midi_send_cc((uint8_t)bus, 23, (uint8_t)(cur << 2));
+            }
+        }
+        /* Master → CC 7 */
+        {
+            int off = MIX_MASTER_OFFSET + bus;
+            uint8_t cur = live[off];
+            if (cur != mixer_snapshot[off]) {
+                mixer_snapshot[off] = cur;
+                midi_send_cc((uint8_t)bus, 7, (uint8_t)(cur << 2));
+            }
+        }
+    }
+}
+
+/* ── MIDI CC → Mixer Control ────────────────────────────────────────── */
 
 static void midi_cc_handler(void *parser_ctx, void *parser_ctx2) {
     uint8_t *p = (uint8_t *)parser_ctx;
     uint8_t status = p[0];
+
+    uart_putc('[');
+    /* Print status and data bytes as hex via putc */
+    {
+        static const char hex[] = "0123456789ABCDEF";
+        uart_putc(hex[(status >> 4) & 0xF]);
+        uart_putc(hex[status & 0xF]);
+        uart_putc(' ');
+        uart_putc(hex[(p[1] >> 4) & 0xF]);
+        uart_putc(hex[p[1] & 0xF]);
+        uart_putc(' ');
+        uart_putc(hex[(p[2] >> 4) & 0xF]);
+        uart_putc(hex[p[2] & 0xF]);
+    }
+    uart_putc(']');
+    uart_putc('\r');
+    uart_putc('\n');
 
     /* Only handle Control Change (0xB0-0xBF) */
     if ((status & 0xF0) != 0xB0)
@@ -166,16 +264,23 @@ static void midi_cc_handler(void *parser_ctx, void *parser_ctx2) {
     if (cc_num == 7) {
         /* CC 7: Master volume */
         MIXER_STATE[MIX_MASTER_OFFSET + bus] = (uint8_t)level;
+        mixer_snapshot[MIX_MASTER_OFFSET + bus] = (uint8_t)level;
         master_level_apply(bus, level);
+        midi_send_cc(channel, cc_num, cc_val);
     } else if (cc_num >= 16 && cc_num <= 22) {
         /* CC 16-22: Input 1-7 levels */
         int input = cc_num - 16;
-        MIXER_STATE[bus * MIX_INPUT_STRIDE + input] = (uint8_t)level;
+        int off = bus * MIX_INPUT_STRIDE + input;
+        MIXER_STATE[off] = (uint8_t)level;
+        mixer_snapshot[off] = (uint8_t)level;
         channel_level_apply(bus, input, level);
+        midi_send_cc(channel, cc_num, cc_val);
     } else if (cc_num == 23) {
         /* CC 23: Compressor level */
         MIXER_STATE[MIX_COMP_OFFSET + bus] = (uint8_t)level;
+        mixer_snapshot[MIX_COMP_OFFSET + bus] = (uint8_t)level;
         compressor_level_apply(bus, level);
+        midi_send_cc(channel, cc_num, cc_val);
     }
     /* Unrecognized CCs fall through to original handler */
 
@@ -271,9 +376,48 @@ extern void rtos_app_init(void);
 
 #define DCP_HANDLER_LIST  (*(volatile uint32_t *)0x313C4)
 
+static volatile uint32_t midi_patched;
+
+static void patch_midi_callback(void) {
+    if (midi_patched)
+        return;
+    volatile uint32_t *cb_ptr =
+        (volatile uint32_t *)((uint8_t *)MIDI_PARSER_CTX + MIDI_CB_OFFSET);
+    *cb_ptr = (uint32_t)(void *)midi_cc_handler;
+    memcpy(mixer_snapshot, (const void *)MIXER_STATE, MIX_STATE_SIZE);
+    midi_patched = 1;
+}
+
+/* ── EP 0x03 arming (native USB MIDI RX) ─────────────────────────────── */
+
+static void arm_midi_rx_endpoint(void) {
+    /* Get EP handle via vtable dispatch — same call usb_midi_streaming_start uses.
+     * Returns NULL if USB subsystem not yet initialized. */
+    void *ep = usb_iface_get_rx_endpoint(usb_midi_conn, 3);
+    if (ep == (void *)0)
+        return;  /* USB not ready, retry next iteration */
+
+    /* Already armed: callback at ep+8 is non-zero when transfer is in flight.
+     * The completion callback (usb_midi_rx_complete) clears this and re-arms. */
+    if (*(volatile uint32_t *)((uint8_t *)ep + 8) != 0)
+        return;
+
+    /* Force EP state to "configured" (0x02).
+     * usb_hw_ep_start_transfer checks this byte — it's firmware-level tracking,
+     * not a hardware register. The USB controller queue heads and dTDs are
+     * initialized for ALL endpoints at boot by usb_hw_controller_init.
+     * EP 0x03 is otherwise unused (streaming_start never fires for MIDI-only). */
+    *(volatile uint8_t *)((uint8_t *)ep + 0x20) = 0x02;
+
+    /* Arm: sets up buffer at midi_pkt_buf, stores EP handle, primes DMA.
+     * Re-arming is automatic via usb_midi_rx_complete → usb_midi_rx_dispatch. */
+    usb_midi_rx_start(ep, 1);
+
+    uart_print_string("[midi] EP armed\r\n");
+}
+
 void boot_init(void) {
-    /* Direct DCP handler registration via memory writes.
-     * Equivalent to what JTAG inject does, but runs at boot. */
+    /* Direct DCP handler registration via memory writes. */
     static struct handler_node boot_node;
     uint32_t old_head = DCP_HANDLER_LIST;
     boot_node.next     = (void *)old_head;
@@ -284,8 +428,11 @@ void boot_init(void) {
     DCP_HANDLER_LIST = (uint32_t)(void *)&boot_node;
 
     done_flag = DONE_MAGIC;
+    midi_patched = 0;  /* BSS not zeroed in patch zone — must init explicitly */
 
-    /* Chain to original rtos_app_init */
+    uart_print_string("[boot_init] DCP registered\r\n");
+
+    /* Chain to original rtos_app_init — starts scheduler, never returns */
     rtos_app_init();
 }
 
@@ -297,6 +444,9 @@ void boot_init(void) {
 void flash_handler_init(void) {
     if (done_flag == DONE_MAGIC) {
         process_mailbox();
+        patch_midi_callback();
+        arm_midi_rx_endpoint();
+        midi_emit_state_diff();
         return;
     }
 
@@ -411,6 +561,55 @@ static void flash_handler(void *ctx, uint16_t category, uint16_t opcode,
         for (volatile int i = 0; i < 100000; i++) {}
         software_reboot();
         /* never returns */
+    }
+
+    case 5: { /* MIDI_INIT — patch MIDI callback + arm RX endpoint */
+        patch_midi_callback();
+
+        /* EP arming TODO: USB bulk OUT EP 0x03 is not armed.
+         * usb_endpoint_submit_transfer crashes the USB stack.
+         * For now, use DCP opcode 6 for host→device CC. */
+
+        *(uint32_t *)body = midi_patched;
+        dcp_send_response(0, body, 4);
+        return;
+    }
+
+    case 6: { /* MIDI_SEND — host sends MIDI bytes via DCP (bypasses broken bulk EP) */
+        /* Body: raw MIDI bytes (3 bytes per CC message, concatenated) */
+        for (uint16_t i = 0; i + 2 < body_len; i += 3) {
+            uint8_t status = body[i];
+            if ((status & 0xF0) != 0xB0)
+                continue;
+            uint8_t channel = status & 0x0F;
+            uint8_t cc_num = body[i + 1];
+            uint8_t cc_val = body[i + 2];
+            if (channel >= 4)
+                continue;
+            int bus = (int)channel;
+            int level = (int)(cc_val >> 2);
+            if (cc_num == 7) {
+                MIXER_STATE[MIX_MASTER_OFFSET + bus] = (uint8_t)level;
+                mixer_snapshot[MIX_MASTER_OFFSET + bus] = (uint8_t)level;
+                master_level_apply(bus, level);
+                midi_send_cc(channel, cc_num, cc_val);
+            } else if (cc_num >= 16 && cc_num <= 22) {
+                int input = cc_num - 16;
+                int off = bus * MIX_INPUT_STRIDE + input;
+                MIXER_STATE[off] = (uint8_t)level;
+                mixer_snapshot[off] = (uint8_t)level;
+                channel_level_apply(bus, input, level);
+                midi_send_cc(channel, cc_num, cc_val);
+            } else if (cc_num == 23) {
+                MIXER_STATE[MIX_COMP_OFFSET + bus] = (uint8_t)level;
+                mixer_snapshot[MIX_COMP_OFFSET + bus] = (uint8_t)level;
+                compressor_level_apply(bus, level);
+                midi_send_cc(channel, cc_num, cc_val);
+            }
+        }
+        *(uint32_t *)body = 0;
+        dcp_send_response(0, body, 4);
+        return;
     }
 
     default: {
