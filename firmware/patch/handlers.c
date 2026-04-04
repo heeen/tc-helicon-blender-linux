@@ -41,6 +41,9 @@ extern void usb_endpoint_submit_transfer(void *ep, void *buf, int size,
                                           void *callback, int ctx);
 extern void usb_midi_rx_complete(void *param1, int param2);
 
+/* Audio clock init — programs HPLL clock source for valid USB descriptors */
+extern void usb_audio_rx_set_sample_rate(uint32_t sample_rate);
+
 /* USB MIDI RX endpoint arming */
 extern void usb_midi_rx_start(void *ep_handle, int num_cables);
 extern void *usb_iface_get_rx_endpoint(void *conn, int type);
@@ -388,6 +391,24 @@ static void patch_midi_callback(void) {
     midi_patched = 1;
 }
 
+/* ── Audio clock self-init ────────────────────────────────────────────── */
+/* Without this, the DICE3 HPLL is uninitialized and the kernel's
+ * snd-usb-audio driver fails to probe (clock descriptors invalid).
+ * The stock firmware waits for the host to send SET_CUR 48kHz (the
+ * "boot quirk"), but standalone sequencers and stock kernels don't.
+ * At boot with TX/RX disabled, this is just a clock source table
+ * lookup + mode flag write — no I2S, no scheduler, no side effects. */
+
+static volatile uint32_t clock_initialized;
+
+static void init_audio_clock(void) {
+    if (clock_initialized)
+        return;
+    usb_audio_rx_set_sample_rate(48000);
+    clock_initialized = 1;
+    uart_print_string("[clock] 48kHz\r\n");
+}
+
 /* ── EP 0x03 arming (native USB MIDI RX) ─────────────────────────────── */
 
 static void arm_midi_rx_endpoint(void) {
@@ -428,7 +449,8 @@ void boot_init(void) {
     DCP_HANDLER_LIST = (uint32_t)(void *)&boot_node;
 
     done_flag = DONE_MAGIC;
-    midi_patched = 0;  /* BSS not zeroed in patch zone — must init explicitly */
+    midi_patched = 0;       /* BSS not zeroed in patch zone — must init explicitly */
+    clock_initialized = 0;
 
     uart_print_string("[boot_init] DCP registered\r\n");
 
@@ -444,6 +466,7 @@ void boot_init(void) {
 void flash_handler_init(void) {
     if (done_flag == DONE_MAGIC) {
         process_mailbox();
+        init_audio_clock();
         patch_midi_callback();
         arm_midi_rx_endpoint();
         midi_emit_state_diff();

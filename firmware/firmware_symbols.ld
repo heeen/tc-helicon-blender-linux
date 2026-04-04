@@ -71,6 +71,9 @@ cyg_alarm_create       = 0xAB2C;
 cyg_alarm_initialize   = 0xAB64;
 cyg_current_time       = 0xAAF0;
 
+/* Audio clock / sample rate (primary firmware) */
+usb_audio_rx_set_sample_rate = 0x194C8;  /* (uint sample_rate) → clock source lookup + mode config */
+
 /* USB MIDI streaming (primary firmware) */
 usb_endpoint_submit_transfer = 0x2077C;  /* (ep, buf, size, callback, ctx) → primes EP */
 usb_midi_rx_complete         = 0x1B9E4;  /* bulk OUT DMA completion callback */
