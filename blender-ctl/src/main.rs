@@ -19,8 +19,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Start BLE + TUI mixer
-    Tui,
+    /// Start TUI mixer (BLE by default, --midi for USB MIDI)
+    Tui {
+        /// Use USB MIDI transport instead of BLE
+        #[arg(long)]
+        midi: bool,
+    },
     /// Start BLE + interactive REPL
     Ble,
     /// Set a parameter via BLE
@@ -151,7 +155,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Tui => cmd_tui().await,
+        Command::Tui { midi } => cmd_tui(midi).await,
         Command::Ble => cmd_ble().await,
         Command::Set { param, value, bus } => cmd_set(&param, &value, bus).await,
         Command::Get { param } => cmd_get(param.as_deref()).await,
@@ -170,13 +174,18 @@ async fn main() -> Result<()> {
 
 // ── BLE Commands ────────────────────────────────────────────────────────
 
-async fn cmd_tui() -> Result<()> {
-    let server = blender_ble::BleClient::connect().await?;
-
-    let state_rx = server.state_watch();
-    let cmd_tx = server.command_sender();
-
-    blender_tui::run(state_rx, cmd_tx).await
+async fn cmd_tui(midi: bool) -> Result<()> {
+    if midi {
+        let client = blender_midi::MidiClient::connect()?;
+        let state_rx = client.state_watch();
+        let cmd_tx = client.command_sender();
+        blender_tui::run(state_rx, cmd_tx).await
+    } else {
+        let server = blender_ble::BleClient::connect().await?;
+        let state_rx = server.state_watch();
+        let cmd_tx = server.command_sender();
+        blender_tui::run(state_rx, cmd_tx).await
+    }
 }
 
 async fn cmd_ble() -> Result<()> {
