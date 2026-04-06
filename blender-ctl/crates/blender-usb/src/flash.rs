@@ -235,6 +235,15 @@ impl BlenderUsb {
         Ok(())
     }
 
+    /// Force USB re-enumeration (simulates cable replug, no reboot).
+    pub fn flash_reenum(&mut self) -> Result<()> {
+        match self.flash_cmd(7, &[]) {
+            Ok(_) => {}
+            Err(_) => {} // Expected: USB disconnects before response arrives
+        }
+        Ok(())
+    }
+
     /// Dump entire memory-mapped flash (1MB) to a file.
     pub fn flash_dump(&mut self, path: &Path) -> Result<()> {
         let info = self.flash_info()?;

@@ -109,6 +109,8 @@ enum FlashCommand {
     },
     /// Reboot device (jumps to XIP bootloader, full DMA reload from SPI)
     Reboot,
+    /// Force USB re-enumeration (simulates cable replug, no reboot)
+    Reenum,
 }
 
 fn parse_value(s: &str) -> Result<u8> {
@@ -550,6 +552,12 @@ fn cmd_usb_flash(cmd: FlashCommand) -> Result<()> {
             println!("Rebooting device...");
             dev.flash_reboot()?;
             println!("Reboot command sent. Device will reload from SPI.");
+            Ok(())
+        }
+        FlashCommand::Reenum => {
+            println!("Forcing USB re-enumeration...");
+            dev.flash_reenum()?;
+            println!("USB re-enumeration triggered. Device will re-appear shortly.");
             Ok(())
         }
         FlashCommand::WriteSectors { specs } => {

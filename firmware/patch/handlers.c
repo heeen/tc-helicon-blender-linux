@@ -291,16 +291,42 @@ chain:
     midi_channel_msg_cb_orig(parser_ctx, parser_ctx2);
 }
 
+/* ── USB control ────────────────────────────────────────────────────── */
+
+#define USB_USBCMD  (*(volatile uint32_t *)0x90000008)  /* bit 0 = Run/Stop */
+
+/* Disconnect USB from host (clear Run/Stop bit).
+ * Host sees device disappear, same as cable unplug. */
+static void usb_disconnect(void) {
+    USB_USBCMD &= ~(uint32_t)1;
+}
+
+/* Reconnect USB to host (set Run/Stop bit).
+ * Host sees new device, full re-enumeration. */
+static void usb_connect(void) {
+    USB_USBCMD |= 1;
+}
+
+/* Force USB re-enumeration: disconnect, wait, reconnect.
+ * Host sees unplug → replug. snd-usb-audio re-probes from scratch. */
+static void usb_reenumerate(void) {
+    usb_disconnect();
+    /* Wait ~800ms for host to detect disconnect and clean up.
+     * Linux needs ~500ms; extra margin for slower hosts. */
+    for (volatile int i = 0; i < 2000000; i++) {}
+    usb_connect();
+}
+
 /* ── Software reboot ─────────────────────────────────────────────────── */
 
 static void __attribute__((noreturn)) software_reboot(void) {
-    /* Full reboot: reset SPI controller to XIP mode, then jump to
-     * TCAT bootloader at XIP 0x4F000. The bootloader DMA-copies
-     * firmware from SPI to SRAM — equivalent to power cycle.
-     *
-     * Must reset SPI controller first because flash operations leave
-     * it in DMA mode, and XIP instruction fetch requires default mode. */
+    /* Full reboot: disconnect USB, reset peripherals, then jump to
+     * TCAT bootloader at XIP 0x4F000. The bootloader re-validates CRC,
+     * DMA-copies firmware from SPI to SRAM — equivalent to power cycle. */
     volatile uint32_t *spi = (volatile uint32_t *)0xCC000000;
+
+    /* Disconnect USB cleanly — host sees device disappear */
+    usb_disconnect();
 
     /* Disable interrupts */
     __asm__ volatile (
@@ -632,6 +658,16 @@ static void flash_handler(void *ctx, uint16_t category, uint16_t opcode,
         }
         *(uint32_t *)body = 0;
         dcp_send_response(0, body, 4);
+        return;
+    }
+
+    case 7: { /* USB_REENUM — force USB re-enumeration (simulates cable replug) */
+        *(uint32_t *)body = 0;
+        dcp_send_response(0, body, 4);
+        /* Brief delay so USB can send the response */
+        for (volatile int i = 0; i < 100000; i++) {}
+        uart_print_string("[usb] re-enumerate\r\n");
+        usb_reenumerate();
         return;
     }
 
