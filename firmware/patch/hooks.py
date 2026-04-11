@@ -138,7 +138,19 @@ def cmd_patch():
     struct.pack_into('<I', content, boot_call_off, new_call)
     print(f"  Boot init: 0x344 bl 0x{boot_init_addr:05X} ({new_call:#010x}, was {old_call:#010x})")
 
-    # ── Patch 3: Move heap_start past handler zone ──
+    # ── Patch 3: Main-loop hook trampoline at 0x4FAC ──
+    # Replace `bl 0x2F38` (ble_spi_read_tuple) with `bl stub` (flash_handler_init)
+    stub_addr = symbols.get('_hook_dcp_flash_stub')
+    if not stub_addr:
+        # Fall back to the start of the patch zone (stubs are placed first)
+        stub_addr = PATCH_ZONE_SRAM
+    hook_off = sram_to_file(HOOK_TARGET)
+    old_hook = struct.unpack_from('<I', content, hook_off)[0]
+    new_hook = encode_arm_bl(HOOK_TARGET, stub_addr)
+    struct.pack_into('<I', content, hook_off, new_hook)
+    print(f"  Hook: 0x{HOOK_TARGET:05X} bl 0x{stub_addr:05X} ({new_hook:#010x}, was {old_hook:#010x})")
+
+    # ── Patch 4: Move heap_start past handler zone ──
     # mempool_var_init loads heap_start from literal at 0xC570
     # heap_size is computed as 0x50000 - heap_start (RSB instruction, auto-adjusts)
     heap_off = sram_to_file(HEAP_LITERAL_SRAM)

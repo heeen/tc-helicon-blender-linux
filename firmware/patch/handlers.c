@@ -293,28 +293,36 @@ chain:
 
 /* ── USB control ────────────────────────────────────────────────────── */
 
-#define USB_USBCMD  (*(volatile uint32_t *)0x90000008)  /* bit 0 = Run/Stop */
+/* ── USB controller (Freescale/ChipIdea OTG at 0x90000000) ──── */
 
-/* Disconnect USB from host (clear Run/Stop bit).
- * Host sees device disappear, same as cable unplug. */
-static void usb_disconnect(void) {
-    USB_USBCMD &= ~(uint32_t)1;
+#define USB_USBCMD      (*(volatile uint32_t *)0x90000008)  /* bit 0=RS, bit 1=RST */
+#define USB_ENDPTFLUSH   (*(volatile uint32_t *)0x90000014)
+#define USB_USBMODE      (*(volatile uint32_t *)0x90000808)
+
+/* Full USB controller reset: flush endpoints, clear RS (D+ released →
+ * host sees disconnect), set RST (self-clearing, resets all internal state).
+ * USBCMD.RST is bit 1 — self-clears when reset completes (~1ms).
+ * After reset, USBMODE must be re-set to device mode (0x02). */
+static void usb_hw_reset(void) {
+    USB_ENDPTFLUSH = 0xFFFFFFFF;     /* flush all endpoints */
+    USB_USBCMD &= ~(uint32_t)1;     /* clear RS → D+ released → disconnect */
+    USB_USBCMD |= 2;                /* set RST → full controller reset */
+    /* Wait for RST self-clear (typically <1ms) */
+    for (volatile int i = 0; i < 100000; i++) {
+        if (!(USB_USBCMD & 2)) break;
+    }
 }
 
-/* Reconnect USB to host (set Run/Stop bit).
- * Host sees new device, full re-enumeration. */
-static void usb_connect(void) {
-    USB_USBCMD |= 1;
-}
-
-/* Force USB re-enumeration: disconnect, wait, reconnect.
- * Host sees unplug → replug. snd-usb-audio re-probes from scratch. */
+/* Force USB re-enumeration: full reset, wait for host to process
+ * disconnect, then re-init as device and reconnect. */
 static void usb_reenumerate(void) {
-    usb_disconnect();
-    /* Wait ~800ms for host to detect disconnect and clean up.
-     * Linux needs ~500ms; extra margin for slower hosts. */
+    usb_hw_reset();
+    /* Wait ~500ms for host to fully process disconnect */
     for (volatile int i = 0; i < 2000000; i++) {}
-    usb_connect();
+    /* Re-set device mode (required after RST clears USBMODE) */
+    USB_USBMODE = 2;
+    /* Reconnect: set RS → D+ pulled high → host sees new device */
+    USB_USBCMD |= 1;
 }
 
 /* ── Software reboot ─────────────────────────────────────────────────── */
@@ -325,8 +333,8 @@ static void __attribute__((noreturn)) software_reboot(void) {
      * DMA-copies firmware from SPI to SRAM — equivalent to power cycle. */
     volatile uint32_t *spi = (volatile uint32_t *)0xCC000000;
 
-    /* Disconnect USB cleanly — host sees device disappear */
-    usb_disconnect();
+    /* Full USB controller reset — host sees clean disconnect */
+    usb_hw_reset();
 
     /* Disable interrupts */
     __asm__ volatile (
@@ -492,7 +500,6 @@ void boot_init(void) {
 void flash_handler_init(void) {
     if (done_flag == DONE_MAGIC) {
         process_mailbox();
-        init_audio_clock();
         patch_midi_callback();
         arm_midi_rx_endpoint();
         midi_emit_state_diff();
