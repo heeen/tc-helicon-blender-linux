@@ -25,11 +25,12 @@ OPENOCD_CFG = FIRMWARE_DIR.parent / "jtag" / "miolink-dice3-openocd.cfg"
 DRIVER_BIN = FIRMWARE_DIR / "sram_flash_driver.bin"
 
 # SRAM layout (must match sram_flash_driver.c)
-READBACK_BUF = 0x00000
-SECTOR_LIST = 0x01000
-MAILBOX = 0x02000
-DRIVER_CODE = 0x03000
-IMAGE_BASE = 0x05000
+DATA_BUF = 0x2B000
+DRIVER_CODE = 0x2C000
+MAILBOX = 0x2E000
+READBACK_BUF = 0x2E100
+SECTOR_LIST = 0x2F100
+IMAGE_BASE = 0x2F900
 
 SECTOR_SIZE = 0x1000
 
@@ -154,8 +155,14 @@ def main():
     try:
         o.halt()
 
+        # Disable USB to prevent its DMA corrupting SRAM during load.
+        # Do NOT disable DMA engine or SPI — the flash driver needs them.
+        print("\nDisabling USB...")
+        o.mww(0x90000008, 0)           # USB controller stop (RS=0)
+        o.mww(0x90000014, 0xFFFFFFFF)  # USB flush all endpoints
+
         # Load driver
-        print("\nLoading driver...")
+        print("Loading driver...")
         o.load_image(str(DRIVER_BIN), DRIVER_CODE)
 
         # Load sector list
@@ -252,21 +259,26 @@ def main():
         time.sleep(0.5)
 
         if errors == 0 and args.reboot:
-            print("Attempting soft reboot via ROM...")
+            print("Attempting soft reboot...")
             o.halt()
-            # Disconnect USB
-            o.mww(0x90000008, 0)
-            # Clear warm-boot flags
-            o.mww(0x14, 0)
-            o.mww(0xC9000050, 0)
+            # Full USB controller reset (ChipIdea RST bit self-clears)
+            o.mww(0x90000014, 0xFFFFFFFF)   # ENDPTFLUSH all
+            val = o.mdw(0x90000008)
+            o.mww(0x90000008, (val & ~1))   # clear RS → disconnect
+            o.mww(0x90000008, (val | 2))    # set RST → full reset
+            time.sleep(0.01)                # RST self-clears in <1ms
+            # Reset SPI to XIP mode (same as software_reboot)
+            o.mww(0xCC000008, 1)            # SPI EN = 1 (power-on)
+            o.mww(0xCC000010, 2)            # SPI CS = 2 (power-on)
+            o.mww(0xCC000014, 0x38)         # SPI CLK = XIP mode
             # Invalidate caches
             o.cmd("arm mcr 15 0 7 5 0 0")
             o.cmd("arm mcr 15 0 7 6 0 0")
-            # Jump to ROM
-            o.cmd("reg pc 0x20000000")
+            # Jump to TCAT bootloader (not ROM — bootloader handles SPI init)
+            o.cmd("reg pc 0x4F000")
             o.cmd("reg cpsr 0xd3")
             o.resume()
-            print("ROM reboot triggered. Watch UART for TCAT-BOOT.")
+            print("Reboot triggered. Watch UART for TCAT-BOOT.")
         elif errors == 0:
             print("Power cycle the device now.")
 

@@ -100,12 +100,9 @@ def poll_status(o, label, timeout_s=30):
             print(f"{label}: ERROR (errors={errors})")
             o.resume()
             return False
-        if status == ST_IDLE:
-            # Command was consumed but status not set — shouldn't happen
-            print(f"{label}: unexpected IDLE")
-            o.resume()
-            return False
-        # status == ST_RUNNING — still going
+        # ST_IDLE = driver hasn't picked up command yet
+        # ST_RUNNING = driver is executing command
+        # Either way, keep polling
         o.resume()
     print(f"{label}: TIMEOUT")
     return False
@@ -114,18 +111,26 @@ def poll_status(o, label, timeout_s=30):
 def send_cmd(o, cmd, spi_addr=0, timeout_s=30, label="cmd"):
     """Send mailbox command and poll until done."""
     o.halt()
+    time.sleep(0.01)  # let halt settle
     o.mww(MAILBOX + 0, 0)       # status = idle
     o.mww(MAILBOX + 8, spi_addr)  # spi_addr
     o.mww(MAILBOX + 12, 0)      # progress
     o.mww(MAILBOX + 16, 0)      # errors
     o.mww(MAILBOX + 4, cmd)     # command — write LAST (driver polls this)
     o.resume()
+    time.sleep(0.1)  # let driver pick up command before first poll
     return poll_status(o, label, timeout_s)
 
 
 def init_driver(o):
     """Load driver, set PC, resume into command loop."""
     o.halt()
+
+    # Disable USB to prevent its DMA activity corrupting SRAM.
+    # Do NOT disable the DMA engine or SPI — the flash driver needs them.
+    o.mww(0x90000008, 0)           # USB stop
+    o.mww(0x90000014, 0xFFFFFFFF)  # USB flush all endpoints
+
     o.load_image(str(DRIVER_BIN), DRIVER_CODE)
 
     # Clear mailbox
@@ -145,10 +150,15 @@ def init_driver(o):
     # Verify driver is in idle loop
     o.halt()
     status = o.mdw(MAILBOX)
+    pc = o.cmd("reg pc")
     if status != ST_IDLE:
-        print(f"WARNING: driver status={status} after init (expected 0)")
+        print(f"WARNING: driver status={status} after init (expected 0), {pc}")
     else:
-        print("Driver initialized (idle).")
+        print(f"Driver initialized (idle). {pc}")
+
+    # Verify mailbox address is correct in binary
+    mb_cmd = o.mdw(MAILBOX + 4)
+    print(f"  Mailbox at {MAILBOX:#x}, command={mb_cmd}")
     o.resume()
 
 
@@ -183,7 +193,7 @@ def main():
 
         # Clear block protection once
         print("Clearing block protection...")
-        if not send_cmd(o, CMD_BP_CLEAR, timeout_s=5, label="BP_CLEAR"):
+        if not send_cmd(o, CMD_BP_CLEAR, timeout_s=30, label="BP_CLEAR"):
             print("BP_CLEAR failed — continuing anyway")
 
         ok = 0
