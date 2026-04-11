@@ -486,6 +486,12 @@ void boot_init(void) {
     midi_patched = 0;       /* BSS not zeroed in patch zone — must init explicitly */
     clock_initialized = 0;
 
+    /* Initialize HPLL clock before USB starts. Without this, the kernel's
+     * snd-usb-audio driver fails to probe (clock descriptors invalid).
+     * Safe here: .ctors have populated the clock source table, but the
+     * scheduler hasn't started yet so no USB/DMA/thread interference. */
+    init_audio_clock();
+
     uart_print_string("[boot_init] DCP registered\r\n");
 
     /* Chain to original rtos_app_init — starts scheduler, never returns */
@@ -501,7 +507,9 @@ void flash_handler_init(void) {
     if (done_flag == DONE_MAGIC) {
         process_mailbox();
         patch_midi_callback();
-        arm_midi_rx_endpoint();
+        /* EP arming moved to DCP opcode 5 (MIDI_INIT) — calling
+         * usb_midi_rx_start from the main loop disrupts USB enumeration.
+         * Host sends MIDI_INIT after USB is stable. */
         midi_emit_state_diff();
         return;
     }
@@ -621,10 +629,7 @@ static void flash_handler(void *ctx, uint16_t category, uint16_t opcode,
 
     case 5: { /* MIDI_INIT — patch MIDI callback + arm RX endpoint */
         patch_midi_callback();
-
-        /* EP arming TODO: USB bulk OUT EP 0x03 is not armed.
-         * usb_endpoint_submit_transfer crashes the USB stack.
-         * For now, use DCP opcode 6 for host→device CC. */
+        arm_midi_rx_endpoint();
 
         *(uint32_t *)body = midi_patched;
         dcp_send_response(0, body, 4);
