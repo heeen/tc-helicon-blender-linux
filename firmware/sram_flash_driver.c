@@ -12,10 +12,11 @@
  *   4 = VERIFY — read + compare with DATA_BUF, report mismatches
  *   5 = BP_CLEAR — clear block protection (run once at start)
  *
- * Proven register sequences from sram_sector_write.c (2026-03-24):
- *   PIO TX:  ≤4 byte commands (WREN, EWSR, WRSR, SE, WRDI, AAI subsequent)
- *   DMA TX:  >4 byte commands (AAI first pair = 6 bytes)
+ * Proven register sequences (2026-04-11 hardware exploration):
+ *   PIO TX:  ≤4 byte commands AND 3-byte AAI subsequent pairs
+ *   DMA TX:  >4 byte commands (AAI first pair = 6 bytes only)
  *   DMA RX:  RDSR (1 byte) + bulk READ (2KB chunks)
+ *   RDSR:    polling reliable after clean spi_reset() (10/10 in test)
  *
  * SRAM layout (eCos stopped, full 512KB available):
  *   0x00000  Readback/verify buffer (4KB)
@@ -72,10 +73,20 @@
 
 /* ── SRAM layout ────────────────────────────────────────────── */
 
-#define READBACK_BUF ((uint8_t *)0x00000)
-#define SECTOR_LIST  ((struct sector_entry *)0x01000)
-#define DATA_BUF     ((uint8_t *)0x05000)     /* also used as single-sector staging */
-#define IMAGE_BASE   ((const uint8_t *)0x05000)
+/* Original proven SRAM layout (single-sector mode):
+ *   0x2B000  DATA_BUF (4KB sector data)
+ *   0x2C000  Driver code (8KB)
+ *   0x2E000  Mailbox + scratch
+ *   0x2E100  READBACK_BUF (4KB)
+ *
+ * Bulk mode (CMD_FLASH_ALL) adds:
+ *   0x2F100  SECTOR_LIST (2KB, up to 256 entries)
+ *   0x2F900  IMAGE_BASE (bulk sector data, ~326KB to 0x7FFFF)
+ */
+#define DATA_BUF     ((uint8_t *)0x2B000)
+#define READBACK_BUF ((uint8_t *)0x2E100)
+#define SECTOR_LIST  ((struct sector_entry *)0x2F100)
+#define IMAGE_BASE   ((const uint8_t *)0x2F900)
 #define SECTOR_SIZE  0x1000
 #define READ_CHUNK   0x800   /* 2KB — fits in DMA CFG 12-bit count */
 
@@ -89,10 +100,10 @@ struct mailbox {
     volatile uint32_t total;     /* total sectors (flash_all) */
     volatile uint32_t reserved;
 };
-#define MBOX ((struct mailbox *)0x02000)
+#define MBOX ((struct mailbox *)0x2E000)
 
-#define TX_SCRATCH ((volatile uint8_t *)0x02020)
-#define RX_SCRATCH ((volatile uint8_t *)0x02030)
+#define TX_SCRATCH ((volatile uint8_t *)0x2E020)
+#define RX_SCRATCH ((volatile uint8_t *)0x2E030)
 
 struct sector_entry {
     uint32_t spi_addr;     /* SPI flash address (sector-aligned) */
@@ -105,16 +116,24 @@ static inline void dwb(void) {
     __asm__ volatile("mcr p15, 0, %0, c7, c10, 4" :: "r"(0) : "memory");
 }
 
-/* ── Delay ──────────────────────────────────────────────────── */
+/* ── Hardware timer (PLL-independent) ──────────────────────── */
+/*
+ * Timer0 at 0xC2000000: down-counting, reload=500000.
+ * ~11 timer cycles per loop iteration at 196MHz → ~18MHz timer clock.
+ * Used for timeout guards only — actual waits use RDSR polling.
+ */
+#define TIMER_COUNT  (*(volatile uint32_t *)0xC2000004)
+#define TIMER_RELOAD (*(volatile uint32_t *)0xC2000000)
 
-static void delay_us(uint32_t us) {
-    /* Loop-based delay. Calibration depends on CPU clock:
-     *   - Boot/ROM clock (~49MHz): ~3µs per iter (multiplier 20 is conservative)
-     *   - PLL active (~196MHz): ~0.3µs per iter (need 4x higher multiplier)
-     * Use 80 to work correctly in both modes. */
-    volatile uint32_t n = us * 80;
-    if (n == 0) n = 1;
-    while (n--) { __asm__ volatile(""); }
+static uint32_t timer_read(void) {
+    return TIMER_COUNT;
+}
+
+static uint32_t timer_elapsed(uint32_t start, uint32_t end) {
+    uint32_t reload = TIMER_RELOAD;
+    if (start >= end)
+        return start - end;
+    return start + (reload - end);
 }
 
 /* ── PIO TX helpers (≤4 bytes only!) ────────────────────────── */
@@ -318,8 +337,8 @@ static int dma_rx(uint32_t spi_cmd, uint8_t *buf, uint32_t len) {
  * RX buf: [garbage×4, data×data_len]     (skip first 4 bytes)
  * Total transfer length = 4 + data_len
  */
-#define READ_TX_BUF  ((volatile uint8_t *)0x02040) /* TX cmd buffer for bidir read */
-#define RX_TEMP      ((uint8_t *)0x02800)          /* temp RX buffer (2KB + overhead) */
+#define READ_TX_BUF  ((volatile uint8_t *)0x2E040) /* TX cmd buffer for bidir read */
+#define RX_TEMP      ((uint8_t *)0x2A000)          /* temp RX buffer (2KB+4, below DATA_BUF) */
 #define RX_OVERHEAD  4  /* 4 cmd-phase garbage before flash data */
 
 static int dma_bidir_read(uint32_t spi_addr, uint8_t *buf, uint32_t data_len) {
@@ -405,9 +424,7 @@ static int dma_bidir_read(uint32_t spi_addr, uint8_t *buf, uint32_t data_len) {
     return -1;
 }
 
-/* ── RDSR + busy-wait ───────────────────────────────────────── */
-
-static int use_fixed_delays = 1;  /* RDSR polling unreliable across sessions */
+/* ── RDSR polling (hardware-exploration confirmed reliable) ─── */
 
 static uint8_t rdsr(void) {
     if (dma_rx(0x05, (uint8_t *)RX_SCRATCH, 1) == 0)
@@ -416,39 +433,31 @@ static uint8_t rdsr(void) {
 }
 
 /*
- * Poll RDSR until BUSY (bit 0) clears, or fall back to fixed delay.
- * On first RDSR failure, switches to fixed-delay mode permanently.
+ * Poll RDSR until BUSY (bit 0) clears.
+ * Uses hardware timer for timeout (PLL-independent).
+ * timeout_cycles: timer cycles to wait (TIMER_RELOAD=500000 ≈ 28ms).
  */
-static int wait_ready(uint32_t timeout_us) {
-    if (use_fixed_delays) {
-        delay_us(timeout_us);
-        return 0;
-    }
+static int wait_ready(uint32_t timeout_cycles) {
+    uint32_t t0 = timer_read();
 
-    uint32_t attempts = timeout_us / 10;
-    if (attempts < 100) attempts = 100;
-
-    uint32_t ff_count = 0;
-    for (uint32_t i = 0; i < attempts; i++) {
+    for (;;) {
         uint8_t sr = rdsr();
-        if (sr == 0xFF) {
-            ff_count++;
-            if (ff_count > 5) {
-                /* DMA RX broken — fall back to fixed delays */
-                use_fixed_delays = 1;
-                MBOX->last_sr = 0xDEAD;
-                delay_us(timeout_us);
-                return 0;
-            }
-            continue;
+        if (sr != 0xFF) {
+            MBOX->last_sr = sr;
+            if (!(sr & 1))
+                return 0;  /* flash ready */
         }
-        ff_count = 0;
-        MBOX->last_sr = sr;
-        if (!(sr & 1))
-            return 0;
+
+        uint32_t elapsed = timer_elapsed(t0, timer_read());
+        if (elapsed > timeout_cycles) {
+            MBOX->last_sr = 0xDEAD;
+            return -1;  /* timeout */
+        }
     }
-    return -1;
 }
+
+/* Convenience: timeout in timer reload units (1 unit ≈ 28ms) */
+#define TIMER_MS(ms) ((uint32_t)((ms) * (500000 / 28)))
 
 /* ── Command handlers ───────────────────────────────────────── */
 
@@ -458,10 +467,8 @@ static void do_bp_clear(void) {
     /* EWSR (0x50) + WRSR (0x01, 0x00) — clear all block protection bits.
      * SST25VF016B requires EWSR (not WREN!) to enable WRSR writes. */
     pio_cmd1(0x50);              /* EWSR */
-    TX_SCRATCH[0] = 0x01;       /* WRSR opcode */
-    TX_SCRATCH[1] = 0x00;       /* SR value: all BP bits clear */
-    dma_tx(TX_SCRATCH, 2);
-    delay_us(15000);             /* tWRSR max 10ms, 1.5x margin */
+    pio_cmd2(0x01, 0x00);       /* WRSR: clear all BP bits */
+    wait_ready(TIMER_RELOAD);    /* tWRSR max 10ms → poll RDSR */
 
     /* Verify: read SR and check BP bits (mask 0x3C = BP3:BP0) */
     uint8_t sr = rdsr();
@@ -469,10 +476,8 @@ static void do_bp_clear(void) {
     if (sr & 0x3C) {
         /* First attempt failed — retry with WREN as fallback */
         pio_cmd1(0x06);          /* WREN */
-        TX_SCRATCH[0] = 0x01;
-        TX_SCRATCH[1] = 0x00;
-        dma_tx(TX_SCRATCH, 2);
-        delay_us(15000);
+        pio_cmd2(0x01, 0x00);   /* WRSR */
+        wait_ready(TIMER_RELOAD);
         sr = rdsr();
         MBOX->last_sr = sr;
     }
@@ -482,16 +487,14 @@ static int do_erase(uint32_t spi_addr) {
     spi_reset();
     pio_cmd1(0x06);  /* WREN */
 
-    /* SE via DMA TX (4 bytes) */
-    TX_SCRATCH[0] = 0x20;
-    TX_SCRATCH[1] = (spi_addr >> 16) & 0xFF;
-    TX_SCRATCH[2] = (spi_addr >> 8) & 0xFF;
-    TX_SCRATCH[3] = spi_addr & 0xFF;
-    dma_tx(TX_SCRATCH, 4);
+    /* SE (0x20) — 4 bytes, fits in PIO */
+    pio_cmd4(0x20,
+             (spi_addr >> 16) & 0xFF,
+             (spi_addr >> 8) & 0xFF,
+             spi_addr & 0xFF);
 
-    /* Wait for erase completion (tSE max 25ms) */
-    delay_us(30000);
-    return 0;
+    /* Poll RDSR for erase completion (tSE max 25ms) */
+    return wait_ready(TIMER_RELOAD);  /* ~28ms timeout */
 }
 
 /*
@@ -506,11 +509,11 @@ static int do_erase(uint32_t spi_addr) {
  * CE# rising edge commits each pair to the internal programming array.
  * tBP = 7µs typical (page 1). Between pairs, CE# MUST go high for ≥ tBP.
  *
- * Previous implementation used full dma_tx() per pair (20+ register writes,
- * DMA channel setup/teardown = ~2.5ms overhead per pair × 2048 = 5.1s/sector).
- *
- * Optimized: configure SPI controller ONCE in PIO TX mode, then tight loop
- * that only toggles CS and pushes 3 bytes per pair. ~12µs per pair × 2048 = 25ms.
+ * Optimized (2026-04-11):
+ *   - First pair: DMA TX 6 bytes (>4 byte PIO limit)
+ *   - Subsequent 2047 pairs: PIO TX 3 bytes each — NO DMA overhead
+ *   - tBP wait: RDSR polling (flash signals ready via SR bit 0)
+ *   - Hardware exploration confirmed PIO AAI works on 0xCC controller
  */
 static int do_write(uint32_t spi_addr) {
     spi_reset();
@@ -530,25 +533,29 @@ static int do_write(uint32_t spi_addr) {
         return -1;
     }
 
-    delay_us(10);  /* tBP after first pair */
+    /* Wait tBP via RDSR polling. In AAI mode, only RDSR (0x05) and
+     * WRDI (0x04) are accepted. RDSR returns SR with BUSY=1 during
+     * programming and BUSY=0 when ready for next pair. */
+    if (wait_ready(TIMER_RELOAD / 10) != 0) {
+        pio_cmd1(0x04);
+        MBOX->errors = 0xDA02;
+        return -1;
+    }
     MBOX->progress = 2;
 
-    /* Subsequent AAI pairs — 3 bytes each via DMA TX.
-     * PIO path tested but fails on this SPI controller (data not
-     * reaching flash — controller needs full DMA framing for AAI).
-     * MUST use fixed delays (no RDSR) to stay in AAI mode. */
+    /* Subsequent AAI pairs — 3 bytes each via PIO TX.
+     * PIO confirmed working for AAI on this controller (2026-04-11).
+     * After each pair, poll RDSR for tBP completion (7µs typical). */
     for (uint32_t i = 2; i < SECTOR_SIZE; i += 2) {
-        TX_SCRATCH[0] = 0xAD;
-        TX_SCRATCH[1] = DATA_BUF[i];
-        TX_SCRATCH[2] = DATA_BUF[i + 1];
+        pio_cmd3(0xAD, DATA_BUF[i], DATA_BUF[i + 1]);
 
-        if (dma_tx(TX_SCRATCH, 3) != 0) {
+        /* Poll RDSR for tBP (7µs typ, 10µs max).
+         * Timeout is generous — if this fails something is very wrong. */
+        if (wait_ready(TIMER_RELOAD / 10) != 0) {
             MBOX->errors = i;
             pio_cmd1(0x04);
             return -1;
         }
-
-        delay_us(10);  /* tBP = 7µs typ, 1.4x margin */
 
         if ((i & 0xFF) == 0)
             MBOX->progress = i + 2;
@@ -760,7 +767,7 @@ void _start(void) {
         "mrc p15, 0, r0, c1, c0, 0\n"
         "bic r0, r0, #5\n"               /* MMU off + D-cache off (keep I-cache!) */
         "mcr p15, 0, r0, c1, c0, 0\n"
-        "ldr sp, =0x04FFC\n"             /* stack at top of driver region */
+        "ldr sp, =0x2AFFC\n"             /* stack below data buffer */
         "bl  do_main\n"
         "1: b 1b\n"
     );
