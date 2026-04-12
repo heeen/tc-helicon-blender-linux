@@ -185,34 +185,35 @@ static void pio_tx_end(void) {
     SPI_EN = 0;
 }
 
+/* Forward declaration — dma_tx defined below */
+static int dma_tx(const volatile uint8_t *buf, uint32_t len);
+
+/* Short SPI commands via DMA TX (replaces PIO which doesn't work in
+ * TCAT-BOOT loader context — SPI_STAT stuck at 0x6 for PIO). */
 static void pio_cmd1(uint8_t cmd) {
-    pio_tx_begin(1);
-    pio_tx_byte(cmd);
-    pio_tx_end();
+    TX_SCRATCH[0] = cmd;
+    dma_tx(TX_SCRATCH, 1);
 }
 
 static void pio_cmd2(uint8_t c1, uint8_t c2) {
-    pio_tx_begin(2);
-    pio_tx_byte(c1);
-    pio_tx_byte(c2);
-    pio_tx_end();
+    TX_SCRATCH[0] = c1;
+    TX_SCRATCH[1] = c2;
+    dma_tx(TX_SCRATCH, 2);
 }
 
 static void pio_cmd3(uint8_t c1, uint8_t c2, uint8_t c3) {
-    pio_tx_begin(3);
-    pio_tx_byte(c1);
-    pio_tx_byte(c2);
-    pio_tx_byte(c3);
-    pio_tx_end();
+    TX_SCRATCH[0] = c1;
+    TX_SCRATCH[1] = c2;
+    TX_SCRATCH[2] = c3;
+    dma_tx(TX_SCRATCH, 3);
 }
 
 static void pio_cmd4(uint8_t c1, uint8_t c2, uint8_t c3, uint8_t c4) {
-    pio_tx_begin(4);
-    pio_tx_byte(c1);
-    pio_tx_byte(c2);
-    pio_tx_byte(c3);
-    pio_tx_byte(c4);
-    pio_tx_end();
+    TX_SCRATCH[0] = c1;
+    TX_SCRATCH[1] = c2;
+    TX_SCRATCH[2] = c3;
+    TX_SCRATCH[3] = c4;
+    dma_tx(TX_SCRATCH, 4);
 }
 
 /* ── DMA TX (>4 bytes) ──────────────────────────────────────── */
@@ -272,21 +273,27 @@ static int dma_tx(const volatile uint8_t *buf, uint32_t len) {
     return -1;
 }
 
-/* ── DMA RX (1-byte commands only: RDSR, JEDEC ID) ─────────── */
+/* ── DMA RX (1-byte commands: RDSR, JEDEC ID) ──────────────── */
 /*
- * CTRL=0x307 sends only 1 byte from SPI_DATA before receiving.
- * Works for 1-byte commands (RDSR=0x05, JEDEC=0x9F).
- * For multi-byte commands (READ=0x03+addr), use dma_bidir_read below.
- */
+ * Bidirectional DMA (DMAMD=3): ch0=RX, ch1=TX.
+ * PIO via SPI_DATA doesn't work in TCAT-BOOT mode, so the command
+ * byte must also come from DMA. TX_SCRATCH holds [cmd, 0x00...]. */
 static int dma_rx(uint32_t spi_cmd, uint8_t *buf, uint32_t len) {
+    uint32_t total = 1 + len;  /* 1 cmd byte + len response bytes */
+
+    /* Build TX buffer: command + dummy bytes */
+    TX_SCRATCH[0] = (uint8_t)spi_cmd;
+    for (uint32_t i = 1; i < total && i < 16; i++)
+        TX_SCRATCH[i] = 0;
+
     while (SPI_STAT & 1) {}
     SPI_EN = 0;
     SPI_CS = 0;
     SPI_DMAGO = 0;
 
-    SPI_CTRL = 0x307;
-    SPI_LEN = len - 1;
-    SPI_DMAMD = 1;
+    SPI_CTRL = 0x007;          /* bidirectional (direction 3) */
+    SPI_LEN = total - 1;
+    SPI_DMAMD = 3;             /* bidirectional DMA */
     SPI_CLK = 2;
     SPI_DMACFG0 = 4;
     SPI_DMACFG1 = 3;
@@ -294,33 +301,53 @@ static int dma_rx(uint32_t spi_cmd, uint8_t *buf, uint32_t len) {
     SPI_EN = 1;
     dwb();
 
-    DMA_EN = 1;
-    DMA_ICLR = 1;
+    /* ch0 = RX: SPI_RX_PORT → RX_SCRATCH (need total bytes, skip first) */
+    DMA_EN = 3;
+    DMA_ICLR = 3;
     DMA_CHCLR(0) = 1;
-    dwb();
-    DMA_CHREG(0, 0x10) = 0;
-    DMA_CHREG(0, 0x00) = SPI_RX_PORT;
-    DMA_CHREG(0, 0x04) = (uint32_t)(uintptr_t)buf;
-    DMA_CHREG(0, 0x0C) = (len & 0xFFF) | 0x88009000;
-    dwb();
-    DMA_CHREG(0, 0x10) = 0xD007;
+    DMA_CHCLR(1) = 1;
     dwb();
 
-    SPI_DATA = spi_cmd;
+    DMA_CHREG(0, 0x10) = 0;
+    DMA_CHREG(0, 0x00) = SPI_RX_PORT;
+    DMA_CHREG(0, 0x04) = (uint32_t)(uintptr_t)RX_SCRATCH;
+    DMA_CHREG(0, 0x08) = 0;
+    DMA_CHREG(0, 0x0C) = (total & 0xFFF) | 0x88009000;
+    dwb();
+    DMA_CHREG(0, 0x10) = 0xD007;
+
+    /* ch1 = TX: TX_SCRATCH → SPI_TX_PORT */
+    DMA_CHREG(1, 0x10) = 0;
+    DMA_CHREG(1, 0x00) = (uint32_t)(uintptr_t)TX_SCRATCH;
+    DMA_CHREG(1, 0x04) = SPI_TX_PORT;
+    DMA_CHREG(1, 0x08) = 0;
+    DMA_CHREG(1, 0x0C) = 0xFFF | 0xF4009000;  /* max count */
+    dwb();
+    DMA_CHREG(1, 0x10) = 0xD005;
+    dwb();
+
     SPI_CS = 1;
+    SPI_CLRINT = 0;
     dwb();
 
     for (volatile int i = 0; i < 500000; i++) {
         if (DMA_ISTAT & 1) {
-            while (SPI_STAT & 1) {}
+            SPI_DMAGO = 1;            /* signal SPI that DMA is done */
+            while (SPI_STAT & 1) {}   /* now wait for SPI idle */
             SPI_CS = 0;
             SPI_EN = 0;
+            DMA_EN = 0;
+            DMA_ICLR = 3;
+            /* Copy response (skip first byte which was during cmd TX) */
+            for (uint32_t j = 0; j < len; j++)
+                buf[j] = ((volatile uint8_t *)RX_SCRATCH)[1 + j];
             return 0;
         }
     }
 
     SPI_CS = 0;
     SPI_EN = 0;
+    DMA_EN = 0;
     return -1;
 }
 
@@ -711,14 +738,13 @@ static void spi_restore_clean(void) {
 void do_main(void) {
     struct mailbox *mb = MBOX;
 
-    /* Initialize SPI controller state */
-    while (SPI_STAT & 1) {}
-    SPI_EN = 0;
-    SPI_CS = 0;
-    SPI_CLK = 2;
+    /* Full SPI/DMA reset — required for TCAT-BOOT mode where the
+     * bootloader leaves the SPI controller in DMA-read state. */
+    spi_reset();
 
     /* Exit AAI mode if flash is stuck in it (from a previous aborted write).
-     * In AAI mode, only RDSR and WRDI are accepted. WRDI exits AAI. */
+     * In AAI mode, only RDSR and WRDI are accepted. WRDI exits AAI.
+     * Uses DMA TX (PIO doesn't work in TCAT-BOOT mode). */
     pio_cmd1(0x04);  /* WRDI — safe to send even if not in AAI mode */
 
     mb->status = 0;

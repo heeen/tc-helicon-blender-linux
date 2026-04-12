@@ -101,7 +101,7 @@ def main():
     p.add_argument("--ref", default=str(FIRMWARE_DIR / "blender_spi_flash_restored.bin"))
     p.add_argument("--speed", type=int, default=1000)
     p.add_argument("--reboot", action="store_true",
-                   help="Attempt soft reboot via ROM after flashing")
+                   help="Attempt soft reboot after flashing")
     args = p.parse_args()
 
     spi = Path(args.ref).read_bytes()
@@ -119,31 +119,12 @@ def main():
     print(f"  {len(sectors)} non-empty sectors, {total_data // 1024} KB data")
     print(f"  Speed: {args.speed} kHz")
 
-    # Pack sector data contiguously
-    image_data = bytearray()
-    sector_list = bytearray()
-    for addr, _ in sectors:
-        offset = len(image_data)
-        image_data.extend(spi[addr:addr + SECTOR_SIZE])
-        sector_list.extend(struct.pack("<II", addr, offset))
-    # Terminator
-    sector_list.extend(struct.pack("<II", 0xFFFFFFFF, 0))
-
-    print(f"  Image blob: {len(image_data)} bytes")
-    print(f"  Sector list: {len(sector_list)} bytes ({len(sectors)} entries)")
-
-    # Check fit
-    if IMAGE_BASE + len(image_data) > 0x80000:
-        print(f"ERROR: image too large for SRAM ({IMAGE_BASE + len(image_data):#x} > 0x80000)")
-        sys.exit(1)
-
-    # Write temp files
-    img_tmp = "/tmp/jtag_flash_image.bin"
-    list_tmp = "/tmp/jtag_flash_list.bin"
-    with open(img_tmp, "wb") as f:
-        f.write(image_data)
-    with open(list_tmp, "wb") as f:
-        f.write(sector_list)
+    # Calculate batch size based on available SRAM
+    max_image_bytes = 0x80000 - IMAGE_BASE  # SRAM end - image start
+    max_sectors_per_batch = max_image_bytes // SECTOR_SIZE
+    num_batches = (len(sectors) + max_sectors_per_batch - 1) // max_sectors_per_batch
+    print(f"  SRAM budget: {max_image_bytes // 1024} KB "
+          f"→ {max_sectors_per_batch} sectors/batch, {num_batches} batch(es)")
 
     # Start OpenOCD
     subprocess.run(["pkill", "-x", "openocd"], capture_output=True)
@@ -151,37 +132,24 @@ def main():
 
     o = OpenOCD(speed=args.speed)
     t0 = time.monotonic()
+    total_errors = 0
+    sectors_done = 0
 
     try:
         o.halt()
 
         # Disable USB to prevent its DMA corrupting SRAM during load.
-        # Do NOT disable DMA engine or SPI — the flash driver needs them.
         print("\nDisabling USB...")
         o.mww(0x90000008, 0)           # USB controller stop (RS=0)
         o.mww(0x90000014, 0xFFFFFFFF)  # USB flush all endpoints
 
-        # Load driver
+        # Load driver once
         print("Loading driver...")
         o.load_image(str(DRIVER_BIN), DRIVER_CODE)
 
-        # Load sector list
-        print("Loading sector list...")
-        o.load_image(list_tmp, SECTOR_LIST)
-
-        # Load bulk image data
-        print(f"Loading image data ({len(image_data) // 1024} KB)...")
-        t_load = time.monotonic()
-        o.load_image(img_tmp, IMAGE_BASE)
-        dt = time.monotonic() - t_load
-        rate = len(image_data) / dt / 1024
-        print(f"  Loaded in {dt:.1f}s ({rate:.1f} KB/s)")
-
-        # Clear mailbox
+        # Invalidate caches, set PC to driver, resume
         for i in range(8):
             o.mww(MAILBOX + i * 4, 0)
-
-        # Invalidate caches, set PC to driver, resume
         o.cmd("arm mcr 15 0 7 5 0 0")
         o.cmd("arm mcr 15 0 7 6 0 0")
         o.cmd(f"reg pc {DRIVER_CODE:#x}")
@@ -196,59 +164,107 @@ def main():
             print(f"WARNING: driver status={status} after init")
         o.resume()
 
-        # Send CMD_FLASH_ALL
-        print(f"\nFlashing {len(sectors)} sectors autonomously...")
-        o.halt()
-        o.mww(MAILBOX + MB_STATUS, 0)
-        o.mww(MAILBOX + MB_PROGRESS, 0)
-        o.mww(MAILBOX + MB_ERRORS, 0)
-        o.mww(MAILBOX + MB_TOTAL, 0)
-        o.mww(MAILBOX + MB_COMMAND, CMD_FLASH_ALL)
-        o.resume()
+        # Process in batches
+        for batch_idx in range(num_batches):
+            batch_start = batch_idx * max_sectors_per_batch
+            batch_end = min(batch_start + max_sectors_per_batch, len(sectors))
+            batch_sectors = sectors[batch_start:batch_end]
+            batch_count = len(batch_sectors)
 
-        # Poll progress
-        t_flash = time.monotonic()
-        last_progress = -1
-        while True:
-            time.sleep(2)
+            if num_batches > 1:
+                print(f"\n── Batch {batch_idx + 1}/{num_batches}: "
+                      f"sectors {batch_start + 1}-{batch_end} of {len(sectors)} ──")
+
+            # Pack this batch's sector data contiguously
+            image_data = bytearray()
+            sector_list = bytearray()
+            for addr, _ in batch_sectors:
+                offset = len(image_data)
+                image_data.extend(spi[addr:addr + SECTOR_SIZE])
+                sector_list.extend(struct.pack("<II", addr, offset))
+            sector_list.extend(struct.pack("<II", 0xFFFFFFFF, 0))
+
+            # Write temp files
+            img_tmp = "/tmp/jtag_flash_image.bin"
+            list_tmp = "/tmp/jtag_flash_list.bin"
+            with open(img_tmp, "wb") as f:
+                f.write(image_data)
+            with open(list_tmp, "wb") as f:
+                f.write(sector_list)
+
+            # Halt driver, load data, resume
             o.halt()
-            status = o.mdw(MAILBOX + MB_STATUS)
-            progress = o.mdw(MAILBOX + MB_PROGRESS)
-            errors = o.mdw(MAILBOX + MB_ERRORS)
-            total = o.mdw(MAILBOX + MB_TOTAL)
+
+            print(f"Loading sector list ({batch_count} entries)...")
+            o.load_image(list_tmp, SECTOR_LIST)
+
+            print(f"Loading image data ({len(image_data) // 1024} KB)...")
+            t_load = time.monotonic()
+            o.load_image(img_tmp, IMAGE_BASE)
+            dt = time.monotonic() - t_load
+            rate = len(image_data) / dt / 1024
+            print(f"  Loaded in {dt:.1f}s ({rate:.1f} KB/s)")
+
+            os.unlink(img_tmp)
+            os.unlink(list_tmp)
+
+            # Clear mailbox and send CMD_FLASH_ALL
+            o.mww(MAILBOX + MB_STATUS, 0)
+            o.mww(MAILBOX + MB_PROGRESS, 0)
+            o.mww(MAILBOX + MB_ERRORS, 0)
+            o.mww(MAILBOX + MB_TOTAL, 0)
+            o.mww(MAILBOX + MB_COMMAND, CMD_FLASH_ALL)
             o.resume()
 
-            if progress != last_progress:
-                elapsed = time.monotonic() - t_flash
-                if progress > 0 and total > 0:
-                    eta = elapsed / progress * (total - progress)
-                    print(f"  [{progress}/{total}] errors={errors} "
-                          f"({elapsed:.0f}s elapsed, ~{eta:.0f}s remaining)")
-                else:
-                    print(f"  [{progress}/{total}] errors={errors}")
-                last_progress = progress
+            # Poll progress
+            t_flash = time.monotonic()
+            last_progress = -1
+            while True:
+                time.sleep(2)
+                o.halt()
+                status = o.mdw(MAILBOX + MB_STATUS)
+                progress = o.mdw(MAILBOX + MB_PROGRESS)
+                errors = o.mdw(MAILBOX + MB_ERRORS)
+                total = o.mdw(MAILBOX + MB_TOTAL)
+                o.resume()
 
-            if status == ST_DONE_OK:
-                break
-            if status == ST_ERROR:
-                print(f"DRIVER ERROR after {progress}/{total} sectors, {errors} errors")
-                break
-            if status == ST_IDLE:
-                # Command was consumed, check if it completed
-                if progress >= total and total > 0:
+                if progress != last_progress:
+                    elapsed = time.monotonic() - t_flash
+                    global_progress = sectors_done + progress
+                    if progress > 0 and total > 0:
+                        eta = elapsed / progress * (total - progress)
+                        print(f"  [{global_progress}/{len(sectors)}] errors={errors} "
+                              f"({elapsed:.0f}s elapsed, ~{eta:.0f}s remaining)")
+                    else:
+                        print(f"  [{global_progress}/{len(sectors)}] errors={errors}")
+                    last_progress = progress
+
+                if status == ST_DONE_OK:
                     break
-                print(f"  (idle, progress={progress}/{total})")
+                if status == ST_ERROR:
+                    print(f"DRIVER ERROR after {progress}/{total} sectors, {errors} errors")
+                    break
+                if status == ST_IDLE:
+                    if progress >= total and total > 0:
+                        break
+                    print(f"  (idle, progress={progress}/{total})")
 
-        dt_flash = time.monotonic() - t_flash
+            total_errors += errors
+            sectors_done += batch_count
+
+            dt_batch = time.monotonic() - t_flash
+            if num_batches > 1:
+                print(f"  Batch {batch_idx + 1} done: {batch_count} sectors in "
+                      f"{dt_batch:.1f}s ({dt_batch/batch_count:.2f}s/sector)")
+
         dt_total = time.monotonic() - t0
 
         print(f"\n{'=' * 60}")
-        if errors == 0:
-            print(f"SUCCESS: {total} sectors, 0 errors")
+        if total_errors == 0:
+            print(f"SUCCESS: {sectors_done} sectors, 0 errors")
         else:
-            print(f"WARNING: {total} sectors, {errors} ERRORS")
-        print(f"Flash time: {dt_flash:.1f}s ({dt_flash/total:.2f}s/sector)")
-        print(f"Total time: {dt_total:.1f}s (including {dt_total - dt_flash:.1f}s JTAG load)")
+            print(f"WARNING: {sectors_done} sectors, {total_errors} ERRORS")
+        print(f"Total time: {dt_total:.1f}s ({dt_total/sectors_done:.2f}s/sector)")
         print(f"{'=' * 60}")
         # Restore SPI/DMA to clean state
         print("Restoring SPI/DMA to clean state...")
@@ -258,33 +274,35 @@ def main():
         o.resume()
         time.sleep(0.5)
 
-        if errors == 0 and args.reboot:
+        if total_errors == 0 and args.reboot:
             print("Attempting soft reboot...")
             o.halt()
-            # Full USB controller reset (ChipIdea RST bit self-clears)
-            o.mww(0x90000014, 0xFFFFFFFF)   # ENDPTFLUSH all
-            val = o.mdw(0x90000008)
-            o.mww(0x90000008, (val & ~1))   # clear RS → disconnect
-            o.mww(0x90000008, (val | 2))    # set RST → full reset
-            time.sleep(0.01)                # RST self-clears in <1ms
-            # Reset SPI to XIP mode (same as software_reboot)
-            o.mww(0xCC000008, 1)            # SPI EN = 1 (power-on)
-            o.mww(0xCC000010, 2)            # SPI CS = 2 (power-on)
-            o.mww(0xCC000014, 0x38)         # SPI CLK = XIP mode
-            # Invalidate caches
-            o.cmd("arm mcr 15 0 7 5 0 0")
-            o.cmd("arm mcr 15 0 7 6 0 0")
-            # Jump to TCAT bootloader (not ROM — bootloader handles SPI init)
-            o.cmd("reg pc 0x4F000")
-            o.cmd("reg cpsr 0xd3")
+            # Upload reboot stub to work area and execute it.
+            # The stub handles USB disconnect, SPI/DMA teardown, cache
+            # invalidation, and jumps to bootloader at 0x4F000.
+            reboot_bin = FIRMWARE_DIR / "reboot_stub.bin"
+            if not reboot_bin.exists():
+                print(f"ERROR: {reboot_bin} not found, skipping reboot")
+            else:
+                REBOOT_ADDR = 0x2B000
+                # Get entry point from ELF (uart_puts may precede reboot_entry)
+                reboot_elf = FIRMWARE_DIR / "reboot_stub.elf"
+                if reboot_elf.exists():
+                    with open(reboot_elf, "rb") as f:
+                        f.seek(0x18)
+                        entry = struct.unpack("<I", f.read(4))[0]
+                else:
+                    entry = REBOOT_ADDR
+                o.load_image(str(reboot_bin), REBOOT_ADDR)
+                o.cmd("arm mcr 15 0 7 5 0 0")  # invalidate I-cache
+                o.cmd(f"reg pc {entry:#x}")
+                o.cmd("reg cpsr 0xd3")
             o.resume()
             print("Reboot triggered. Watch UART for TCAT-BOOT.")
-        elif errors == 0:
+        elif total_errors == 0:
             print("Power cycle the device now.")
 
     finally:
-        os.unlink(img_tmp)
-        os.unlink(list_tmp)
         o.close()
 
 
