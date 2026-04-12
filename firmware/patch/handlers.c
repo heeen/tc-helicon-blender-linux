@@ -11,61 +11,11 @@
  *   midi_cc_handler     — intercepts MIDI CC → mixer control
  */
 
-#include <stdint.h>
+#include "dice_platform.h"
 
-/* ── Firmware functions (resolved by linker via firmware_symbols.ld) ── */
-
-extern int  sst25xx_sector_erase(void *ctx, uint32_t addr);
-extern int  sst25xx_aai_write(void *ctx, uint32_t addr,
-                               const void *buf, uint32_t len);
-extern void *memcpy(void *dst, const void *src, unsigned int len);
-extern void dcp_register_handler(void *node);
-extern void dcp_send_response(int retcode, void *body, int len);
-
-/* Mixer hardware functions */
-extern void channel_level_apply(int bus, int input, int level);
-extern void master_level_apply(int bus, int level);
-extern void compressor_level_apply(int bus, int level);
-extern void led_mute_update(int input, int on_off);
-
-/* Original MIDI channel message callback (we chain to it) */
-extern void midi_channel_msg_cb_orig(void *parser_ctx, void *parser_ctx2);
-
-
-/* MIDI TX — sends MIDI data out USB MIDI EP IN (device → host). */
-extern int midi_tx_write(const void *data, int len);
-
-/* USB endpoint transfer submission — bypasses streaming state checks.
- * Programs the USB controller queue head and primes the endpoint. */
-extern void usb_endpoint_submit_transfer(void *ep, void *buf, int size,
-                                          void *callback, int ctx);
-extern void usb_midi_rx_complete(void *param1, int param2);
-
-/* Audio clock init — programs HPLL clock source for valid USB descriptors */
-extern void usb_audio_rx_set_sample_rate(uint32_t sample_rate);
-
-/* USB MIDI RX endpoint arming */
-extern void usb_midi_rx_start(void *ep_handle, int num_cables);
-extern void *usb_iface_get_rx_endpoint(void *conn, int type);
-extern uint8_t usb_midi_conn[];  /* connection object at 0x2A230 */
-
-extern uint8_t sst25xx_driver_ctx[];  /* SPI flash driver context at 0x2A93C */
 #define DRIVER_CTX  ((void *)sst25xx_driver_ctx)
-
-/* Mixer state in firmware BSS — inputs[4][7] + compressor[4] + master[4] */
-extern uint8_t mixer_state[36];
-#define MIXER_STATE  ((volatile uint8_t *)mixer_state)
-
-/* MIDI parser context — channel_msg_cb pointer at offset +0x28 */
-extern uint8_t midi_parser_ctx[0x34];
-#define MIDI_PARSER_CTX     ((volatile uint32_t *)midi_parser_ctx)
-#define MIDI_CB_OFFSET      0x28  /* offset to channel_msg_cb function pointer */
-
-/* ── UART debug output (firmware functions, resolved via firmware_symbols.ld) ── */
-
-extern void uart_putc(char c);
-extern void uart_print_string(const char *s);
-extern int  uart_printf(const char *fmt, ...);
+#define MIXER_STATE ((volatile uint8_t *)mixer_state)
+#define MIDI_PARSER_CTX ((volatile uint32_t *)midi_parser_ctx)
 
 /* ── Done flag ───────────────────────────────────────────────────────── */
 /* Placed in BSS — zeroed by C runtime (or by JTAG clear).
@@ -328,28 +278,64 @@ static void usb_reenumerate(void) {
 /* ── Software reboot ─────────────────────────────────────────────────── */
 
 static void __attribute__((noreturn)) software_reboot(void) {
-    /* Full reboot: disconnect USB, reset peripherals, then jump to
+    /* Full reboot: disconnect USB, tear down all peripherals, then jump to
      * TCAT bootloader at XIP 0x4F000. The bootloader re-validates CRC,
      * DMA-copies firmware from SPI to SRAM — equivalent to power cycle. */
     volatile uint32_t *spi = (volatile uint32_t *)0xCC000000;
+    volatile uint32_t *dma = (volatile uint32_t *)0x80000000;
 
-    /* Full USB controller reset — host sees clean disconnect */
+    uart_print_string("[reboot] start\r\n");
+
+    /* 1. USB disconnect (while system still live, host sees clean removal) */
     usb_hw_reset();
+    uart_print_string("[reboot] usb off\r\n");
 
-    /* Disable interrupts */
-    __asm__ volatile (
-        "mrs r0, cpsr        \n"
-        "orr r0, r0, #0xC0   \n"
-        "msr cpsr_c, r0      \n"
-        ::: "r0"
-    );
+    /* 2. SVC mode + disable IRQ+FIQ (bootloader expects SVC) */
+    __asm__ volatile ("mov r0, #0xD3 \n msr cpsr_c, r0 \n" ::: "r0");
+    uart_print_string("[reboot] irq off\r\n");
 
-    /* Restore SPI controller to power-on state (XIP mode) */
-    spi[0x08 / 4] = 1;    /* ctrl = 1 (power-on default) */
-    spi[0x10 / 4] = 2;    /* TX count = 2 (power-on default) */
-    spi[0x14 / 4] = 0x38; /* mode = 0x38 (XIP mode, NOT 0x02 DMA) */
+    /* 3. Stop eCos scheduler tick timer */
+    *(volatile uint32_t *)0xC2000008 = 0;
 
-    /* Invalidate caches */
+    /* 4. Wait for any in-flight SPI/DMA transfer to complete.
+     * sram_flash_driver_v2.c warns: touching DMA_EN/CHCLR during active
+     * transfer permanently breaks the DMA engine. */
+    for (volatile int i = 0; i < 100000; i++) {
+        if (!(spi[0x28 / 4] & 1)) break;  /* SPI_STAT bit 0 = busy */
+    }
+    uart_print_string("[reboot] spi idle\r\n");
+
+    /* 5. Fully disable SPI */
+    spi[0x10 / 4] = 0;    /* SPI_CS = 0 */
+    spi[0x08 / 4] = 0;    /* SPI_EN = 0 */
+    spi[0x2C / 4] = 0;    /* SPI_DMAGO = 0 */
+    spi[0x4C / 4] = 0;    /* SPI_DMAMD = 0 */
+    spi[0x50 / 4] = 0;    /* SPI_DMACFG0 = 0 */
+    spi[0x54 / 4] = 0;    /* SPI_DMACFG1 = 0 */
+    __asm__ volatile ("mcr p15, 0, %0, c7, c10, 4" :: "r"(0) : "memory");
+    uart_print_string("[reboot] spi off\r\n");
+
+    /* 6. DMA engine teardown (proven pattern from spi_restore_clean) */
+    dma[0x08 / 4] = 0;    /* DMA_EN = 0 — disable all channels */
+    dma[0x10 / 4] = 3;    /* DMA_ICLR = clear ch0+ch1 */
+    dma[0x30 / 4] = 1;    /* DMA_CHCLR(0) */
+    dma[0x34 / 4] = 1;    /* DMA_CHCLR(1) */
+    *(volatile uint32_t *)(0x80000110) = 0;  /* ch0 TRG */
+    *(volatile uint32_t *)(0x8000010C) = 0;  /* ch0 CFG */
+    *(volatile uint32_t *)(0x80000130) = 0;  /* ch1 TRG */
+    *(volatile uint32_t *)(0x8000012C) = 0;  /* ch1 CFG */
+    __asm__ volatile ("mcr p15, 0, %0, c7, c10, 4" :: "r"(0) : "memory");
+    uart_print_string("[reboot] dma off\r\n");
+
+    /* 7. Restore SPI to XIP-compatible power-on defaults */
+    spi[0x00 / 4] = 1;    /* SPI_CTRL = 1 (power-on default) */
+    spi[0x04 / 4] = 2;    /* SPI_LEN = 2 (power-on default) */
+    spi[0x14 / 4] = 0x38; /* SPI_CLK = XIP mode */
+    __asm__ volatile ("mcr p15, 0, %0, c7, c10, 4" :: "r"(0) : "memory");
+    uart_print_string("[reboot] xip ok\r\n");
+
+    /* 8. Invalidate caches and jump to bootloader */
+    uart_print_string("[reboot] jump 0x4F000\r\n");
     __asm__ volatile (
         "mov r0, #0          \n"
         "mcr p15, 0, r0, c7, c5, 0 \n"  /* invalidate I-cache */
@@ -419,10 +405,11 @@ static void patch_midi_callback(void) {
     if (midi_patched)
         return;
     volatile uint32_t *cb_ptr =
-        (volatile uint32_t *)((uint8_t *)MIDI_PARSER_CTX + MIDI_CB_OFFSET);
+        (volatile uint32_t *)((uint8_t *)MIDI_PARSER_CTX + MIDI_PARSER_CH_CB_OFFSET);
     *cb_ptr = (uint32_t)(void *)midi_cc_handler;
     memcpy(mixer_snapshot, (const void *)MIXER_STATE, MIX_STATE_SIZE);
     midi_patched = 1;
+    uart_print_string("[midi] cb patched\r\n");
 }
 
 /* ── Audio clock self-init ────────────────────────────────────────────── */
@@ -434,6 +421,9 @@ static void patch_midi_callback(void) {
  * lookup + mode flag write — no I2S, no scheduler, no side effects. */
 
 static volatile uint32_t clock_initialized;
+static volatile uint32_t loop_count;
+static volatile uint32_t last_total_pkts;
+static volatile uint32_t ep3_rx_enabled;
 
 static void init_audio_clock(void) {
     if (clock_initialized)
@@ -441,34 +431,6 @@ static void init_audio_clock(void) {
     usb_audio_rx_set_sample_rate(48000);
     clock_initialized = 1;
     uart_print_string("[clock] 48kHz\r\n");
-}
-
-/* ── EP 0x03 arming (native USB MIDI RX) ─────────────────────────────── */
-
-static void arm_midi_rx_endpoint(void) {
-    /* Get EP handle via vtable dispatch — same call usb_midi_streaming_start uses.
-     * Returns NULL if USB subsystem not yet initialized. */
-    void *ep = usb_iface_get_rx_endpoint(usb_midi_conn, 3);
-    if (ep == (void *)0)
-        return;  /* USB not ready, retry next iteration */
-
-    /* Already armed: callback at ep+8 is non-zero when transfer is in flight.
-     * The completion callback (usb_midi_rx_complete) clears this and re-arms. */
-    if (*(volatile uint32_t *)((uint8_t *)ep + 8) != 0)
-        return;
-
-    /* Force EP state to "configured" (0x02).
-     * usb_hw_ep_start_transfer checks this byte — it's firmware-level tracking,
-     * not a hardware register. The USB controller queue heads and dTDs are
-     * initialized for ALL endpoints at boot by usb_hw_controller_init.
-     * EP 0x03 is otherwise unused (streaming_start never fires for MIDI-only). */
-    *(volatile uint8_t *)((uint8_t *)ep + 0x20) = 0x02;
-
-    /* Arm: sets up buffer at midi_pkt_buf, stores EP handle, primes DMA.
-     * Re-arming is automatic via usb_midi_rx_complete → usb_midi_rx_dispatch. */
-    usb_midi_rx_start(ep, 1);
-
-    uart_print_string("[midi] EP armed\r\n");
 }
 
 void boot_init(void) {
@@ -485,6 +447,9 @@ void boot_init(void) {
     done_flag = DONE_MAGIC;
     midi_patched = 0;       /* BSS not zeroed in patch zone — must init explicitly */
     clock_initialized = 0;
+    loop_count = 0;
+    last_total_pkts = 0;
+    ep3_rx_enabled = 0;
 
     /* Initialize HPLL clock before USB starts. Without this, the kernel's
      * snd-usb-audio driver fails to probe (clock descriptors invalid).
@@ -492,48 +457,114 @@ void boot_init(void) {
      * scheduler hasn't started yet so no USB/DMA/thread interference. */
     init_audio_clock();
 
+    /* EP3 MIDI RX reprime handled in midi_loop_hook after USB is up. */
+
     uart_print_string("[boot_init] DCP registered\r\n");
 
     /* Chain to original rtos_app_init — starts scheduler, never returns */
     rtos_app_init();
 }
 
-/* ── Main-loop hook (called from trampoline at 0x4FAC) ───────────────── */
+/* ── MIDI engine loop hook (replaces bl midi_rx_poll at 0x5180) ───────── */
+/* Called every 2-tick alarm cycle in midi_engine_thread.
+ * Runs midi_rx_poll (the displaced function), then our processing. */
 
-/* If the main loop ever reaches 0x4FAC, this handles mailbox polling.
- * Currently the main loop is blocked in cyg_flag_wait, so this rarely fires.
- */
-void flash_handler_init(void) {
-    if (done_flag == DONE_MAGIC) {
-        process_mailbox();
-        patch_midi_callback();
-        /* EP arming moved to DCP opcode 5 (MIDI_INIT) — calling
-         * usb_midi_rx_start from the main loop disrupts USB enumeration.
-         * Host sends MIDI_INIT after USB is stable. */
-        midi_emit_state_diff();
-        return;
+extern void midi_rx_poll(void);
+
+void midi_loop_hook(void) {
+    /* Enable EP3 RX completion interrupt (one-shot, after USB controller init).
+     * EP3 OUT QH reinit + reprime (one-shot, after USB controller is up). */
+    if (!ep3_rx_enabled) {
+        /* EP3 OUT (MIDI RX) — full QH reinit + reprime via direct MMIO.
+         *
+         * Root cause: usb_hw_ep_read_start fails during SET_CONFIGURATION:
+         *   1. State byte (ep+0x20) must be 0 — dma_start set it to 3
+         *   2. QH[0] bit 31 must be clear — dma_start set it (0x84000000)
+         * So QH bits 28,27 never get set → DMA engine won't accept transfers.
+         *
+         * Fix: write correct QH configuration directly, then reprime.
+         * QH at 0x90000B60 (TCAT RX bank, EP3 OUT, 0x20-byte block).
+         * Completion interrupt bit 19 of 0x81C already set by firmware.
+         */
+        uint32_t ep_h = *(volatile uint32_t *)(midi_pkt_buf + MIDI_PKT_RX_EP);
+        if (ep_h) {
+            volatile uint8_t *ep_state = (volatile uint8_t *)(ep_h + 0x20);
+            uint32_t qh_addr = *(volatile uint32_t *)((uint8_t *)ep_h + 0x1C);
+
+            if (qh_addr && *ep_state != 2) {
+                volatile uint32_t *qh = (volatile uint32_t *)qh_addr;
+
+                /* Configure QH for bulk OUT, 512-byte max packet.
+                 * Replicates what usb_hw_ep_read_start writes:
+                 *   bit 28 = capability (0x10000000)
+                 *   bit 27 = IOC (0x08000000)
+                 *   bit 19 = bulk type (0x00080000)
+                 *   bit 15 = IOS (0x00008000)
+                 *   bits 9:0 = max_pkt (0x200)
+                 * Clears bit 31 ("in use") and bit 21. */
+                qh[0] = 0x18088200;
+
+                /* Reset EP state to configured */
+                *ep_state = 2;
+                *(volatile uint32_t *)((uint8_t *)ep_h + ECOS_EP_COMPLETE_FN) = 0;
+
+                /* Reprime via firmware rx_start → dispatch → submit → dma_start.
+                 * dma_start will set QH[0] |= 0x84000000 (active+IOC)
+                 * and QH[4] with transfer size. */
+                uint8_t cables = *(volatile uint8_t *)(midi_pkt_buf + MIDI_PKT_CABLE_CNT);
+                usb_midi_rx_start((void *)ep_h, cables ? cables : 1);
+
+                /* Kick the standard ChipIdea ENDPTPRIME register.
+                 * TCAT proprietary registers handle DMA config, but the
+                 * controller may still need ENDPTPRIME to start accepting
+                 * bulk OUT tokens. Bit 3 = EP3 RX (USB OUT direction). */
+                *(volatile uint32_t *)0x90000080 = (1u << 3);  /* ENDPTPRIME EP3 RX */
+
+                /* Log QH after reprime */
+                uint32_t qh0 = qh[0];
+                static const char hex[] = "0123456789ABCDEF";
+                uart_print_string("[midi] QH=");
+                for (int i = 28; i >= 0; i -= 4) uart_putc(hex[(qh0 >> i) & 0xF]);
+                uart_putc('\r'); uart_putc('\n');
+            }
+        }
+        ep3_rx_enabled = 1;
     }
 
-    uart_print_string("A");
+    /* Call the displaced midi_rx_poll first — processes USB MIDI RX data */
+    midi_rx_poll();
 
-    /* Register DCP flash handler */
-    static struct handler_node node;
-    node.next     = (void *)0;
-    node.category = CATEGORY_FLASH;
-    node.padding  = 0;
-    node.handler  = (void *)flash_handler;
-    node.context  = (void *)0;
+    /* Patch MIDI parser callback (idempotent — first call patches, rest no-op) */
+    patch_midi_callback();
 
-    dcp_register_handler(&node);
-    uart_print_string("B");
+    /* JTAG mailbox polling */
+    process_mailbox();
 
-    /* Patch MIDI parser's channel_msg_cb to intercept CC messages */
-    volatile uint32_t *cb_ptr =
-        (volatile uint32_t *)((uint8_t *)MIDI_PARSER_CTX + MIDI_CB_OFFSET);
-    *cb_ptr = (uint32_t)(void *)midi_cc_handler;
-    uart_print_string("C");
+    /* Monitor USB MIDI RX state — report changes */
+    uint32_t total = *(volatile uint32_t *)(midi_pkt_buf + MIDI_PKT_TOTAL);
+    if (total != last_total_pkts) {
+        static const char hex[] = "0123456789ABCDEF";
+        uart_print_string("[rx] ");
+        uart_putc(hex[(total >> 4) & 0xF]);
+        uart_putc(hex[total & 0xF]);
+        uart_putc('\r'); uart_putc('\n');
+        last_total_pkts = total;
+    }
 
-    done_flag = DONE_MAGIC;
+    /* Periodic EP status (every ~60 seconds = 4096 loops at ~15ms) */
+    loop_count++;
+    if ((loop_count & 0xFFF) == 0) {
+        uint32_t ep_handle = *(volatile uint32_t *)(midi_pkt_buf + MIDI_PKT_RX_EP);
+        uint8_t cable_cnt = *(volatile uint8_t *)(midi_pkt_buf + MIDI_PKT_CABLE_CNT);
+        uint32_t complete_fn = ep_handle ? *(volatile uint32_t *)((uint8_t *)ep_handle + 8) : 0;
+        uart_putc(ep_handle ? 'E' : 'e');    /* E=ep set, e=no ep */
+        uart_putc(complete_fn ? 'C' : 'c');  /* C=callback set, c=no cb */
+        uart_putc('0' + cable_cnt);          /* cable count digit */
+        uart_putc('\r'); uart_putc('\n');
+    }
+
+    /* Emit MIDI CC feedback for mixer state changes (knobs, BLE) */
+    midi_emit_state_diff();
 }
 
 /* ── DCP Flash Handler ───────────────────────────────────────────────── */
@@ -627,12 +658,13 @@ static void flash_handler(void *ctx, uint16_t category, uint16_t opcode,
         /* never returns */
     }
 
-    case 5: { /* MIDI_INIT — patch MIDI callback + arm RX endpoint */
+    case 5: { /* MIDI_INIT — patch MIDI callback (endpoints armed by firmware) */
         patch_midi_callback();
-        arm_midi_rx_endpoint();
-
+        /* Diagnostic: [0..3]=midi_patched, [4]=usb_state, [5]=rx_armed */
         *(uint32_t *)body = midi_patched;
-        dcp_send_response(0, body, 4);
+        body[4] = usb_conn_get_state(usb_midi_conn);
+        body[5] = (*(volatile uint32_t *)(midi_pkt_buf + MIDI_PKT_RX_EP)) ? 1 : 0;
+        dcp_send_response(0, body, 8);
         return;
     }
 
@@ -680,6 +712,33 @@ static void flash_handler(void *ctx, uint16_t category, uint16_t opcode,
         for (volatile int i = 0; i < 100000; i++) {}
         uart_print_string("[usb] re-enumerate\r\n");
         usb_reenumerate();
+        return;
+    }
+
+    case 8: { /* USB_DIAG — read USB controller + EP state */
+        uint32_t *out = (uint32_t *)body;
+        uint32_t ep_h = *(volatile uint32_t *)(midi_pkt_buf + MIDI_PKT_RX_EP);
+        /* EP struct fields */
+        out[0] = ep_h;  /* EP handle address */
+        out[1] = ep_h ? *(volatile uint32_t *)((uint8_t *)ep_h + 0x1C) : 0;  /* qh_ptr */
+        out[2] = ep_h ? *(volatile uint32_t *)((uint8_t *)ep_h + 0x20) : 0;  /* state+num */
+        out[3] = ep_h ? *(volatile uint32_t *)((uint8_t *)ep_h + 0x24) : 0;  /* flags */
+        out[4] = ep_h ? *(volatile uint32_t *)((uint8_t *)ep_h + 0x28) : 0;  /* dma_buf_copy */
+        out[5] = ep_h ? *(volatile uint32_t *)((uint8_t *)ep_h + 0x2C) : 0;  /* dma_size_copy */
+        /* QH from ep->qh_ptr (read actual HW QH) */
+        uint32_t qh_addr = ep_h ? *(volatile uint32_t *)((uint8_t *)ep_h + 0x1C) : 0;
+        if (qh_addr) {
+            volatile uint32_t *qh = (volatile uint32_t *)qh_addr;
+            out[6] = qh[0];  out[7] = qh[1];  out[8] = qh[2];
+            out[9] = qh[3];  out[10] = qh[4]; out[11] = qh[5];
+            out[12] = qh[6]; out[13] = qh[7];
+        }
+        /* USB controller registers */
+        out[14] = *(volatile uint32_t *)0x90000818;  /* EP comp status */
+        out[15] = *(volatile uint32_t *)0x9000081C;  /* EP comp enable */
+        out[16] = *(volatile uint32_t *)0x90000810;  /* EP RX enable */
+        out[17] = *(volatile uint32_t *)0x90000028;  /* ENDPTLISTADDR */
+        dcp_send_response(0, body, 72);
         return;
     }
 
