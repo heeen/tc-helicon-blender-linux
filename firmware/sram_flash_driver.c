@@ -149,11 +149,22 @@ static void spi_reset(void) {
     SPI_CS = 0;
     SPI_DMAGO = 0;
     SPI_DMAMD = 0;
+    SPI_CTRL = 0x107;   /* TX mode — power-on-like default */
+    SPI_LEN = 0;
+    SPI_DATA = 0;       /* clear stale cmd/addr from bootloader XIP reads */
     SPI_CLK = 2;
+    SPI_CLRINT = 0;
+    SPI_DMACFG0 = 0;
+    SPI_DMACFG1 = 0;
     DMA_EN = 0;
     DMA_ICLR = 3;
     DMA_CHCLR(0) = 1;
     DMA_CHCLR(1) = 1;
+    /* Zero out DMA channel registers to prevent stale config */
+    DMA_CHREG(0, 0x0C) = 0;  /* ch0 CFG */
+    DMA_CHREG(0, 0x10) = 0;  /* ch0 TRG */
+    DMA_CHREG(1, 0x0C) = 0;  /* ch1 CFG */
+    DMA_CHREG(1, 0x10) = 0;  /* ch1 TRG */
     dwb();
     /* Brief spin in case SPI needs time to deassert busy */
     for (volatile int i = 0; i < 1000; i++) {
@@ -364,36 +375,40 @@ static int dma_rx(uint32_t spi_cmd, uint8_t *buf, uint32_t len) {
  * RX buf: [garbage×4, data×data_len]     (skip first 4 bytes)
  * Total transfer length = 4 + data_len
  */
-#define READ_TX_BUF  ((volatile uint8_t *)0x2E040) /* TX cmd buffer for bidir read */
-#define RX_TEMP      ((uint8_t *)0x2A000)          /* temp RX buffer (2KB+4, below DATA_BUF) */
-#define RX_OVERHEAD  4  /* 4 cmd-phase garbage before flash data */
+/* ── Flash read using dma_rx pattern ──────────────────────────────── */
+/*
+ * Uses the exact same SPI/DMA setup as dma_rx (which works for RDSR)
+ * but for a full READ 0x03 command.  TX sends [0x03,A23,A15,A7]+dummy,
+ * RX captures [garbage×4, data×data_len].
+ *
+ * RX goes into RX_TEMP at 0x2A000 (2KB+4 bytes available).
+ * Caller must copy out with 4-byte offset.
+ */
+#define RX_TEMP      ((uint8_t *)0x2A000)
+/*
+ * RX overhead: the SPI RX FIFO can retain up to 4 stale bytes from
+ * a previous bidirectional transfer.  Plus 4 bytes of cmd-phase garbage
+ * (during [0x03, A23, A15, A7]).  DMA captures all of it; we skip 8.
+ */
+#define RX_OVERHEAD  4
 
-static int dma_bidir_read(uint32_t spi_addr, uint8_t *buf, uint32_t data_len) {
+static int flash_read_chunk(uint32_t spi_addr, uint32_t data_len) {
     uint32_t total = RX_OVERHEAD + data_len;
 
-    /* Build TX buffer: READ command + dummy bytes */
-    READ_TX_BUF[0] = 0x03;
-    READ_TX_BUF[1] = (spi_addr >> 16) & 0xFF;
-    READ_TX_BUF[2] = (spi_addr >> 8) & 0xFF;
-    READ_TX_BUF[3] = spi_addr & 0xFF;
-    dwb();
+    /* Build TX: READ cmd + addr + dummy bytes */
+    TX_SCRATCH[0] = 0x03;
+    TX_SCRATCH[1] = (spi_addr >> 16) & 0xFF;
+    TX_SCRATCH[2] = (spi_addr >> 8) & 0xFF;
+    TX_SCRATCH[3] = spi_addr & 0xFF;
+    for (uint32_t i = 4; i < 16; i++)
+        TX_SCRATCH[i] = 0;
 
-    /*
-     * Bidirectional DMA (DMAMD=3) with oversized TX count.
-     *
-     * Problem: TX DMA finishes before all bytes are clocked (FIFO buffering),
-     * which causes the SPI controller to stop and RX stalls.
-     *
-     * Fix: set TX DMA count to max (0xFFF=4095) so TX never "completes"
-     * during the transfer. SPI_LEN controls the actual clock count.
-     * After LEN+1 clocks, the SPI stops, RX DMA has all data.
-     * TX DMA will have a partial transfer (not completed) — that's fine.
-     */
     while (SPI_STAT & 1) {}
     SPI_EN = 0;
     SPI_CS = 0;
     SPI_DMAGO = 0;
-    SPI_CTRL = 0x007;          /* bidirectional (firmware direction 3) */
+
+    SPI_CTRL = 0x007;          /* bidirectional */
     SPI_LEN = total - 1;
     SPI_DMAMD = 3;             /* bidirectional DMA */
     SPI_CLK = 2;
@@ -403,7 +418,7 @@ static int dma_bidir_read(uint32_t spi_addr, uint8_t *buf, uint32_t data_len) {
     SPI_EN = 1;
     dwb();
 
-    /* DMA ch0: RX */
+    /* ch0 = RX: SPI_RX_PORT → RX_TEMP */
     DMA_EN = 3;
     DMA_ICLR = 3;
     DMA_CHCLR(0) = 1;
@@ -412,19 +427,18 @@ static int dma_bidir_read(uint32_t spi_addr, uint8_t *buf, uint32_t data_len) {
 
     DMA_CHREG(0, 0x10) = 0;
     DMA_CHREG(0, 0x00) = SPI_RX_PORT;
-    DMA_CHREG(0, 0x04) = (uint32_t)(uintptr_t)RX_TEMP;  /* write to temp buffer */
+    DMA_CHREG(0, 0x04) = (uint32_t)(uintptr_t)RX_TEMP;
     DMA_CHREG(0, 0x08) = 0;
     DMA_CHREG(0, 0x0C) = (total & 0xFFF) | 0x88009000;
     dwb();
     DMA_CHREG(0, 0x10) = 0xD007;
-    dwb();
 
-    /* DMA ch1: TX — oversized count (0xFFF) so it NEVER completes */
+    /* ch1 = TX: TX_SCRATCH → SPI_TX_PORT (oversized count) */
     DMA_CHREG(1, 0x10) = 0;
-    DMA_CHREG(1, 0x00) = (uint32_t)(uintptr_t)READ_TX_BUF;
+    DMA_CHREG(1, 0x00) = (uint32_t)(uintptr_t)TX_SCRATCH;
     DMA_CHREG(1, 0x04) = SPI_TX_PORT;
     DMA_CHREG(1, 0x08) = 0;
-    DMA_CHREG(1, 0x0C) = 0xFFF | 0xF4009000;  /* max count = 4095 */
+    DMA_CHREG(1, 0x0C) = 0xFFF | 0xF4009000;
     dwb();
     DMA_CHREG(1, 0x10) = 0xD005;
     dwb();
@@ -433,20 +447,22 @@ static int dma_bidir_read(uint32_t spi_addr, uint8_t *buf, uint32_t data_len) {
     SPI_CLRINT = 0;
     dwb();
 
-    /* Poll RX DMA only (ch0 bit 0). TX won't complete — that's intentional. */
     for (volatile int i = 0; i < 1000000; i++) {
         if (DMA_ISTAT & 1) {
             while (SPI_STAT & 1) {}
-            SPI_DMAGO = 1;
+            SPI_DMAGO = 1;     /* signal complete — flushes RX FIFO */
             SPI_CS = 0;
             SPI_EN = 0;
-            DMA_CHCLR(1) = 1;
+            DMA_EN = 0;
+            DMA_ICLR = 3;
+            DMA_CHCLR(1) = 1; /* kill incomplete TX channel */
             return 0;
         }
     }
 
     SPI_CS = 0;
     SPI_EN = 0;
+    DMA_EN = 0;
     DMA_CHCLR(1) = 1;
     return -1;
 }
@@ -560,28 +576,30 @@ static int do_write(uint32_t spi_addr) {
         return -1;
     }
 
-    /* Wait tBP via RDSR polling. In AAI mode, only RDSR (0x05) and
-     * WRDI (0x04) are accepted. RDSR returns SR with BUSY=1 during
-     * programming and BUSY=0 when ready for next pair. */
-    if (wait_ready(TIMER_RELOAD / 10) != 0) {
-        pio_cmd1(0x04);
-        MBOX->errors = 0xDA02;
-        return -1;
+    /*
+     * tBP wait: timer-based delay instead of RDSR polling.
+     *
+     * RDSR polling via dma_rx doesn't work reliably here — the SPI RX
+     * FIFO retains stale bytes from the preceding dma_tx, corrupting
+     * the RDSR response.  The firmware uses delay_us(10) between pairs.
+     *
+     * Hardware timer at 0xC2000004 runs at ~18MHz (PLL-independent).
+     * tBP max = 10µs → 180 timer ticks.  Use 360 ticks (~20µs) for margin.
+     */
+    {
+        uint32_t t0 = timer_read();
+        while (timer_elapsed(t0, timer_read()) < 360) {}
     }
     MBOX->progress = 2;
 
-    /* Subsequent AAI pairs — 3 bytes each via PIO TX.
-     * PIO confirmed working for AAI on this controller (2026-04-11).
-     * After each pair, poll RDSR for tBP completion (7µs typical). */
+    /* Subsequent AAI pairs — 3 bytes each via DMA TX.
+     * Timer-based tBP delay after each pair (PLL-independent). */
     for (uint32_t i = 2; i < SECTOR_SIZE; i += 2) {
         pio_cmd3(0xAD, DATA_BUF[i], DATA_BUF[i + 1]);
 
-        /* Poll RDSR for tBP (7µs typ, 10µs max).
-         * Timeout is generous — if this fails something is very wrong. */
-        if (wait_ready(TIMER_RELOAD / 10) != 0) {
-            MBOX->errors = i;
-            pio_cmd1(0x04);
-            return -1;
+        {
+            uint32_t t0 = timer_read();
+            while (timer_elapsed(t0, timer_read()) < 360) {}
         }
 
         if ((i & 0xFF) == 0)
@@ -591,29 +609,33 @@ static int do_write(uint32_t spi_addr) {
     /* Exit AAI mode */
     pio_cmd1(0x04);  /* WRDI */
 
+    /*
+     * In CMD_FLASH_ALL we transition directly to VERIFY with no host-side
+     * gap. Ensure the final internal program cycle is complete before any
+     * subsequent READ/VERIFY, otherwise verify can race BUSY and report
+     * transient mismatches.
+     */
+    spi_reset();
+    if (wait_ready(TIMER_RELOAD * 2) != 0) {
+        MBOX->errors = 0xDA02;
+        return -1;
+    }
+
     return 0;
 }
 
 /*
  * Read sector via bidirectional DMA in chunks.
- * Each chunk reads into RX_TEMP (which includes 4-byte garbage prefix),
- * then copies data portion to READBACK_BUF.
+ * Each chunk reads into RX_TEMP, then copies (skipping 4-byte cmd overhead).
  */
 static int do_read(uint32_t spi_addr) {
-    /* Flush SPI RX pipeline: do a dummy 1-byte RDSR to drain stale data.
-     * Without this, subsequent chunks get 4 extra stale bytes in the RX path. */
-    dma_rx(0x05, (uint8_t *)RX_SCRATCH, 1);
-
     for (uint32_t off = 0; off < SECTOR_SIZE; off += READ_CHUNK) {
-        /* Flush between chunks too */
-        if (off > 0)
-            dma_rx(0x05, (uint8_t *)RX_SCRATCH, 1);
+        spi_reset();  /* clear stale RX FIFO before every chunk */
 
-        if (dma_bidir_read(spi_addr + off, RX_TEMP, READ_CHUNK) != 0) {
+        if (flash_read_chunk(spi_addr + off, READ_CHUNK) != 0) {
             MBOX->errors = off;
             return -1;
         }
-        /* Copy data from RX_TEMP (skip 4-byte cmd-phase garbage) */
         for (uint32_t i = 0; i < READ_CHUNK; i++)
             READBACK_BUF[off + i] = RX_TEMP[RX_OVERHEAD + i];
         MBOX->progress = off + READ_CHUNK;
@@ -653,6 +675,8 @@ static void do_flash_all(void) {
     /* Clear block protection once */
     do_bp_clear();
 
+    uint32_t fail_count = 0;
+
     for (uint32_t i = 0; i < total; i++) {
         uint32_t addr = list[i].spi_addr;
         const uint8_t *src = image + list[i].sram_offset;
@@ -665,24 +689,97 @@ static void do_flash_all(void) {
 
         /* Erase */
         if (do_erase(addr) != 0) {
-            MBOX->errors++;
+            fail_count++;
+            MBOX->last_sr = addr;  /* store failing address */
             continue;
         }
 
         /* Write */
         if (do_write(addr) != 0) {
-            MBOX->errors++;
+            fail_count++;
+            MBOX->last_sr = addr;
             continue;
         }
 
         /* Verify (on-device: reads flash, compares against DATA_BUF) */
+        uint32_t saved_errors = MBOX->errors;
         if (do_verify(addr) != 0) {
-            MBOX->errors++;
-            continue;
+            fail_count++;
+            MBOX->last_sr = addr;
+            /* do_verify overwrites MBOX->errors with mismatch count;
+             * preserve our running total */
         }
+        MBOX->errors = fail_count;
     }
 
     MBOX->progress = total;
+    MBOX->errors = fail_count;
+}
+
+/* CMD_FLASH_ALL_NOVRFY (cmd 9): erase+write all sectors via main loop.
+ * Instead of calling do_erase/do_write directly, dispatches each sub-op
+ * back through the main loop (like host-driven mode does).
+ *
+ * State machine (driven by MBOX->reserved):
+ *   0 = start: bp_clear, then set state=1
+ *   1 = erase current sector, then set state=2
+ *   2 = write current sector, advance, then set state=1 (or done)
+ */
+static int do_flash_step(void) {
+    struct sector_entry *list = SECTOR_LIST;
+    const uint8_t *image = IMAGE_BASE;
+    uint32_t state = MBOX->reserved;
+    uint32_t idx = MBOX->progress;
+
+    if (state == 0) {
+        /* Init: count sectors, bp_clear */
+        uint32_t total = 0;
+        while (list[total].spi_addr != 0xFFFFFFFF && total < 256)
+            total++;
+        MBOX->total = total;
+        MBOX->progress = 0;
+        MBOX->errors = 0;
+        do_bp_clear();
+        MBOX->reserved = 1;
+        return 1;  /* not done */
+    }
+
+    if (idx >= MBOX->total) {
+        MBOX->reserved = 0;
+        return 0;  /* done */
+    }
+
+    uint32_t addr = list[idx].spi_addr;
+
+    if (state == 1) {
+        /* Copy sector data to DATA_BUF */
+        const uint8_t *src = image + list[idx].sram_offset;
+        for (uint32_t j = 0; j < SECTOR_SIZE; j++)
+            DATA_BUF[j] = src[j];
+        /* Erase */
+        if (do_erase(addr) != 0) {
+            MBOX->errors++;
+            MBOX->last_sr = addr;
+            /* skip to next sector */
+            MBOX->progress = idx + 1;
+            return 1;
+        }
+        MBOX->reserved = 2;
+        return 1;  /* not done, come back for write */
+    }
+
+    if (state == 2) {
+        /* Write */
+        if (do_write(addr) != 0) {
+            MBOX->errors++;
+            MBOX->last_sr = addr;
+        }
+        MBOX->progress = idx + 1;
+        MBOX->reserved = 1;
+        return 1;  /* next sector */
+    }
+
+    return 0;  /* unknown state */
 }
 
 /* ── SPI/DMA cleanup for soft reboot ───────────────────────── */
@@ -759,8 +856,11 @@ void do_main(void) {
             continue;
 
         mb->status = 1;  /* running */
-        mb->progress = 0;
-        mb->errors = 0;
+        /* Don't reset progress/errors for cmd 9 re-entries */
+        if (cmd != 9) {
+            mb->progress = 0;
+            mb->errors = 0;
+        }
 
         uint32_t addr = mb->spi_addr;
         int ret = 0;
@@ -773,6 +873,84 @@ void do_main(void) {
         case 5: do_bp_clear(); break;
         case 6: do_flash_all(); break;
         case 7: spi_restore_clean(); break;
+        case 9:
+            /* State machine: one sub-op per host dispatch.
+             * Host polls status, re-sends cmd=9 for each step.
+             * ret=0 from do_flash_step means done; ret=1 means more. */
+            ret = do_flash_step() ? 0 : 0;  /* always "success" for status */
+            break;
+        case 8: {
+            /* Diagnostic: read 4 flash bytes via dma_rx code path.
+             * Sends [0x03, A23, A15, A7] + 4 dummy = 8 bytes bidir.
+             * Result in mailbox: last_sr = first 4 data bytes (LE). */
+            uint8_t rx[12];
+            TX_SCRATCH[0] = 0x03;
+            TX_SCRATCH[1] = (addr >> 16) & 0xFF;
+            TX_SCRATCH[2] = (addr >> 8) & 0xFF;
+            TX_SCRATCH[3] = addr & 0xFF;
+            for (int k = 4; k < 16; k++) TX_SCRATCH[k] = 0;
+
+            /* Exact dma_rx path but total=8, dest=rx */
+            uint32_t total = 8;
+            while (SPI_STAT & 1) {}
+            SPI_EN = 0; SPI_CS = 0; SPI_DMAGO = 0;
+            SPI_CTRL = 0x007;
+            SPI_LEN = total - 1;
+            SPI_DMAMD = 3;
+            SPI_CLK = 2;
+            SPI_DMACFG0 = 4;
+            SPI_DMACFG1 = 3;
+            dwb();
+            SPI_EN = 1;
+            dwb();
+
+            DMA_EN = 3;
+            DMA_ICLR = 3;
+            DMA_CHCLR(0) = 1;
+            DMA_CHCLR(1) = 1;
+            dwb();
+
+            DMA_CHREG(0, 0x10) = 0;
+            DMA_CHREG(0, 0x00) = SPI_RX_PORT;
+            DMA_CHREG(0, 0x04) = (uint32_t)(uintptr_t)rx;
+            DMA_CHREG(0, 0x08) = 0;
+            DMA_CHREG(0, 0x0C) = (total & 0xFFF) | 0x88009000;
+            dwb();
+            DMA_CHREG(0, 0x10) = 0xD007;
+
+            DMA_CHREG(1, 0x10) = 0;
+            DMA_CHREG(1, 0x00) = (uint32_t)(uintptr_t)TX_SCRATCH;
+            DMA_CHREG(1, 0x04) = SPI_TX_PORT;
+            DMA_CHREG(1, 0x08) = 0;
+            DMA_CHREG(1, 0x0C) = 0xFFF | 0xF4009000;
+            dwb();
+            DMA_CHREG(1, 0x10) = 0xD005;
+            dwb();
+
+            SPI_CS = 1;
+            SPI_CLRINT = 0;
+            dwb();
+
+            int ok = 0;
+            for (volatile int w = 0; w < 500000; w++) {
+                if (DMA_ISTAT & 1) {
+                    while (SPI_STAT & 1) {}
+                    SPI_CS = 0; SPI_EN = 0;
+                    DMA_EN = 0; DMA_ICLR = 3;
+                    ok = 1;
+                    break;
+                }
+            }
+            if (!ok) { SPI_CS = 0; SPI_EN = 0; DMA_EN = 0; ret = -1; break; }
+
+            /* Pack flash bytes (skip 4 cmd-phase garbage) into mailbox */
+            mb->last_sr = (uint32_t)rx[4] | ((uint32_t)rx[5] << 8) |
+                          ((uint32_t)rx[6] << 16) | ((uint32_t)rx[7] << 24);
+            /* Also store cmd-phase garbage for debug */
+            mb->errors = (uint32_t)rx[0] | ((uint32_t)rx[1] << 8) |
+                         ((uint32_t)rx[2] << 16) | ((uint32_t)rx[3] << 24);
+            break;
+        }
         default: ret = -1; break;
         }
 

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3 -u
 """Fast autonomous JTAG flash writer.
 
 Loads the entire SPI image + sector list to SRAM in one bulk transfer,
@@ -9,6 +9,7 @@ Usage:
     python3 firmware/jtag_flash_fast.py
     python3 firmware/jtag_flash_fast.py --ref firmware/blender_spi_patched.bin
     python3 firmware/jtag_flash_fast.py --speed 1000
+    python3 firmware/jtag_flash_fast.py --device-verify
 """
 
 import argparse
@@ -45,6 +46,8 @@ MB_TOTAL = 24
 
 CMD_FLASH_ALL = 6
 CMD_SPI_CLEANUP = 7
+CMD_FLASH_NO_VERIFY = 9
+CMD_READ = 3
 ST_IDLE = 0
 ST_RUNNING = 1
 ST_DONE_OK = 2
@@ -96,12 +99,45 @@ class OpenOCD:
         return r
 
 
+def send_cmd(o, cmd, spi_addr=0):
+    o.halt()
+    for i in range(7):
+        o.mww(MAILBOX + i * 4, 0)
+    o.mww(MAILBOX + MB_SPI_ADDR, spi_addr)
+    o.mww(MAILBOX + MB_COMMAND, cmd)
+    o.resume()
+
+
+def wait_cmd(o, timeout=60):
+    t0 = time.monotonic()
+    while True:
+        time.sleep(0.2)
+        o.halt()
+        st = o.mdw(MAILBOX + MB_STATUS)
+        er = o.mdw(MAILBOX + MB_ERRORS)
+        o.resume()
+        if st == ST_DONE_OK:
+            return (True, er)
+        if st == ST_ERROR:
+            return (False, er)
+        if time.monotonic() - t0 > timeout:
+            return (False, 0xDEAD)
+
+
 def main():
     p = argparse.ArgumentParser(description="Fast autonomous JTAG flash writer")
     p.add_argument("--ref", default=str(FIRMWARE_DIR / "blender_spi_flash_restored.bin"))
-    p.add_argument("--speed", type=int, default=1000)
+    p.add_argument("--speed", type=int, default=10000)
     p.add_argument("--reboot", action="store_true",
                    help="Attempt soft reboot after flashing")
+    p.add_argument("--ignore-errors", action="store_true",
+                   help="Continue on errors instead of aborting")
+    p.add_argument("--device-verify", action="store_true",
+                   help="Deprecated alias: on-device verify is now default")
+    p.add_argument("--no-verify", action="store_true",
+                   help="Skip on-device verify (use CMD_FLASH_NO_VERIFY)")
+    p.add_argument("--limit", type=int, default=0,
+                   help="Limit to first N sectors (0 = all)")
     args = p.parse_args()
 
     spi = Path(args.ref).read_bytes()
@@ -114,6 +150,8 @@ def main():
         if non_ff > 0:
             sectors.append((addr, non_ff))
 
+    if args.limit > 0:
+        sectors = sectors[:args.limit]
     total_data = len(sectors) * SECTOR_SIZE
     print(f"Reference: {args.ref}")
     print(f"  {len(sectors)} non-empty sectors, {total_data // 1024} KB data")
@@ -143,7 +181,7 @@ def main():
         o.mww(0x90000008, 0)           # USB controller stop (RS=0)
         o.mww(0x90000014, 0xFFFFFFFF)  # USB flush all endpoints
 
-        # Load driver once
+        # Load driver once (driver configures PLL internally if needed)
         print("Loading driver...")
         o.load_image(str(DRIVER_BIN), DRIVER_CODE)
 
@@ -157,11 +195,19 @@ def main():
         o.resume()
         time.sleep(0.3)
 
-        # Verify driver is idle
+        # Verify driver is idle and check detected mode
         o.halt()
         status = o.mdw(MAILBOX + MB_STATUS)
+        last_sr = o.mdw(MAILBOX + MB_LAST_SR)
         if status != ST_IDLE:
             print(f"WARNING: driver status={status} after init")
+        if last_sr != 0xFF and last_sr != 0:
+            print(f"Driver ready (SR=0x{last_sr:02X})")
+        elif last_sr == 0:
+            print(f"Driver ready (SR=0x00, BP cleared)")
+        else:
+            print(f"WARNING: RDSR returned 0xFF — flash may not respond")
+        recovery_mode = True   # timer-based delays, ~0.5s/sector at any clock
         o.resume()
 
         # Process in batches
@@ -208,49 +254,122 @@ def main():
             os.unlink(img_tmp)
             os.unlink(list_tmp)
 
-            # Clear mailbox and send CMD_FLASH_ALL
+            # Clear mailbox and send flash command
+            # Default to on-device verify via CMD_FLASH_ALL.
+            # Use --no-verify to force flash-only path.
+            flash_cmd = CMD_FLASH_NO_VERIFY if args.no_verify else CMD_FLASH_ALL
             o.mww(MAILBOX + MB_STATUS, 0)
             o.mww(MAILBOX + MB_PROGRESS, 0)
             o.mww(MAILBOX + MB_ERRORS, 0)
             o.mww(MAILBOX + MB_TOTAL, 0)
-            o.mww(MAILBOX + MB_COMMAND, CMD_FLASH_ALL)
+            o.mww(MAILBOX + MB_COMMAND, flash_cmd)
             o.resume()
 
-            # Poll progress
+            # Wait for autonomous flash to complete.
+            # IMPORTANT: do NOT halt the CPU during flash — any JTAG halt
+            # corrupts in-flight DMA transfers (RDSR polling, verify reads).
+            # Wait the full estimated time, then check once.
             t_flash = time.monotonic()
-            last_progress = -1
+            if recovery_mode:
+                secs_per_sector = 0.6   # timer-based ~20µs/pair, ~0.5s/sector + DMA overhead
+            else:
+                secs_per_sector = 0.15  # DMA TX + fixed delays at 196MHz PLL
+
+            est_seconds = batch_count * secs_per_sector
+            print(f"  Flashing {batch_count} sectors (~{est_seconds:.0f}s, "
+                  f"{'recovery' if recovery_mode else 'fast'} mode)...")
+            time.sleep(est_seconds)
+
+            # Check status — should be done. If not, wait more.
             while True:
-                time.sleep(2)
                 o.halt()
                 status = o.mdw(MAILBOX + MB_STATUS)
                 progress = o.mdw(MAILBOX + MB_PROGRESS)
                 errors = o.mdw(MAILBOX + MB_ERRORS)
                 total = o.mdw(MAILBOX + MB_TOTAL)
+                last_sr = o.mdw(MAILBOX + MB_LAST_SR)
                 o.resume()
 
-                if progress != last_progress:
-                    elapsed = time.monotonic() - t_flash
-                    global_progress = sectors_done + progress
-                    if progress > 0 and total > 0:
-                        eta = elapsed / progress * (total - progress)
-                        print(f"  [{global_progress}/{len(sectors)}] errors={errors} "
-                              f"({elapsed:.0f}s elapsed, ~{eta:.0f}s remaining)")
-                    else:
-                        print(f"  [{global_progress}/{len(sectors)}] errors={errors}")
-                    last_progress = progress
+                elapsed = time.monotonic() - t_flash
+                global_progress = sectors_done + progress
 
                 if status == ST_DONE_OK:
+                    print(f"  Done: {progress}/{total} sectors, {errors} errors "
+                          f"({elapsed:.0f}s, last_sr=0x{last_sr:x})")
                     break
                 if status == ST_ERROR:
-                    print(f"DRIVER ERROR after {progress}/{total} sectors, {errors} errors")
+                    print(f"  DRIVER ERROR: {progress}/{total} sectors, "
+                          f"{errors} errors (last_sr=0x{last_sr:x})")
+                    if not args.ignore_errors:
+                        total_errors += errors
+                        sectors_done += batch_count
+                        raise SystemExit(1)
                     break
-                if status == ST_IDLE:
-                    if progress >= total and total > 0:
-                        break
-                    print(f"  (idle, progress={progress}/{total})")
+                if status == ST_IDLE and progress >= total and total > 0:
+                    print(f"  Done: {progress}/{total} sectors, {errors} errors "
+                          f"({elapsed:.0f}s, last_sr=0x{last_sr:x})")
+                    break
+
+                # Not done yet — wait more without halting
+                remaining = (total - progress) * secs_per_sector if total > 0 else 30
+                wait = max(remaining * 1.5, 10)
+                print(f"  [{global_progress}/{len(sectors)}] {progress}/{total} done, "
+                      f"waiting {wait:.0f}s more...")
+                time.sleep(wait)
 
             total_errors += errors
             sectors_done += batch_count
+
+            if errors > 0 and not args.ignore_errors:
+                print(f"ABORTING: {errors} errors in batch (use --ignore-errors to continue)")
+                break
+
+            if not args.no_verify:
+                verify_tmp = "/tmp/jtag_flash_verify.bin"
+                verify_errors = 0
+                print(f"  Host verify: reading back {batch_count} sectors...")
+                t_verify = time.monotonic()
+                for i, (addr, _) in enumerate(batch_sectors):
+                    expected = spi[addr:addr + SECTOR_SIZE]
+                    send_cmd(o, CMD_READ, addr)
+                    ok, er = wait_cmd(o, timeout=30)
+                    if not ok:
+                        print(f"    READ FAIL @ 0x{addr:05x} (err=0x{er:x})")
+                        verify_errors += 1
+                        if not args.ignore_errors:
+                            break
+                        continue
+
+                    o.halt()
+                    o.cmd(
+                        f"dump_image {verify_tmp} {READBACK_BUF:#x} {SECTOR_SIZE}",
+                        timeout=30,
+                    )
+                    o.resume()
+                    actual = Path(verify_tmp).read_bytes()
+                    mismatches = sum(1 for a, b in zip(actual, expected) if a != b)
+                    if mismatches > 0:
+                        print(f"    MISMATCH @ 0x{addr:05x}: {mismatches} bytes")
+                        verify_errors += 1
+                        if not args.ignore_errors:
+                            break
+                    elif (i + 1) % 16 == 0:
+                        print(f"    verified {i + 1}/{batch_count}")
+
+                try:
+                    os.unlink(verify_tmp)
+                except FileNotFoundError:
+                    pass
+
+                dt_verify = time.monotonic() - t_verify
+                if verify_errors == 0:
+                    print(f"  Host verify passed ({dt_verify:.1f}s)")
+                else:
+                    print(f"  Host verify found {verify_errors} error(s) ({dt_verify:.1f}s)")
+                    total_errors += verify_errors
+                    if not args.ignore_errors:
+                        print("ABORTING: host verification failed")
+                        break
 
             dt_batch = time.monotonic() - t_flash
             if num_batches > 1:
@@ -298,6 +417,7 @@ def main():
                 o.cmd(f"reg pc {entry:#x}")
                 o.cmd("reg cpsr 0xd3")
             o.resume()
+            time.sleep(2)  # let reboot stub run before closing OpenOCD
             print("Reboot triggered. Watch UART for TCAT-BOOT.")
         elif total_errors == 0:
             print("Power cycle the device now.")
