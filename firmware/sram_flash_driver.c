@@ -103,12 +103,38 @@ struct mailbox {
 #define MBOX ((struct mailbox *)0x2E000)
 
 #define TX_SCRATCH ((volatile uint8_t *)0x2E020)
+#define TX_SCRATCH_MAX 16 /* bytes; contiguous through 0x2E02F */
 #define RX_SCRATCH ((volatile uint8_t *)0x2E030)
+#define SR_TRACE_IDX (*(volatile uint32_t *)0x2E07C)
+#define SR_TRACE_BUF ((volatile uint32_t *)0x2E080)  /* 32 entries */
 
 struct sector_entry {
     uint32_t spi_addr;     /* SPI flash address (sector-aligned) */
     uint32_t sram_offset;  /* byte offset into IMAGE_BASE */
 };
+
+/* SR trace event tags (high byte in trace word). */
+#define EVT_BP_CLEAR_PRE   0x01
+#define EVT_BP_CLEAR_POST  0x02
+#define EVT_ERASE_WREN     0x10
+#define EVT_ERASE_DONE     0x11
+#define EVT_WRITE_WREN     0x20
+#define EVT_WRITE_FIRST    0x21
+#define EVT_WRITE_MID      0x22
+#define EVT_WRITE_WRDI     0x23
+#define EVT_WRITE_DONE     0x24
+#define EVT_WRITE_PAIR_SR  0x25
+#define EVT_WRITE_WEL_LOST 0x26
+#define EVT_WRITE_PREPAIR  0x27
+#define EVT_WRITE_POSTPAIR 0x28
+#define EVT_WRITE_WRDI_RETRY 0x29
+#define EVT_WRITE_FAIL_SR  0x2A
+
+static void trace_sr(uint8_t evt, uint8_t sr) {
+    uint32_t idx = SR_TRACE_IDX & 0x1F;
+    SR_TRACE_BUF[idx] = ((uint32_t)evt << 24) | sr;
+    SR_TRACE_IDX = (idx + 1) & 0x1F;
+}
 
 /* ── Write barrier (ARM926EJ-S has no DMB) ──────────────────── */
 
@@ -136,11 +162,34 @@ static uint32_t timer_elapsed(uint32_t start, uint32_t end) {
     return start + (reload - end);
 }
 
+/* Timer-based AAI inter-pair delay.
+ * Tune near TBP (10us max) with a small safety margin. */
+static inline void aai_pair_delay(uint32_t ticks) {
+    uint32_t t0 = timer_read();
+    while (timer_elapsed(t0, timer_read()) < ticks) {}
+}
+
 /* ── PIO TX helpers (≤4 bytes only!) ────────────────────────── */
 
 static void spi_off(void) {
     SPI_EN = 0;
     SPI_CS = 0;
+}
+
+/*
+ * Stop DMA and SPI after a failed or abandoned transfer.
+ * Must match teardown on success paths so the next dma_tx/dma_rx cannot inherit
+ * half-armed channels.
+ */
+static void dma_abort_inflight(void) {
+    SPI_DMAGO = 0;
+    DMA_EN = 0;
+    DMA_ICLR = 3;
+    DMA_CHCLR(0) = 1;
+    DMA_CHCLR(1) = 1;
+    SPI_CS = 0;
+    SPI_EN = 0;
+    dwb();
 }
 
 /* Hard reset SPI + DMA to a known clean state */
@@ -201,30 +250,30 @@ static int dma_tx(const volatile uint8_t *buf, uint32_t len);
 
 /* Short SPI commands via DMA TX (replaces PIO which doesn't work in
  * TCAT-BOOT loader context — SPI_STAT stuck at 0x6 for PIO). */
-static void pio_cmd1(uint8_t cmd) {
+static int pio_cmd1(uint8_t cmd) {
     TX_SCRATCH[0] = cmd;
-    dma_tx(TX_SCRATCH, 1);
+    return dma_tx(TX_SCRATCH, 1);
 }
 
-static void pio_cmd2(uint8_t c1, uint8_t c2) {
+static int pio_cmd2(uint8_t c1, uint8_t c2) {
     TX_SCRATCH[0] = c1;
     TX_SCRATCH[1] = c2;
-    dma_tx(TX_SCRATCH, 2);
+    return dma_tx(TX_SCRATCH, 2);
 }
 
-static void pio_cmd3(uint8_t c1, uint8_t c2, uint8_t c3) {
+static int pio_cmd3(uint8_t c1, uint8_t c2, uint8_t c3) {
     TX_SCRATCH[0] = c1;
     TX_SCRATCH[1] = c2;
     TX_SCRATCH[2] = c3;
-    dma_tx(TX_SCRATCH, 3);
+    return dma_tx(TX_SCRATCH, 3);
 }
 
-static void pio_cmd4(uint8_t c1, uint8_t c2, uint8_t c3, uint8_t c4) {
+static int pio_cmd4(uint8_t c1, uint8_t c2, uint8_t c3, uint8_t c4) {
     TX_SCRATCH[0] = c1;
     TX_SCRATCH[1] = c2;
     TX_SCRATCH[2] = c3;
     TX_SCRATCH[3] = c4;
-    dma_tx(TX_SCRATCH, 4);
+    return dma_tx(TX_SCRATCH, 4);
 }
 
 /* ── DMA TX (>4 bytes) ──────────────────────────────────────── */
@@ -271,16 +320,17 @@ static int dma_tx(const volatile uint8_t *buf, uint32_t len) {
 
     for (volatile int i = 0; i < 500000; i++) {
         if (DMA_ISTAT & 1) {
-            while (SPI_STAT & 1) {}
             SPI_DMAGO = 1;
+            while (SPI_STAT & 1) {}
             SPI_CS = 0;
             SPI_EN = 0;
+            DMA_EN = 0;
+            DMA_ICLR = 3;
             return 0;
         }
     }
 
-    SPI_CS = 0;
-    SPI_EN = 0;
+    dma_abort_inflight();
     return -1;
 }
 
@@ -292,9 +342,12 @@ static int dma_tx(const volatile uint8_t *buf, uint32_t len) {
 static int dma_rx(uint32_t spi_cmd, uint8_t *buf, uint32_t len) {
     uint32_t total = 1 + len;  /* 1 cmd byte + len response bytes */
 
+    if (total > TX_SCRATCH_MAX || len == 0)
+        return -1;
+
     /* Build TX buffer: command + dummy bytes */
     TX_SCRATCH[0] = (uint8_t)spi_cmd;
-    for (uint32_t i = 1; i < total && i < 16; i++)
+    for (uint32_t i = 1; i < total; i++)
         TX_SCRATCH[i] = 0;
 
     while (SPI_STAT & 1) {}
@@ -356,9 +409,7 @@ static int dma_rx(uint32_t spi_cmd, uint8_t *buf, uint32_t len) {
         }
     }
 
-    SPI_CS = 0;
-    SPI_EN = 0;
-    DMA_EN = 0;
+    dma_abort_inflight();
     return -1;
 }
 
@@ -371,46 +422,41 @@ static int dma_rx(uint32_t spi_cmd, uint8_t *buf, uint32_t len) {
  * Firmware uses DMAMD=3 (bidirectional) and arms both channels
  * before CS assert (FUN_0000f384 case 3/4, FUN_000091f0 per channel).
  *
- * TX buf: [0x03, A23, A15, A7, 0x00...] (4 cmd + data_len dummy)
- * RX buf: [garbage×4, data×data_len]     (skip first 4 bytes)
- * Total transfer length = 4 + data_len
+ * xfer_len = READ_RX_SKIP + data_len (see READ_RX_SKIP: cmd/addr + pipeline + dummies).
+ * RX: discard first READ_RX_SKIP bytes, then flash payload.
  */
-/* ── Flash read using dma_rx pattern ──────────────────────────────── */
 /*
- * Uses the exact same SPI/DMA setup as dma_rx (which works for RDSR)
- * but for a full READ 0x03 command.  TX sends [0x03,A23,A15,A7]+dummy,
- * RX captures [garbage×4, data×data_len].
- *
- * RX goes into RX_TEMP at 0x2A000 (2KB+4 bytes available).
- * Caller must copy out with 4-byte offset.
+ * Bidirectional READ TX must supply one byte per SPI clock for the whole
+ * transfer (cmd + addr + dummies).  Only initializing [0..3] leaves DMA
+ * sourcing garbage for the data phase → MISO often reads as 0xFF.
+ * Use a dedicated buffer below RX_TEMP (0x2A000); max xfer = READ_RX_SKIP + READ_CHUNK.
  */
-#define RX_TEMP      ((uint8_t *)0x2A000)
+#define BIDIR_TX_BUF ((volatile uint8_t *)0x28000)
+#define RX_TEMP      ((uint8_t *)0x2A000)          /* temp RX buffer (2KB+overhead) */
 /*
- * RX overhead: the SPI RX FIFO can retain up to 4 stale bytes from
- * a previous bidirectional transfer.  Plus 4 bytes of cmd-phase garbage
- * (during [0x03, A23, A15, A7]).  DMA captures all of it; we skip 8.
+ * TCAT SPI DMA: first MISO data byte aligns after 8 RX samples (4 cmd/addr +
+ * 4 pipeline/dummy clocks). Match xfer_len to READ_RX_SKIP + data_len.
  */
-#define RX_OVERHEAD  4
+#define READ_RX_SKIP 8
 
-static int flash_read_chunk(uint32_t spi_addr, uint32_t data_len) {
-    uint32_t total = RX_OVERHEAD + data_len;
+static int dma_bidir_read(uint32_t spi_addr, uint8_t *buf, uint32_t data_len) {
+    uint32_t xfer_len = READ_RX_SKIP + data_len;
 
-    /* Build TX: READ cmd + addr + dummy bytes */
-    TX_SCRATCH[0] = 0x03;
-    TX_SCRATCH[1] = (spi_addr >> 16) & 0xFF;
-    TX_SCRATCH[2] = (spi_addr >> 8) & 0xFF;
-    TX_SCRATCH[3] = spi_addr & 0xFF;
-    for (uint32_t i = 4; i < 16; i++)
-        TX_SCRATCH[i] = 0;
+    BIDIR_TX_BUF[0] = 0x03;
+    BIDIR_TX_BUF[1] = (spi_addr >> 16) & 0xFF;
+    BIDIR_TX_BUF[2] = (spi_addr >> 8) & 0xFF;
+    BIDIR_TX_BUF[3] = spi_addr & 0xFF;
+    for (uint32_t i = 4; i < xfer_len; i++)
+        BIDIR_TX_BUF[i] = 0;
+    dwb();
 
     while (SPI_STAT & 1) {}
     SPI_EN = 0;
     SPI_CS = 0;
     SPI_DMAGO = 0;
-
-    SPI_CTRL = 0x007;          /* bidirectional */
-    SPI_LEN = total - 1;
-    SPI_DMAMD = 3;             /* bidirectional DMA */
+    SPI_CTRL = 0x007;
+    SPI_LEN = xfer_len - 1;
+    SPI_DMAMD = 3;
     SPI_CLK = 2;
     SPI_DMACFG0 = 4;
     SPI_DMACFG1 = 3;
@@ -418,7 +464,6 @@ static int flash_read_chunk(uint32_t spi_addr, uint32_t data_len) {
     SPI_EN = 1;
     dwb();
 
-    /* ch0 = RX: SPI_RX_PORT → RX_TEMP */
     DMA_EN = 3;
     DMA_ICLR = 3;
     DMA_CHCLR(0) = 1;
@@ -429,13 +474,13 @@ static int flash_read_chunk(uint32_t spi_addr, uint32_t data_len) {
     DMA_CHREG(0, 0x00) = SPI_RX_PORT;
     DMA_CHREG(0, 0x04) = (uint32_t)(uintptr_t)RX_TEMP;
     DMA_CHREG(0, 0x08) = 0;
-    DMA_CHREG(0, 0x0C) = (total & 0xFFF) | 0x88009000;
+    DMA_CHREG(0, 0x0C) = (xfer_len & 0xFFF) | 0x88009000;
     dwb();
     DMA_CHREG(0, 0x10) = 0xD007;
+    dwb();
 
-    /* ch1 = TX: TX_SCRATCH → SPI_TX_PORT (oversized count) */
     DMA_CHREG(1, 0x10) = 0;
-    DMA_CHREG(1, 0x00) = (uint32_t)(uintptr_t)TX_SCRATCH;
+    DMA_CHREG(1, 0x00) = (uint32_t)(uintptr_t)BIDIR_TX_BUF;
     DMA_CHREG(1, 0x04) = SPI_TX_PORT;
     DMA_CHREG(1, 0x08) = 0;
     DMA_CHREG(1, 0x0C) = 0xFFF | 0xF4009000;
@@ -449,21 +494,21 @@ static int flash_read_chunk(uint32_t spi_addr, uint32_t data_len) {
 
     for (volatile int i = 0; i < 1000000; i++) {
         if (DMA_ISTAT & 1) {
+            SPI_DMAGO = 1;
             while (SPI_STAT & 1) {}
-            SPI_DMAGO = 1;     /* signal complete — flushes RX FIFO */
             SPI_CS = 0;
             SPI_EN = 0;
             DMA_EN = 0;
             DMA_ICLR = 3;
-            DMA_CHCLR(1) = 1; /* kill incomplete TX channel */
+            DMA_CHCLR(0) = 1;
+            DMA_CHCLR(1) = 1;
+            for (uint32_t j = 0; j < data_len; j++)
+                buf[j] = RX_TEMP[READ_RX_SKIP + j];
             return 0;
         }
     }
 
-    SPI_CS = 0;
-    SPI_EN = 0;
-    DMA_EN = 0;
-    DMA_CHCLR(1) = 1;
+    dma_abort_inflight();
     return -1;
 }
 
@@ -473,6 +518,42 @@ static uint8_t rdsr(void) {
     if (dma_rx(0x05, (uint8_t *)RX_SCRATCH, 1) == 0)
         return RX_SCRATCH[0];
     return 0xFF;
+}
+
+/* Read SR until two consecutive non-0xFF samples match. */
+static uint8_t rdsr_stable(uint32_t timeout_cycles) {
+    uint32_t t0 = timer_read();
+    uint8_t prev = 0xFF;
+    for (;;) {
+        uint8_t sr = rdsr();
+        if (sr != 0xFF) {
+            if (sr == prev)
+                return sr;
+            prev = sr;
+        }
+        if (timer_elapsed(t0, timer_read()) > timeout_cycles)
+            return 0xFF;
+    }
+}
+
+/* During AAI, RDSR can intermittently return 0xFF on this transport.
+ * Treat single bad samples as noise; only fail on repeated stable WEL=0. */
+static int aai_wel_ok(void) {
+    int clear_hits = 0;
+    for (int n = 0; n < 6; n++) {
+        uint8_t sr = rdsr_stable(TIMER_RELOAD / 32 + 1);
+        if (sr == 0xFF)
+            continue;
+        trace_sr(EVT_WRITE_PAIR_SR, sr);
+        if (sr & 0x02)
+            return 1;  /* WEL set */
+        clear_hits++;
+        if (clear_hits >= 2) {
+            trace_sr(EVT_WRITE_WEL_LOST, sr);
+            return 0;  /* repeated stable clear -> real failure */
+        }
+    }
+    return 1;  /* inconclusive noisy path; don't false-fail */
 }
 
 /*
@@ -503,14 +584,19 @@ static int wait_ready(uint32_t timeout_cycles) {
 #define TIMER_MS(ms) ((uint32_t)((ms) * (500000 / 28)))
 
 /* ── Command handlers ───────────────────────────────────────── */
+static int do_read(uint32_t spi_addr);
 
-static void do_bp_clear(void) {
+static int do_bp_clear(void) {
     spi_reset();
+    trace_sr(EVT_BP_CLEAR_PRE, rdsr());
 
     /* EWSR (0x50) + WRSR (0x01, 0x00) — clear all block protection bits.
      * SST25VF016B requires EWSR (not WREN!) to enable WRSR writes. */
-    pio_cmd1(0x50);              /* EWSR */
-    pio_cmd2(0x01, 0x00);       /* WRSR: clear all BP bits */
+    if (pio_cmd1(0x50) != 0 || pio_cmd2(0x01, 0x00) != 0) {
+        MBOX->errors = 0xDA50;
+        spi_reset();
+        return -1;
+    }
     wait_ready(TIMER_RELOAD);    /* tWRSR max 10ms → poll RDSR */
 
     /* Verify: read SR and check BP bits (mask 0x3C = BP3:BP0) */
@@ -518,26 +604,42 @@ static void do_bp_clear(void) {
     MBOX->last_sr = sr;
     if (sr & 0x3C) {
         /* First attempt failed — retry with WREN as fallback */
-        pio_cmd1(0x06);          /* WREN */
-        pio_cmd2(0x01, 0x00);   /* WRSR */
+        if (pio_cmd1(0x06) != 0 || pio_cmd2(0x01, 0x00) != 0) {
+            MBOX->errors = 0xDA50;
+            spi_reset();
+            return -1;
+        }
         wait_ready(TIMER_RELOAD);
         sr = rdsr();
         MBOX->last_sr = sr;
     }
+    trace_sr(EVT_BP_CLEAR_POST, sr);
+    return 0;
 }
 
 static int do_erase(uint32_t spi_addr) {
     spi_reset();
-    pio_cmd1(0x06);  /* WREN */
+    if (pio_cmd1(0x06) != 0) {  /* WREN */
+        MBOX->errors = 0xDA51;
+        spi_reset();
+        return -1;
+    }
+    trace_sr(EVT_ERASE_WREN, rdsr());
 
     /* SE (0x20) — 4 bytes, fits in PIO */
-    pio_cmd4(0x20,
-             (spi_addr >> 16) & 0xFF,
-             (spi_addr >> 8) & 0xFF,
-             spi_addr & 0xFF);
+    if (pio_cmd4(0x20,
+                  (spi_addr >> 16) & 0xFF,
+                  (spi_addr >> 8) & 0xFF,
+                  spi_addr & 0xFF) != 0) {
+        MBOX->errors = 0xDA52;
+        spi_reset();
+        return -1;
+    }
 
     /* Poll RDSR for erase completion (tSE max 25ms) */
-    return wait_ready(TIMER_RELOAD);  /* ~28ms timeout */
+    int ret = wait_ready(TIMER_RELOAD);  /* ~28ms timeout */
+    trace_sr(EVT_ERASE_DONE, rdsr());
+    return ret;
 }
 
 /*
@@ -545,69 +647,79 @@ static int do_erase(uint32_t spi_addr) {
  *
  * SST25VF016B AAI protocol (DS20005044C, Figure 4-9):
  *   - WREN (0x06)
- *   - First pair:  CE# low → [0xAD, A23, A15, A7, D0, D1] → CE# high → wait tBP
- *   - Subsequent:  CE# low → [0xAD, Dn, Dn+1] → CE# high → wait tBP
+ *   - First pair:  CE# low → [0xAD, A23, A15, A7, D0, D1] → CE# high
+ *   - Subsequent:  CE# low → [0xAD, Dn, Dn+1] → CE# high
+ *   - Between pairs: wait until RDSR.BUSY clears
  *   - Terminate:   CE# low → WRDI (0x04) → CE# high
  *
- * CE# rising edge commits each pair to the internal programming array.
- * tBP = 7µs typical (page 1). Between pairs, CE# MUST go high for ≥ tBP.
- *
- * Optimized (2026-04-11):
- *   - First pair: DMA TX 6 bytes (>4 byte PIO limit)
- *   - Subsequent 2047 pairs: PIO TX 3 bytes each — NO DMA overhead
- *   - tBP wait: RDSR polling (flash signals ready via SR bit 0)
- *   - Hardware exploration confirmed PIO AAI works on 0xCC controller
+ * CE# rising edge commits each pair to internal programming; issuing the
+ * next AAI pair before BUSY clears can drop/garble data.  Polling BUSY is
+ * both valid per datasheet and faster than fixed worst-case delays.
  */
 static int do_write(uint32_t spi_addr) {
-    spi_reset();
-    pio_cmd1(0x06);  /* WREN */
-
-    /* First AAI pair — 6 bytes, needs DMA TX (>4 byte PIO limit) */
-    TX_SCRATCH[0] = 0xAD;
-    TX_SCRATCH[1] = (spi_addr >> 16) & 0xFF;
-    TX_SCRATCH[2] = (spi_addr >> 8) & 0xFF;
-    TX_SCRATCH[3] = spi_addr & 0xFF;
-    TX_SCRATCH[4] = DATA_BUF[0];
-    TX_SCRATCH[5] = DATA_BUF[1];
-
-    if (dma_tx(TX_SCRATCH, 6) != 0) {
-        MBOX->errors = 0xDA01;
-        pio_cmd1(0x04);  /* WRDI */
-        return -1;
-    }
-
-    /*
-     * tBP wait: timer-based delay instead of RDSR polling.
-     *
-     * RDSR polling via dma_rx doesn't work reliably here — the SPI RX
-     * FIFO retains stale bytes from the preceding dma_tx, corrupting
-     * the RDSR response.  The firmware uses delay_us(10) between pairs.
-     *
-     * Hardware timer at 0xC2000004 runs at ~18MHz (PLL-independent).
-     * tBP max = 10µs → 180 timer ticks.  Use 360 ticks (~20µs) for margin.
-     */
-    {
-        uint32_t t0 = timer_read();
-        while (timer_elapsed(t0, timer_read()) < 360) {}
-    }
-    MBOX->progress = 2;
-
-    /* Subsequent AAI pairs — 3 bytes each via DMA TX.
-     * Timer-based tBP delay after each pair (PLL-independent). */
-    for (uint32_t i = 2; i < SECTOR_SIZE; i += 2) {
-        pio_cmd3(0xAD, DATA_BUF[i], DATA_BUF[i + 1]);
-
+    /* Byte-program fallback: slower than AAI, but this is the best baseline we
+     * have in TCAT-BOOT. */
+    const uint32_t warmup_addr = spi_addr + SECTOR_SIZE - 1;
+    const uint32_t total_launches = SECTOR_SIZE + 3;
+    for (uint32_t i = 0; i < total_launches; i++) {
+        spi_reset();
+        if (pio_cmd1(0x06) != 0) {  /* WREN */
+            MBOX->errors = 0xDA53;
+            spi_reset();
+            return -1;
+        }
         {
-            uint32_t t0 = timer_read();
-            while (timer_elapsed(t0, timer_read()) < 360) {}
+            uint8_t sr = rdsr_stable(TIMER_RELOAD / 4);
+            MBOX->last_sr = sr;
+            if (i == 0 || (i & 0x7F) == 0)
+                trace_sr((i == 0) ? EVT_WRITE_WREN : EVT_WRITE_MID, sr);
+            if ((sr & 0x02) == 0) {
+                MBOX->errors = 0xDA20;
+                spi_reset();
+                return -1;
+            }
         }
 
-        if ((i & 0xFF) == 0)
-            MBOX->progress = i + 2;
+        TX_SCRATCH[0] = 0x02;
+        if (i < 3) {
+            /* Diagnostic: if the first few byte-program launches are being lost
+             * by the controller, spend them on an erased tail byte where a 0xFF
+             * write is harmless, then begin real programming at byte 0. */
+            TX_SCRATCH[1] = (warmup_addr >> 16) & 0xFF;
+            TX_SCRATCH[2] = (warmup_addr >> 8) & 0xFF;
+            TX_SCRATCH[3] = warmup_addr & 0xFF;
+            TX_SCRATCH[4] = 0xFF;
+        } else {
+            TX_SCRATCH[1] = ((spi_addr + (i - 3)) >> 16) & 0xFF;
+            TX_SCRATCH[2] = ((spi_addr + (i - 3)) >> 8) & 0xFF;
+            TX_SCRATCH[3] = (spi_addr + (i - 3)) & 0xFF;
+            TX_SCRATCH[4] = DATA_BUF[i - 3];
+        }
+        dwb();
+
+        if (dma_tx(TX_SCRATCH, 5) != 0) {
+            MBOX->errors = 0xDA01;
+            spi_reset();
+            return -1;
+        }
+        if (i == 0)
+            trace_sr(EVT_WRITE_FIRST, rdsr_stable(TIMER_RELOAD / 8));
+
+        if (wait_ready(TIMER_RELOAD) != 0) {
+            MBOX->errors = 0xDA12;
+            spi_reset();
+            return -1;
+        }
+
+        if (i >= 3 && (((i - 2) & 0xFF) == 0) && MBOX->command != 6)
+            MBOX->progress = i - 2;
     }
 
-    /* Exit AAI mode */
-    pio_cmd1(0x04);  /* WRDI */
+    {
+        uint8_t sr = rdsr_stable(TIMER_RELOAD / 4);
+        MBOX->last_sr = sr;
+        trace_sr(EVT_WRITE_DONE, sr);
+    }
 
     /*
      * In CMD_FLASH_ALL we transition directly to VERIFY with no host-side
@@ -618,7 +730,23 @@ static int do_write(uint32_t spi_addr) {
     spi_reset();
     if (wait_ready(TIMER_RELOAD * 2) != 0) {
         MBOX->errors = 0xDA02;
+        spi_reset();
         return -1;
+    }
+
+    /* Debug guard: verify first 16 bytes immediately after write.
+     * Catches silent "write accepted but not programmed" failures. */
+    if (do_read(spi_addr) != 0) {
+        MBOX->errors = 0xDA30;
+        return -1;
+    }
+    for (uint32_t i = 0; i < 16; i++) {
+        if (READBACK_BUF[i] != DATA_BUF[i]) {
+            MBOX->errors = 0xDA31;
+            MBOX->last_sr = 0xE0000000 | (i << 16) |
+                ((uint32_t)DATA_BUF[i] << 8) | (uint32_t)READBACK_BUF[i];
+            return -1;
+        }
     }
 
     return 0;
@@ -629,31 +757,145 @@ static int do_write(uint32_t spi_addr) {
  * Each chunk reads into RX_TEMP, then copies (skipping 4-byte cmd overhead).
  */
 static int do_read(uint32_t spi_addr) {
-    for (uint32_t off = 0; off < SECTOR_SIZE; off += READ_CHUNK) {
-        spi_reset();  /* clear stale RX FIFO before every chunk */
+    /* When READ follows AAI WRITE inside CMD_FLASH_ALL, normalize SPI/DMA
+     * state first to avoid stale mode/FIFO interactions. */
+    spi_reset();
 
-        if (flash_read_chunk(spi_addr + off, READ_CHUNK) != 0) {
+    /* Flush SPI RX pipeline: do a dummy 1-byte RDSR to drain stale data. */
+    if (dma_rx(0x05, (uint8_t *)RX_SCRATCH, 1) != 0) {
+        MBOX->errors = 0xDA60;
+        spi_reset();
+        return -1;
+    }
+
+    for (uint32_t off = 0; off < SECTOR_SIZE; off += READ_CHUNK) {
+        if (off > 0) {
+            if (dma_rx(0x05, (uint8_t *)RX_SCRATCH, 1) != 0) {
+                MBOX->errors = 0xDA60;
+                spi_reset();
+                return -1;
+            }
+        }
+
+        if (dma_bidir_read(spi_addr + off, READBACK_BUF + off, READ_CHUNK) != 0) {
             MBOX->errors = off;
             return -1;
         }
-        for (uint32_t i = 0; i < READ_CHUNK; i++)
-            READBACK_BUF[off + i] = RX_TEMP[RX_OVERHEAD + i];
-        MBOX->progress = off + READ_CHUNK;
+        if (MBOX->command != 6)
+            MBOX->progress = off + READ_CHUNK;
     }
     return 0;
 }
 
 static int do_verify(uint32_t spi_addr) {
-    if (do_read(spi_addr) != 0)
+    if (do_read(spi_addr) != 0) {
+        MBOX->last_sr = 0xD0000000 | (spi_addr & 0x0FFFFFFF);  /* verify read path fail */
         return -1;
+    }
 
     uint32_t mismatches = 0;
+    uint32_t first_idx = 0xFFFFFFFF;
+    uint8_t first_exp = 0;
+    uint8_t first_act = 0;
     for (uint32_t i = 0; i < SECTOR_SIZE; i++) {
-        if (READBACK_BUF[i] != DATA_BUF[i])
+        if (READBACK_BUF[i] != DATA_BUF[i]) {
+            if (first_idx == 0xFFFFFFFF) {
+                first_idx = i;
+                first_exp = DATA_BUF[i];
+                first_act = READBACK_BUF[i];
+            }
             mismatches++;
+        }
     }
     MBOX->errors = mismatches;
+    if (mismatches != 0) {
+        /* Encode mismatch detail for host:
+         * last_sr: [31:28]=0xC tag, [27:16]=first mismatch index, [15:8]=expected, [7:0]=actual
+         */
+        MBOX->last_sr = 0xC0000000 |
+            ((first_idx & 0x0FFF) << 16) |
+            ((uint32_t)first_exp << 8) |
+            (uint32_t)first_act;
+        /* Store a tiny readback signature to detect all-0x00 / all-0xFF patterns quickly. */
+        uint32_t sig = ((uint32_t)READBACK_BUF[0]) |
+                       ((uint32_t)READBACK_BUF[1] << 8) |
+                       ((uint32_t)READBACK_BUF[2] << 16) |
+                       ((uint32_t)READBACK_BUF[3] << 24);
+        MBOX->reserved = sig;
+    }
     return (mismatches == 0) ? 0 : -1;
+}
+
+#define VERIFY_CHUNK_BYTES 0x80
+#define SECTOR_RETRY_LIMIT 1
+
+/* FSS-like write-and-verify pass: write first, then chunked read/compare. */
+static int verify_chunked_after_write(uint32_t spi_addr) {
+    spi_reset();
+    /* First READ after a long byte-program run can come back 4 bytes
+     * misaligned unless the controller sees one short RX transaction first.
+     * Reopened mailbox sessions naturally do this during setup; mirror that
+     * here before the first verify chunk. */
+    if (dma_rx(0x05, (uint8_t *)RX_SCRATCH, 1) != 0) {
+        MBOX->errors = 0xDA60;
+        return -1;
+    }
+    for (uint32_t off = 0; off < SECTOR_SIZE; off += VERIFY_CHUNK_BYTES) {
+        if (off > 0 && dma_rx(0x05, (uint8_t *)RX_SCRATCH, 1) != 0) {
+            MBOX->errors = 0xDA60;
+            return -1;
+        }
+        if (dma_bidir_read(spi_addr + off, READBACK_BUF, VERIFY_CHUNK_BYTES) != 0) {
+            MBOX->errors = 0xDA61;
+            MBOX->last_sr = 0xD0000000 | ((spi_addr + off) & 0x0FFFFFFF);
+            return -1;
+        }
+        for (uint32_t i = 0; i < VERIFY_CHUNK_BYTES; i++) {
+            uint8_t act = READBACK_BUF[i];
+            uint8_t exp = DATA_BUF[off + i];
+            if (act != exp) {
+                MBOX->errors = 0xDA62;
+                MBOX->last_sr = 0xE0000000 |
+                    (((off + i) & 0x0FFF) << 16) |
+                    ((uint32_t)exp << 8) |
+                    (uint32_t)act;
+                return -1;
+            }
+        }
+    }
+    return 0;
+}
+
+/* FSS-style sector program: erase -> write -> verify with one retry. */
+static int program_sector_with_retry(uint32_t spi_addr) {
+    for (uint32_t attempt = 0; attempt <= SECTOR_RETRY_LIMIT; attempt++) {
+        if (attempt > 0) {
+            /* Retry gate based on current SR state (FSS-like conservative recovery). */
+            spi_reset();
+            uint8_t sr = rdsr_stable(TIMER_RELOAD / 4);
+            trace_sr(EVT_WRITE_FAIL_SR, sr);
+            if (sr != 0xFF && (sr & 0x3C)) {
+                (void)do_bp_clear();  /* clear BP bits if they reappeared */
+            }
+            if (sr != 0xFF && (sr & 0x40)) {
+                (void)pio_cmd1(0x04); /* force exit AAI if still latched */
+                (void)wait_ready(TIMER_RELOAD);
+            }
+        }
+        if (do_erase(spi_addr) != 0) {
+            MBOX->errors = 0xDA70 | attempt;
+            continue;
+        }
+        aai_pair_delay(36000);  /* settle gap after erase */
+        if (do_write(spi_addr) != 0) {
+            MBOX->errors = 0xDA72 | attempt;
+            continue;
+        }
+        if (verify_chunked_after_write(spi_addr) == 0)
+            return 0;
+        MBOX->errors = 0xDA74 | attempt;
+    }
+    return -1;
 }
 
 /* ── Autonomous flash-all ──────────────────────────────────── */
@@ -673,7 +915,12 @@ static void do_flash_all(void) {
     MBOX->total = total;
 
     /* Clear block protection once */
-    do_bp_clear();
+    if (do_bp_clear() != 0) {
+        MBOX->errors = total;
+        MBOX->last_sr = 0xD0000000u;
+        MBOX->progress = total;
+        return;
+    }
 
     uint32_t fail_count = 0;
 
@@ -685,45 +932,27 @@ static void do_flash_all(void) {
         for (uint32_t j = 0; j < SECTOR_SIZE; j++)
             DATA_BUF[j] = src[j];
 
+        /* CMD_FLASH_ALL progress is sector-based (0..total). */
         MBOX->progress = i;
 
-        /* Erase */
-        if (do_erase(addr) != 0) {
+        if (program_sector_with_retry(addr) != 0) {
             fail_count++;
-            MBOX->last_sr = addr;  /* store failing address */
-            continue;
-        }
-
-        /* Write */
-        if (do_write(addr) != 0) {
-            fail_count++;
-            MBOX->last_sr = addr;
-            continue;
-        }
-
-        /* Verify (on-device: reads flash, compares against DATA_BUF) */
-        uint32_t saved_errors = MBOX->errors;
-        if (do_verify(addr) != 0) {
-            fail_count++;
-            MBOX->last_sr = addr;
-            /* do_verify overwrites MBOX->errors with mismatch count;
-             * preserve our running total */
+            MBOX->reserved = MBOX->errors;  /* preserve stage-specific detail */
+            if ((MBOX->last_sr & 0xF0000000) < 0xA0000000)
+                MBOX->last_sr = 0xB0000000 | (addr & 0x0FFFFFFF);
         }
         MBOX->errors = fail_count;
+        MBOX->progress = i + 1;
     }
 
     MBOX->progress = total;
     MBOX->errors = fail_count;
 }
 
-/* CMD_FLASH_ALL_NOVRFY (cmd 9): erase+write all sectors via main loop.
- * Instead of calling do_erase/do_write directly, dispatches each sub-op
- * back through the main loop (like host-driven mode does).
- *
+/* CMD_FLASH_ALL_NOVRFY (cmd 9): one full sector pipeline per dispatch.
  * State machine (driven by MBOX->reserved):
  *   0 = start: bp_clear, then set state=1
- *   1 = erase current sector, then set state=2
- *   2 = write current sector, advance, then set state=1 (or done)
+ *   1 = program current sector (erase+write+verify-chunked), advance
  */
 static int do_flash_step(void) {
     struct sector_entry *list = SECTOR_LIST;
@@ -739,7 +968,12 @@ static int do_flash_step(void) {
         MBOX->total = total;
         MBOX->progress = 0;
         MBOX->errors = 0;
-        do_bp_clear();
+        if (do_bp_clear() != 0) {
+            MBOX->errors++;
+            MBOX->last_sr = 0xD0000000u;
+            MBOX->reserved = 0;
+            return 0;  /* abort — BP clear failed */
+        }
         MBOX->reserved = 1;
         return 1;  /* not done */
     }
@@ -756,26 +990,15 @@ static int do_flash_step(void) {
         const uint8_t *src = image + list[idx].sram_offset;
         for (uint32_t j = 0; j < SECTOR_SIZE; j++)
             DATA_BUF[j] = src[j];
-        /* Erase */
-        if (do_erase(addr) != 0) {
+        if (program_sector_with_retry(addr) != 0) {
             MBOX->errors++;
-            MBOX->last_sr = addr;
-            /* skip to next sector */
+            if ((MBOX->last_sr & 0xF0000000) < 0xA0000000)
+                MBOX->last_sr = 0xB0000000 | (addr & 0x0FFFFFFF);
             MBOX->progress = idx + 1;
             return 1;
         }
-        MBOX->reserved = 2;
-        return 1;  /* not done, come back for write */
-    }
-
-    if (state == 2) {
-        /* Write */
-        if (do_write(addr) != 0) {
-            MBOX->errors++;
-            MBOX->last_sr = addr;
-        }
-        MBOX->progress = idx + 1;
         MBOX->reserved = 1;
+        MBOX->progress = idx + 1;
         return 1;  /* next sector */
     }
 
@@ -842,13 +1065,15 @@ void do_main(void) {
     /* Exit AAI mode if flash is stuck in it (from a previous aborted write).
      * In AAI mode, only RDSR and WRDI are accepted. WRDI exits AAI.
      * Uses DMA TX (PIO doesn't work in TCAT-BOOT mode). */
-    pio_cmd1(0x04);  /* WRDI — safe to send even if not in AAI mode */
+    if (pio_cmd1(0x04) != 0)  /* WRDI — safe to send even if not in AAI mode */
+        spi_reset();
 
     mb->status = 0;
     mb->command = 0;
     mb->progress = 0;
     mb->errors = 0;
     mb->last_sr = 0;
+    SR_TRACE_IDX = 0;
 
     for (;;) {
         uint32_t cmd = mb->command;
@@ -870,7 +1095,7 @@ void do_main(void) {
         case 2: ret = do_write(addr); break;
         case 3: ret = do_read(addr); break;
         case 4: ret = do_verify(addr); break;
-        case 5: do_bp_clear(); break;
+        case 5: ret = do_bp_clear(); break;
         case 6: do_flash_all(); break;
         case 7: spi_restore_clean(); break;
         case 9:
@@ -934,14 +1159,21 @@ void do_main(void) {
             int ok = 0;
             for (volatile int w = 0; w < 500000; w++) {
                 if (DMA_ISTAT & 1) {
+                    SPI_DMAGO = 1;
                     while (SPI_STAT & 1) {}
                     SPI_CS = 0; SPI_EN = 0;
                     DMA_EN = 0; DMA_ICLR = 3;
+                    DMA_CHCLR(0) = 1;
+                    DMA_CHCLR(1) = 1;
                     ok = 1;
                     break;
                 }
             }
-            if (!ok) { SPI_CS = 0; SPI_EN = 0; DMA_EN = 0; ret = -1; break; }
+            if (!ok) {
+                dma_abort_inflight();
+                ret = -1;
+                break;
+            }
 
             /* Pack flash bytes (skip 4 cmd-phase garbage) into mailbox */
             mb->last_sr = (uint32_t)rx[4] | ((uint32_t)rx[5] << 8) |
