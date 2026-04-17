@@ -71,6 +71,7 @@ CMD_FLASH_ALL = 6
 CMD_QUIT      = 7
 CMD_ERASE_32K = 8
 CMD_ERASE_64K = 9
+CMD_FLASH_SECTOR = 10
 
 PHASE_NAMES = {
     0: "INIT", 1: "TEARDOWN", 2: "T0_ENABLE", 3: "IDLE", 4: "BP_CLEAR",
@@ -348,6 +349,24 @@ class FlashClientV2:
         self.o.resume()
         return data
 
+    def flash_sector(self, spi_addr, data_bytes):
+        """Autonomous erase+program+verify for one sector in a single cmd.
+        Saves 2 of the 3 JTAG handshakes per sector vs erase/program/verify."""
+        tmp = f"/tmp/v2_fs_{spi_addr:x}.bin"
+        Path(tmp).write_bytes(data_bytes)
+        self.o.halt()
+        self.o.load_image(tmp, DATA_BUF_ADDR)
+        self.o.resume()
+        try: os.unlink(tmp)
+        except FileNotFoundError: pass
+        print(f"flash_sector 0x{spi_addr:06x} (len={len(data_bytes)})...")
+        pairs = max(1, len(data_bytes) // 2)
+        est_us = pairs * 260 + 55_000 + 80_000   # program + erase + verify
+        return self._issue(CMD_FLASH_SECTOR, flash_addr=spi_addr,
+                           buf_addr=DATA_BUF_ADDR, length=len(data_bytes),
+                           est_us=est_us,
+                           overall_timeout=max(est_us / 1e6 * 2, 5.0))
+
     def verify(self, spi_addr, expected_bytes):
         tmp = f"/tmp/v2_expect_{spi_addr:x}.bin"
         Path(tmp).write_bytes(expected_bytes)
@@ -493,9 +512,11 @@ def main():
     p.add_argument("--test-sector", type=lambda x: int(x, 0), default=0x3F000,
                    help="Scratch sector for test mode (default 0x3F000)")
     p.add_argument("--mode", choices=("test", "erase-only", "readback",
-                                       "flash-all"),
+                                       "flash-all", "autonomous"),
                    default="test",
-                   help="'test' = erase+program+verify on test sector, "
+                   help="'test' = host-driven erase+program+verify on test sector, "
+                        "'autonomous' = same but via single V2_CMD_FLASH_SECTOR "
+                        "(driver does all three), "
                         "'erase-only' = just erase, "
                         "'readback' = read 4 KB from --test-sector to stdout hex, "
                         "'flash-all' = write every non-empty sector from --ref")
@@ -525,6 +546,17 @@ def main():
         client.load_driver()
         if args.mode == "flash-all":
             return flash_all(client, args)
+        if args.mode == "autonomous":
+            if not client.bp_clear():
+                raise SystemExit(1)
+            pattern = bytes(((i * 37) & 0xFF) if (i % 257) else 0
+                            for i in range(SECTOR_SIZE))
+            t0 = time.monotonic()
+            ok = client.flash_sector(args.test_sector, pattern)
+            dt = time.monotonic() - t0
+            print(f"autonomous flash_sector: {dt:.2f}s wall, "
+                  f"{'OK' if ok else 'FAIL'}")
+            return 0 if ok else 1
         if args.mode == "erase-only":
             ok = client.erase(args.test_sector)
         elif args.mode == "readback":

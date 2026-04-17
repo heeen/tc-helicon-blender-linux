@@ -844,6 +844,24 @@ static int do_verify(uint32_t spi_addr, const uint8_t *expected, uint32_t len) {
     return 0;
 }
 
+/* Autonomous "flash one sector" op — erase + AAI program + verify in
+ * one command. Saves the host ~2/3 of the JTAG round-trips it would
+ * otherwise spend issuing ERASE → PROGRAM → VERIFY separately. */
+static int do_flash_sector(uint32_t spi_addr, const uint8_t *data, uint32_t len) {
+    if (len == 0 || len > V2_SECTOR_SIZE) {
+        set_error(V2_ERR_BAD_LENGTH, spi_addr, 0);
+        return -1;
+    }
+    if (spi_addr & 0xFFFu) {
+        set_error(V2_ERR_BAD_ADDR, spi_addr, 0);
+        return -1;
+    }
+    if (do_erase(spi_addr) != 0) return -1;
+    if (do_aai_program(spi_addr, data, len) != 0) return -1;
+    if (do_verify(spi_addr, data, len) != 0) return -1;
+    return 0;
+}
+
 /* ── Command dispatch ─────────────────────────────────────── */
 
 static void handle_command(uint32_t cmd) {
@@ -868,6 +886,11 @@ static void handle_command(uint32_t cmd) {
     case V2_CMD_ERASE_64K:
         rc = do_erase_block_64k(MBOX->flash_addr);
         break;
+    case V2_CMD_FLASH_SECTOR: {
+        const uint8_t *src = (const uint8_t *)(uintptr_t)MBOX->buf_addr;
+        rc = do_flash_sector(MBOX->flash_addr, src, MBOX->length);
+        break;
+    }
     case V2_CMD_PROGRAM: {
         const uint8_t *src = (const uint8_t *)(uintptr_t)MBOX->buf_addr;
         rc = do_aai_program(MBOX->flash_addr, src, MBOX->length);
