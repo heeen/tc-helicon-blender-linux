@@ -486,7 +486,10 @@ static int do_erase(uint32_t spi_addr) {
 
     set_phase(V2_PHASE_ERASE_POLL);
     uint8_t sr = 0xFF;
-    if (wait_not_busy(60000, &sr) != 0) {  /* datasheet tSE max 25 ms */
+    /* Datasheet tSE max 25 ms. Observed up to ~56 ms on this controller
+     * because our wait_not_busy polls via dma_rx which itself takes
+     * several ms per sample. 150 ms gives generous headroom. */
+    if (wait_not_busy(150000, &sr) != 0) {
         set_error(V2_ERR_ERASE_TIMEOUT, spi_addr, sr);
         return -1;
     }

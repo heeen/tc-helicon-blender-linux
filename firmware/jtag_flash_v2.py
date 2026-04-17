@@ -350,6 +350,51 @@ class FlashClientV2:
                            est_us=30_000, overall_timeout=5.0)
 
 
+def flash_all(client, args):
+    """Flash every non-empty sector of --ref through the v2 driver."""
+    ref = Path(args.ref).read_bytes()
+    print(f"Reference: {args.ref} ({len(ref)} bytes)")
+
+    if args.sectors:
+        sectors = [int(s.strip(), 0) for s in args.sectors.split(",") if s.strip()]
+    else:
+        sectors = []
+        for addr in range(0, len(ref), SECTOR_SIZE):
+            sec = ref[addr:addr + SECTOR_SIZE]
+            if any(b != 0xFF for b in sec):
+                sectors.append(addr)
+    if args.limit > 0:
+        sectors = sectors[:args.limit]
+    print(f"  {len(sectors)} sectors to flash "
+          f"({len(sectors) * SECTOR_SIZE // 1024} KB)")
+
+    if not client.bp_clear():
+        return 1
+
+    total_t0 = time.monotonic()
+    failed = []
+    for idx, addr in enumerate(sectors):
+        expected = ref[addr:addr + SECTOR_SIZE]
+        sec_t0 = time.monotonic()
+        if not client.erase(addr):
+            failed.append(("erase", addr)); continue
+        if not client.program(addr, expected):
+            failed.append(("program", addr)); continue
+        if not args.skip_verify and not client.verify(addr, expected):
+            failed.append(("verify", addr)); continue
+        dt = time.monotonic() - sec_t0
+        done_kb = (idx + 1) * SECTOR_SIZE // 1024
+        print(f"[{idx+1}/{len(sectors)}] 0x{addr:06x} OK {dt:.2f}s "
+              f"({done_kb}/{len(sectors)*SECTOR_SIZE//1024} KB)")
+
+    total = time.monotonic() - total_t0
+    print(f"\n=== flash-all done in {total:.1f}s ===")
+    if failed:
+        print(f"FAILED sectors: {failed}")
+        return 1
+    return 0
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--ref", default=str(FIRMWARE_DIR / "blender_spi_patched.bin"),
@@ -358,11 +403,20 @@ def main():
                    help="JTAG adapter clock in kHz")
     p.add_argument("--test-sector", type=lambda x: int(x, 0), default=0x3F000,
                    help="Scratch sector for test mode (default 0x3F000)")
-    p.add_argument("--mode", choices=("test", "erase-only", "readback"),
+    p.add_argument("--mode", choices=("test", "erase-only", "readback",
+                                       "flash-all"),
                    default="test",
                    help="'test' = erase+program+verify on test sector, "
                         "'erase-only' = just erase, "
-                        "'readback' = read 4 KB from --test-sector to stdout hex")
+                        "'readback' = read 4 KB from --test-sector to stdout hex, "
+                        "'flash-all' = write every non-empty sector from --ref")
+    p.add_argument("--limit", type=int, default=0,
+                   help="flash-all: stop after N sectors (0 = all)")
+    p.add_argument("--skip-verify", action="store_true",
+                   help="flash-all: skip per-sector verify (faster, riskier)")
+    p.add_argument("--sectors", type=str, default="",
+                   help="flash-all: comma-separated hex sector addrs "
+                        "(overrides the non-empty scan of --ref)")
     args = p.parse_args()
 
     if not DRIVER_BIN.exists():
@@ -373,6 +427,8 @@ def main():
     try:
         client = FlashClientV2(ocd)
         client.load_driver()
+        if args.mode == "flash-all":
+            return flash_all(client, args)
         if args.mode == "erase-only":
             ok = client.erase(args.test_sector)
         elif args.mode == "readback":
