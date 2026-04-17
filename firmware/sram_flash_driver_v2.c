@@ -1,25 +1,28 @@
 /*
- * sram_flash_driver_v2.c — Clean rewrite of SPI flash driver
+ * sram_flash_driver_v2.c — v2 bare-metal SRAM flash driver for the
+ * TC Helicon Blender (DICE3 SoC, ARM926EJ-S, SST25VF016B flash).
  *
- * Built and tested incrementally. Each primitive verified in isolation
- * before composition. All addresses and timings from DS20005044C.
+ * Design goals (see ~/.claude/plans/lets-redesign-the-flash-linked-blossom.md):
+ *   1. Deterministic peripheral init (USB/DMA/SPI/LED/Timer0/VIC) — no
+ *      more "depends on previous firmware state" surprises.
+ *   2. Single-writer-per-field mailbox (closes v1 init-race).
+ *   3. Clean AAI word-program loop with fixed-delay + escape-to-RDSR.
+ *   4. Timer-bounded timeouts everywhere; no PLL-dependent spin counts.
+ *   5. Structured log ring (128 × 12 B) with timestamps + phase.
  *
- * SRAM layout (proven working):
- *   0x2A000  RX_TEMP      (2KB+4, bidir DMA read scratch)
- *   0x2B000  DATA_BUF     (4KB, sector data for write/verify)
- *   0x2C000  Driver code  (8KB max, this file)
- *   0x2E000  Mailbox      (32 bytes)
- *   0x2E020  TX_SCRATCH   (16 bytes)
- *   0x2E030  RX_SCRATCH   (16 bytes)
- *   0x2E040  READ_TX_BUF  (16 bytes, bidir read command buffer)
- *   0x2E100  READBACK_BUF (4KB, flash readback)
- *   0x2F100  SECTOR_LIST  (2KB, 256 entries max)
- *   0x2F900  IMAGE_BASE   (326KB bulk data, fits 80 sectors)
- *   Stack at 0x2AFFC (grows down)
+ * Layout (all fixed; host finds these via sram_flash_mailbox_v2.h):
+ *   0x28000-0x29FFF  BIDIR_TX_BUF / RX_TEMP (flash read scratch)
+ *   0x2B000-0x2BFFF  V2_DATA_BUF (single-sector source/dest, 4 KB)
+ *   0x2C000-0x2DFFF  driver code
+ *   0x2E000-0x2E0FF  V2_MBOX (mailbox)
+ *   0x2E100-0x2E17F  TX_SCRATCH / RX_SCRATCH / misc
+ *   0x2E200-0x2E7FF  V2_LOG_RING (128 × 12 B)
+ *   0x2F100-0x2F8FF  V2_SECTOR_LIST
+ *   0x2F900-0x7FFFF  V2_IMAGE_BASE
  *
  * Build:
  *   arm-none-eabi-gcc -march=armv5te -marm -Os -nostdlib -ffreestanding \
- *     -T firmware/sram_flash_driver.ld \
+ *     -T firmware/sram_flash_driver_v2.ld \
  *     -o firmware/sram_flash_driver_v2.elf firmware/sram_flash_driver_v2.c
  *   arm-none-eabi-objcopy -O binary \
  *     firmware/sram_flash_driver_v2.elf firmware/sram_flash_driver_v2.bin
@@ -27,627 +30,773 @@
 
 #include <stdint.h>
 
-/* ═══════════════════════════════════════════════════════════════
- * Hardware Registers
- * ═══════════════════════════════════════════════════════════════ */
+#include "dice3_hw.h"
+#include "sram_flash_mailbox_v2.h"
 
-#define SPI_BASE    0xCC000000
-#define SPI_CTRL    (*(volatile uint32_t *)(SPI_BASE + 0x00))
-#define SPI_LEN     (*(volatile uint32_t *)(SPI_BASE + 0x04))
-#define SPI_EN      (*(volatile uint32_t *)(SPI_BASE + 0x08))
-#define SPI_CS      (*(volatile uint32_t *)(SPI_BASE + 0x10))
-#define SPI_CLK     (*(volatile uint32_t *)(SPI_BASE + 0x14))
-#define SPI_CLRINT  (*(volatile uint32_t *)(SPI_BASE + 0x18))
-#define SPI_STAT    (*(volatile uint32_t *)(SPI_BASE + 0x28))
-#define SPI_DMAGO   (*(volatile uint32_t *)(SPI_BASE + 0x2C))
-#define SPI_DMAMD   (*(volatile uint32_t *)(SPI_BASE + 0x4C))
-#define SPI_DMACFG0 (*(volatile uint32_t *)(SPI_BASE + 0x50))
-#define SPI_DMACFG1 (*(volatile uint32_t *)(SPI_BASE + 0x54))
-#define SPI_DATA    (*(volatile uint32_t *)(SPI_BASE + 0x60))
+/* ── Lvalue accessors for the fixed SRAM addresses ──────────── */
+#define MBOX      ((struct v2_mailbox *)V2_MBOX_ADDR)
+#define LOG_RING  ((struct v2_log_entry *)V2_LOG_RING_ADDR)
+#define DATA_BUF  ((uint8_t *)V2_DATA_BUF_ADDR)
 
-#define DMA_BASE    0x80000000
-#define DMA_EN      (*(volatile uint32_t *)(DMA_BASE + 0x08))
-#define DMA_ICLR    (*(volatile uint32_t *)(DMA_BASE + 0x10))
-#define DMA_ISTAT   (*(volatile uint32_t *)(DMA_BASE + 0x14))
-#define DMA_CHREG(ch, off) (*(volatile uint32_t *)(DMA_BASE + 0x100 + (ch)*0x20 + (off)))
-#define DMA_CHCLR(ch)      (*(volatile uint32_t *)(DMA_BASE + 0x30 + (ch)*4))
+#define TX_SCRATCH  ((volatile uint8_t *)0x0002E100u)
+#define RX_SCRATCH  ((volatile uint8_t *)0x0002E120u)
+#define TX_SCRATCH_MAX  16
 
-#define SPI_TX_PORT (SPI_BASE + 0x80)
-#define SPI_RX_PORT (SPI_BASE + 0x70)
+/* Bidir-read scratch (below driver code, doesn't collide with anything). */
+#define BIDIR_TX_BUF  ((volatile uint8_t *)0x00028000u)
+#define RX_TEMP       ((uint8_t *)0x0002A000u)
 
-/* ═══════════════════════════════════════════════════════════════
- * SRAM Layout
- * ═══════════════════════════════════════════════════════════════ */
-
-#define RX_TEMP      ((uint8_t *)0x2A000)
-#define DATA_BUF     ((uint8_t *)0x2B000)
-#define READBACK_BUF ((uint8_t *)0x2E100)
-#define SECTOR_LIST  ((struct sector_entry *)0x2F100)
-#define IMAGE_BASE   ((const uint8_t *)0x2F900)
-#define TX_SCRATCH   ((volatile uint8_t *)0x2E020)
-#define RX_SCRATCH   ((volatile uint8_t *)0x2E030)
-#define READ_TX_BUF  ((volatile uint8_t *)0x2E040)
-
-#define SECTOR_SIZE  0x1000
-#define READ_CHUNK   0x800
-#define RX_OVERHEAD  4
-#define MAX_BATCH    32  /* limited by safe SRAM for load_image (0x2F900-0x4FFFF) */
-
-struct sector_entry {
-    uint32_t spi_addr;
-    uint32_t sram_offset;
-};
-
-/* ═══════════════════════════════════════════════════════════════
- * Mailbox
- * ═══════════════════════════════════════════════════════════════ */
-
-#define ST_IDLE    0
-#define ST_RUNNING 1
-#define ST_DONE    2
-#define ST_ERROR   0xFF
-
-struct mailbox {
-    volatile uint32_t status;
-    volatile uint32_t command;
-    volatile uint32_t spi_addr;
-    volatile uint32_t progress;
-    volatile uint32_t errors;
-    volatile uint32_t last_sr;
-    volatile uint32_t total;
-    volatile uint32_t fail_addr;
-};
-#define MB ((struct mailbox *)0x2E000)
-
-/* ═══════════════════════════════════════════════════════════════
- * Primitives
- * ═══════════════════════════════════════════════════════════════ */
-
+/* ── ARM barriers ───────────────────────────────────────────── */
 static inline void dwb(void) {
     __asm__ volatile("mcr p15, 0, %0, c7, c10, 4" :: "r"(0) : "memory");
 }
 
-/* PLL-independent delay. Multiplier 80 gives ~12µs for delay_us(10)
- * on PLL-active clock (~196MHz). On ROM clock (~49MHz) it gives ~48µs.
- * Both are safe for tBP max=10µs. */
-static void delay_us(uint32_t us) {
-    volatile uint32_t n = us * 80;
-    while (n--) { __asm__ volatile(""); }
+/* ── Timer0 helpers ─────────────────────────────────────────── *
+ * Free-running down-counter; reload 500000, ~18 MHz tick.
+ * now_us() is a soft wrap-aware microsecond counter. */
+#define TIMER_RELOAD_V2  500000u
+#define TIMER_TICKS_PER_US 18u   /* empirical, documented in memory */
+
+static uint32_t s_us_accum;
+static uint32_t s_last_raw;
+
+static void timer_enable(void) {
+    TIMER_CTRL = 0;
+    TIMER_RELOAD = TIMER_RELOAD_V2;
+    TIMER_CTRL = TIMER_CTRL_RUN;
+    dwb();
 }
 
-/* ── SPI reset ─────────────────────────────────────────────── */
-
-static void spi_wait_idle(void) {
-    for (volatile int i = 0; i < 100000; i++)
-        if (!(SPI_STAT & 1)) return;
+static void time_reset(void) {
+    s_us_accum = 0;
+    s_last_raw = TIMER_COUNT;
 }
 
-static void spi_reset(void) {
-    spi_wait_idle();
-    SPI_CS = 0;
+static uint32_t now_us(void) {
+    uint32_t r = TIMER_COUNT;
+    uint32_t delta;
+    if (r <= s_last_raw) {
+        delta = s_last_raw - r;
+    } else {
+        delta = s_last_raw + (TIMER_RELOAD_V2 - r);
+    }
+    s_last_raw = r;
+    s_us_accum += delta / TIMER_TICKS_PER_US;
+    return s_us_accum;
+}
+
+static void busy_wait_us(uint32_t us) {
+    uint32_t deadline = now_us() + us;
+    while (now_us() < deadline) {}
+}
+
+/* ── Log ring ──────────────────────────────────────────────── */
+static void log_put(uint8_t evt, uint16_t detail, uint32_t spi_addr) {
+    uint32_t idx = MBOX->log_head & V2_LOG_RING_MASK;
+    struct v2_log_entry *e = &LOG_RING[idx];
+    e->t_us     = now_us();
+    e->evt      = evt;
+    e->phase    = (uint8_t)MBOX->phase;
+    e->detail   = detail;
+    e->spi_addr = spi_addr;
+    dwb();
+    MBOX->log_head = (MBOX->log_head + 1u) & 0xFFFFu;
+}
+
+/* ── Mailbox helpers ───────────────────────────────────────── */
+static inline void set_phase(uint32_t phase) {
+    MBOX->phase = phase;
+    MBOX->seq++;
+    dwb();
+}
+
+static void set_error(uint16_t err_code, uint32_t spi_addr, uint8_t last_sr) {
+    MBOX->err_code     = err_code;
+    MBOX->err_spi_addr = spi_addr;
+    MBOX->last_sr      = last_sr;
+    MBOX->status       = V2_STATUS_ERR;
+    set_phase(V2_PHASE_ERROR);
+    log_put(V2_EVT_ABORT, err_code, spi_addr);
+}
+
+/* ── SPI + DMA low-level ────────────────────────────────────
+ * Values match v1's proven config (CTRL=0x107, DMAMD=2 for TX,
+ * DMAMD=3 for bidir, DMACFG0=4, DMACFG1=3). Deliberately avoid the
+ * ctrl_base bit 12 flag — tests 2026-04-17 showed it breaks WREN
+ * in polling mode. */
+
+static void spi_reset_clean(void) {
     SPI_EN = 0;
+    SPI_CS = 0;
     SPI_DMAGO = 0;
     SPI_DMAMD = 0;
-    SPI_CLK = 2;
-    /* Do NOT touch DMA_EN or DMA_CHCLR here — they break DMA permanently */
-    dwb();
-}
-
-/* ── PIO TX (≤4 bytes) ─────────────────────────────────────── */
-
-static void pio_begin(uint32_t nbytes) {
-    spi_wait_idle();
-    SPI_EN = 0; SPI_CS = 0;
-    SPI_DMAMD = 0;
     SPI_CTRL = 0x107;
-    SPI_LEN = nbytes - 1;
+    SPI_LEN = 0;
+    SPI_DATA = 0;
     SPI_CLK = 2;
+    SPI_CLRINT = 0;
+    SPI_DMACFG0 = 0;
+    SPI_DMACFG1 = 0;
+    DMA_EN = 0;
+    DMA_ICLR = 3;
+    DMA_CHCLR(0) = 1;
+    DMA_CHCLR(1) = 1;
+    DMA_CHREG(0, 0x0C) = 0;
+    DMA_CHREG(0, 0x10) = 0;
+    DMA_CHREG(1, 0x0C) = 0;
+    DMA_CHREG(1, 0x10) = 0;
     dwb();
-    SPI_EN = 1; SPI_CS = 1;
+    for (volatile int i = 0; i < 1000; i++)
+        if (!(SPI_STAT & SPI_STAT_BUSY)) break;
+}
+
+static void dma_abort(void) {
+    SPI_DMAGO = 0;
+    DMA_EN = 0;
+    DMA_ICLR = 3;
+    DMA_CHCLR(0) = 1;
+    DMA_CHCLR(1) = 1;
+    SPI_CS = 0;
+    SPI_EN = 0;
     dwb();
 }
 
-static void pio_byte(uint8_t b) {
-    while (!(SPI_STAT & 2)) {}
-    SPI_DATA = b;
-}
-
-static void pio_end(void) {
-    spi_wait_idle();
-    SPI_CS = 0; SPI_EN = 0;
-}
-
-static void pio_cmd1(uint8_t c) {
-    pio_begin(1); pio_byte(c); pio_end();
-}
-
-/* ── DMA TX (any length) ───────────────────────────────────── */
-
-static int dma_tx(const volatile uint8_t *buf, uint32_t len) {
+/* DMA TX — CS assert + N-byte burst + CS deassert. Timer-bounded. */
+static int dma_tx(const volatile uint8_t *buf, uint32_t len, uint32_t budget_us) {
     dwb();
-    spi_wait_idle();
-    SPI_EN = 0; SPI_CS = 0; SPI_DMAGO = 0;
+    while (SPI_STAT & SPI_STAT_BUSY) {}
+    SPI_EN = 0;
+    SPI_CS = 0;
+    SPI_DMAGO = 0;
     SPI_CTRL = 0x107;
     SPI_LEN = len - 1;
     SPI_DMAMD = 2;
     SPI_CLK = 2;
-    SPI_DMACFG0 = 4; SPI_DMACFG1 = 3;
+    SPI_DMACFG0 = 4;
+    SPI_DMACFG1 = 3;
     dwb();
     SPI_EN = 1;
     dwb();
 
     DMA_EN = 1;
     DMA_ICLR = 1;
+    DMA_CHCLR(0) = 1;
     dwb();
     DMA_CHREG(0, 0x10) = 0;
     DMA_CHREG(0, 0x00) = (uint32_t)(uintptr_t)buf;
     DMA_CHREG(0, 0x04) = SPI_TX_PORT;
     DMA_CHREG(0, 0x08) = 0;
-    DMA_CHREG(0, 0x0C) = len | 0xF4009000;
+    DMA_CHREG(0, 0x0C) = len | DMA_CFG_TX;
     dwb();
-    DMA_CHREG(0, 0x10) = 0xD005;
+    DMA_CHREG(0, 0x10) = DMA_TRG_TX;
     dwb();
 
     SPI_CS = 1;
     SPI_CLRINT = 0;
     dwb();
 
-    for (volatile int i = 0; i < 500000; i++) {
-        if (DMA_ISTAT & 1) {
-            spi_wait_idle();
-            SPI_DMAGO = 1;
-            SPI_CS = 0; SPI_EN = 0;
-            return 0;
-        }
+    uint32_t t0 = now_us();
+    while (!(DMA_ISTAT & 1)) {
+        if (now_us() - t0 > budget_us) { dma_abort(); return -1; }
     }
-    SPI_CS = 0; SPI_EN = 0;
-    return -1;
+    /* Give BUSY time to assert before waiting for it to clear. */
+    for (volatile int j = 0; j < 200; j++)
+        if (SPI_STAT & SPI_STAT_BUSY) break;
+    while (SPI_STAT & SPI_STAT_BUSY) {
+        if (now_us() - t0 > budget_us) { dma_abort(); return -1; }
+    }
+    SPI_CS = 0;
+    SPI_EN = 0;
+    DMA_EN = 0;
+    DMA_ICLR = 3;
+    return 0;
 }
 
-/* ── DMA RX (1-byte cmd + response) ────────────────────────── */
+/* Bidirectional DMA RX for small commands (RDSR etc). Cmd byte is
+ * clocked on TX channel 1; response captured on RX channel 0. */
+static int dma_rx(uint32_t spi_cmd, uint8_t *out, uint32_t len,
+                  uint32_t budget_us)
+{
+    uint32_t total = 1 + len;
+    if (total > TX_SCRATCH_MAX || len == 0)
+        return -1;
 
-static int dma_rx(uint8_t spi_cmd, uint8_t *buf, uint32_t len) {
-    spi_wait_idle();
-    SPI_EN = 0; SPI_CS = 0; SPI_DMAGO = 0;
-    SPI_CTRL = 0x307;
-    SPI_LEN = len - 1;
-    SPI_DMAMD = 1;
-    SPI_CLK = 2;
-    SPI_DMACFG0 = 4; SPI_DMACFG1 = 3;
-    dwb();
-    SPI_EN = 1;
-    dwb();
-
-    DMA_EN = 1;
-    DMA_ICLR = 1;
-    dwb();
-    DMA_CHREG(0, 0x10) = 0;
-    DMA_CHREG(0, 0x00) = SPI_RX_PORT;
-    DMA_CHREG(0, 0x04) = (uint32_t)(uintptr_t)buf;
-    DMA_CHREG(0, 0x0C) = (len & 0xFFF) | 0x88009000;
-    dwb();
-    DMA_CHREG(0, 0x10) = 0xD007;
+    TX_SCRATCH[0] = (uint8_t)spi_cmd;
+    for (uint32_t i = 1; i < total; i++) TX_SCRATCH[i] = 0;
     dwb();
 
-    SPI_DATA = spi_cmd;
-    SPI_CS = 1;
-    dwb();
-
-    for (volatile int i = 0; i < 500000; i++) {
-        if (DMA_ISTAT & 1) {
-            spi_wait_idle();
-            SPI_CS = 0; SPI_EN = 0;
-            return 0;
-        }
-    }
-    SPI_CS = 0; SPI_EN = 0;
-    return -1;
-}
-
-/* ── DMA Bidirectional Read (READ 0x03 + addr) ─────────────── */
-
-static int dma_bidir_read(uint32_t spi_addr, uint32_t data_len) {
-    uint32_t total = RX_OVERHEAD + data_len;
-
-    READ_TX_BUF[0] = 0x03;
-    READ_TX_BUF[1] = (spi_addr >> 16) & 0xFF;
-    READ_TX_BUF[2] = (spi_addr >> 8) & 0xFF;
-    READ_TX_BUF[3] = spi_addr & 0xFF;
-    dwb();
-
-    spi_wait_idle();
-    SPI_EN = 0; SPI_CS = 0; SPI_DMAGO = 0;
+    while (SPI_STAT & SPI_STAT_BUSY) {}
+    SPI_EN = 0;
+    SPI_CS = 0;
+    SPI_DMAGO = 0;
     SPI_CTRL = 0x007;
     SPI_LEN = total - 1;
     SPI_DMAMD = 3;
     SPI_CLK = 2;
-    SPI_DMACFG0 = 4; SPI_DMACFG1 = 3;
+    SPI_DMACFG0 = 4;
+    SPI_DMACFG1 = 3;
     dwb();
     SPI_EN = 1;
     dwb();
 
     DMA_EN = 3;
     DMA_ICLR = 3;
+    DMA_CHCLR(0) = 1;
+    DMA_CHCLR(1) = 1;
     dwb();
 
-    /* CH0: RX → RX_TEMP */
     DMA_CHREG(0, 0x10) = 0;
     DMA_CHREG(0, 0x00) = SPI_RX_PORT;
-    DMA_CHREG(0, 0x04) = (uint32_t)(uintptr_t)RX_TEMP;
+    DMA_CHREG(0, 0x04) = (uint32_t)(uintptr_t)RX_SCRATCH;
     DMA_CHREG(0, 0x08) = 0;
-    DMA_CHREG(0, 0x0C) = (total & 0xFFF) | 0x88009000;
+    DMA_CHREG(0, 0x0C) = (total & 0xFFF) | DMA_CFG_RX;
     dwb();
-    DMA_CHREG(0, 0x10) = 0xD007;
-    dwb();
+    DMA_CHREG(0, 0x10) = DMA_TRG_RX;
 
-    /* CH1: TX — oversized (0xFFF) so RX completes first */
     DMA_CHREG(1, 0x10) = 0;
-    DMA_CHREG(1, 0x00) = (uint32_t)(uintptr_t)READ_TX_BUF;
+    DMA_CHREG(1, 0x00) = (uint32_t)(uintptr_t)TX_SCRATCH;
     DMA_CHREG(1, 0x04) = SPI_TX_PORT;
     DMA_CHREG(1, 0x08) = 0;
-    DMA_CHREG(1, 0x0C) = 0xFFF | 0xF4009000;
+    DMA_CHREG(1, 0x0C) = 0xFFF | DMA_CFG_TX;
     dwb();
-    DMA_CHREG(1, 0x10) = 0xD005;
+    DMA_CHREG(1, 0x10) = DMA_TRG_TX;
     dwb();
 
     SPI_CS = 1;
     SPI_CLRINT = 0;
     dwb();
 
-    for (volatile int i = 0; i < 1000000; i++) {
-        if (DMA_ISTAT & 1) {
-            spi_wait_idle();
-            SPI_DMAGO = 1;
-            SPI_CS = 0; SPI_EN = 0;
-            DMA_CHCLR(1) = 1;  /* kill incomplete TX channel */
-            return 0;
-        }
+    uint32_t t0 = now_us();
+    while (!(DMA_ISTAT & 1)) {
+        if (now_us() - t0 > budget_us) { dma_abort(); return -1; }
     }
-    SPI_CS = 0; SPI_EN = 0;
-    DMA_CHCLR(1) = 1;
-    return -1;
+    while (SPI_STAT & SPI_STAT_BUSY) {
+        if (now_us() - t0 > budget_us) { dma_abort(); return -1; }
+    }
+    SPI_CS = 0;
+    SPI_EN = 0;
+    DMA_EN = 0;
+    DMA_ICLR = 3;
+    for (uint32_t j = 0; j < len; j++)
+        out[j] = ((volatile uint8_t *)RX_SCRATCH)[1 + j];
+    return 0;
 }
-
-/* ═══════════════════════════════════════════════════════════════
- * Flash Operations (built on primitives)
- * ═══════════════════════════════════════════════════════════════ */
 
 static uint8_t rdsr(void) {
-    if (dma_rx(0x05, (uint8_t *)RX_SCRATCH, 1) == 0)
-        return RX_SCRATCH[0];
-    return 0xFF;
+    uint8_t sr;
+    if (dma_rx(SST_CMD_RDSR, &sr, 1, 5000) != 0)
+        return 0xFF;
+    MBOX->last_sr = sr;
+    return sr;
 }
 
-/* Poll RDSR until BUSY (bit 0) clears. Returns 0 on success.
- * Used for erase and WRSR — NOT during AAI (breaks AAI mode). */
-static int poll_busy(uint32_t max_ms) {
-    for (uint32_t i = 0; i < max_ms * 10; i++) {
+static int spi_cmd1(uint8_t cmd) {
+    TX_SCRATCH[0] = cmd;
+    return dma_tx(TX_SCRATCH, 1, 5000);
+}
+
+static int spi_cmd2(uint8_t c1, uint8_t c2) {
+    TX_SCRATCH[0] = c1; TX_SCRATCH[1] = c2;
+    return dma_tx(TX_SCRATCH, 2, 5000);
+}
+
+/* ── Peripheral teardown ──────────────────────────────────── */
+
+#define REBOOT_USB_BASE            0x90000000u
+#define REBOOT_USB_USBCMD          (*(volatile uint32_t *)(REBOOT_USB_BASE + 0x08))
+#define REBOOT_USB_USBSTS          (*(volatile uint32_t *)(REBOOT_USB_BASE + 0x14))
+#define REBOOT_USB_USBINTR         (*(volatile uint32_t *)(REBOOT_USB_BASE + 0x18))
+#define REBOOT_USB_DEVICEADDR      (*(volatile uint32_t *)(REBOOT_USB_BASE + 0x24))
+#define REBOOT_USB_ENDPTLISTADDR   (*(volatile uint32_t *)(REBOOT_USB_BASE + 0x28))
+#define REBOOT_TCAT_USBMODE        (*(volatile uint32_t *)(REBOOT_USB_BASE + 0x800))
+#define REBOOT_TCAT_EP_COMP_STATUS (*(volatile uint32_t *)(REBOOT_USB_BASE + 0x818))
+#define REBOOT_TCAT_EP_COMP_ENABLE (*(volatile uint32_t *)(REBOOT_USB_BASE + 0x81C))
+#define REBOOT_TCAT_EP_ASYNC_PRIME (*(volatile uint32_t *)(REBOOT_USB_BASE + 0x834))
+#define REBOOT_TCAT_EP_RX_EN       (*(volatile uint32_t *)(REBOOT_USB_BASE + 0x810))
+#define REBOOT_TCAT_EP_TX_EN       (*(volatile uint32_t *)(REBOOT_USB_BASE + 0x814))
+
+#define REBOOT_VIC_INT_EN_CLR (*(volatile uint32_t *)0xFFFFF014)
+#define REBOOT_VIC_SOFT_CLR   (*(volatile uint32_t *)0xFFFFF01C)
+
+#define REBOOT_FLASH_SPI      ((volatile uint32_t *)0xCC000000u)
+#define REBOOT_LED_SPI        ((volatile uint32_t *)0xCF000000u)
+#define REBOOT_LED_GPIO       (*(volatile uint32_t *)0xCB000020)
+
+static void spi_ip_quiesce(volatile uint32_t *s) {
+    for (volatile int i = 0; i < 100000; i++)
+        if (!(s[0x28 / 4] & 1u)) break;
+    s[0x10 / 4] = 0;
+    s[0x08 / 4] = 0;
+    s[0x2C / 4] = 0;
+    s[0x4C / 4] = 0;
+    s[0x50 / 4] = 0;
+    s[0x54 / 4] = 0;
+    s[0x00 / 4] = 0;
+    s[0x04 / 4] = 0;
+    s[0x18 / 4] = 0;
+    s[0x34 / 4] = 0;
+    dwb();
+}
+
+static void dma_engine_reset(void) {
+    volatile uint32_t *dma = (volatile uint32_t *)0x80000000u;
+    dma[0x08 / 4] = 0;
+    dma[0x10 / 4] = 0x0Fu;
+    for (unsigned ch = 0; ch < 4; ch++)
+        dma[0x30 / 4 + ch] = 1;
+    for (unsigned ch = 0; ch < 4; ch++) {
+        volatile uint32_t *b = (volatile uint32_t *)(0x80000100u + ch * 0x20u);
+        b[0x10 / 4] = 0;
+        b[0x0C / 4] = 0;
+        b[0x08 / 4] = 0;
+        b[0x00 / 4] = 0;
+        b[0x04 / 4] = 0;
+    }
+    dwb();
+}
+
+static void usb_hw_reset(void) {
+    REBOOT_USB_USBSTS = 0xFFFFFFFFu;
+    REBOOT_USB_USBCMD &= ~(uint32_t)1;
+    REBOOT_USB_USBCMD |= 2;
+    for (volatile int i = 0; i < 100000; i++)
+        if (!(REBOOT_USB_USBCMD & 2)) break;
+    REBOOT_USB_USBSTS = 0xFFFFFFFFu;
+    REBOOT_USB_USBINTR = 0;
+    REBOOT_USB_USBCMD &= ~(uint32_t)((1u << 0) | (1u << 13) | (1u << 14));
+    REBOOT_USB_DEVICEADDR = 0;
+    REBOOT_USB_ENDPTLISTADDR = 0;
+    REBOOT_TCAT_USBMODE = 2u;
+    REBOOT_TCAT_EP_COMP_STATUS = 0xFFFFFFFFu;
+    REBOOT_TCAT_EP_COMP_ENABLE = 0;
+    REBOOT_TCAT_EP_ASYNC_PRIME = 0;
+    REBOOT_TCAT_EP_RX_EN = 0;
+    REBOOT_TCAT_EP_TX_EN = 0;
+    dwb();
+}
+
+static void driver_setup(void) {
+    /* Timer0 must be running before log_put() is called (it timestamps). */
+    timer_enable();
+    time_reset();
+    set_phase(V2_PHASE_INIT);
+    log_put(V2_EVT_SETUP_BEGIN, 0, 0);
+
+    __asm__ volatile("mov r0, #0xD3 \n msr cpsr_c, r0 \n" ::: "r0", "memory");
+
+    set_phase(V2_PHASE_TEARDOWN);
+    usb_hw_reset();
+
+    spi_ip_quiesce(REBOOT_LED_SPI);
+    REBOOT_LED_GPIO = 0;
+    REBOOT_LED_SPI[0x14 / 4] = 0xFF;
+    dwb();
+    spi_ip_quiesce(REBOOT_FLASH_SPI);
+
+    dma_engine_reset();
+
+    REBOOT_VIC_INT_EN_CLR = 0xFFFFFFFFu;
+    REBOOT_VIC_SOFT_CLR   = 0xFFFFFFFFu;
+    dwb();
+
+    spi_reset_clean();
+    /* If a previous run left flash in AAI mode, WRDI exits it. Safe
+     * to send unconditionally. */
+    (void)spi_cmd1(SST_CMD_WRDI);
+
+    set_phase(V2_PHASE_T0_ENABLE);
+    log_put(V2_EVT_T0_ENABLED, 0, 0);
+
+    log_put(V2_EVT_SETUP_DONE, 0, 0);
+}
+
+/* ── Flash operations ─────────────────────────────────────── */
+
+static int wait_not_busy(uint32_t budget_us, uint8_t *out_sr) {
+    uint32_t t0 = now_us();
+    for (;;) {
         uint8_t sr = rdsr();
-        MB->last_sr = sr;
-        if (sr == 0xFF) {
-            delay_us(100);
-            continue;  /* DMA glitch, retry */
+        if (sr != 0xFF) {
+            MBOX->last_sr = sr;
+            if (!(sr & SST_SR_BUSY)) {
+                if (out_sr) *out_sr = sr;
+                return 0;
+            }
         }
-        if (!(sr & 1)) return 0;  /* not busy */
-        delay_us(100);
-    }
-    return -1;  /* timeout */
-}
-
-/* ── CMD 7: JEDEC ID ───────────────────────────────────────── */
-
-static void do_jedec_id(void) {
-    /* JEDEC Read-ID: send 0x9F, receive 3 bytes (mfr, type, cap) */
-    if (dma_rx(0x9F, (uint8_t *)RX_SCRATCH, 3) != 0) {
-        MB->errors = 0xBAD0;
-        return;
-    }
-    /* Pack as 0x00MMTTCC (manufacturer, memory type, capacity) */
-    MB->last_sr = ((uint32_t)RX_SCRATCH[0] << 16) |
-                  ((uint32_t)RX_SCRATCH[1] << 8) |
-                  (uint32_t)RX_SCRATCH[2];
-}
-
-/* ── CMD 5: BP Clear ───────────────────────────────────────── */
-
-static void do_bp_clear(void) {
-    spi_reset();
-
-    /* EWSR (0x50) — required for SST25, NOT WREN */
-    pio_cmd1(0x50);
-
-    /* WRSR (0x01, 0x00) — clear all BP bits */
-    TX_SCRATCH[0] = 0x01;
-    TX_SCRATCH[1] = 0x00;
-    dma_tx(TX_SCRATCH, 2);
-
-    /* Poll RDSR until WRSR completes (tWRSR ≤ 10ms per datasheet) */
-    if (poll_busy(50) != 0) {
-        MB->errors = 0xBFC1;  /* BP clear timeout */
-        return;
-    }
-
-    /* Verify BP bits actually cleared */
-    uint8_t sr = rdsr();
-    MB->last_sr = sr;
-    if (sr & 0x3C) {
-        MB->errors = 0xBFC2;  /* BP bits still set */
+        if (now_us() - t0 > budget_us) {
+            if (out_sr) *out_sr = sr;
+            return -1;
+        }
     }
 }
 
-/* ── CMD 1: Sector Erase ───────────────────────────────────── */
+static int aai_pair_wait(uint32_t pair_idx) {
+    /* Pure fixed delay. RDSR polling between pairs turned out to
+     * sometimes drop the flash out of AAI mode after ~73 pairs
+     * (observed 2026-04-17). Datasheet tBP max is 10 µs; use 30 µs
+     * (3× margin). Short AAI runs (< 128 pairs) with this scheme verified
+     * clean; long runs still need the dummy-pair head workaround above. */
+    busy_wait_us(30);
+    if ((pair_idx & 0x3F) == 0)
+        log_put(V2_EVT_AAI_BUSY_FAST, (uint16_t)pair_idx, 0);
+    return 0;
+}
+
+static int do_bp_clear(void) {
+    set_phase(V2_PHASE_BP_CLEAR);
+    log_put(V2_EVT_BP_CLEAR_PRE, 0, 0);
+    spi_reset_clean();
+    if (spi_cmd1(SST_CMD_EWSR) != 0) { set_error(V2_ERR_BP_CLEAR_WREN, 0, 0); return -1; }
+    if (spi_cmd2(SST_CMD_WRSR, 0x00) != 0) { set_error(V2_ERR_BP_CLEAR_WRSR, 0, 0); return -1; }
+    uint8_t sr = 0xFF;
+    if (wait_not_busy(30000, &sr) != 0) {
+        set_error(V2_ERR_BP_CLEAR_STUCK, 0, sr);
+        return -1;
+    }
+    if (sr & SST_SR_BP_MASK) {
+        /* Retry with WREN (some SST parts want WREN, not EWSR). */
+        (void)spi_cmd1(SST_CMD_WREN);
+        (void)spi_cmd2(SST_CMD_WRSR, 0x00);
+        (void)wait_not_busy(30000, &sr);
+    }
+    MBOX->last_sr = sr;
+    log_put(V2_EVT_BP_CLEAR_POST, 0, 0);
+    return (sr & SST_SR_BP_MASK) ? -1 : 0;
+}
 
 static int do_erase(uint32_t spi_addr) {
-    spi_reset();
-    pio_cmd1(0x06);  /* WREN */
+    set_phase(V2_PHASE_ERASE_WREN);
+    spi_reset_clean();
+    if (spi_cmd1(SST_CMD_WREN) != 0) {
+        set_error(V2_ERR_ERASE_WREN, spi_addr, 0);
+        return -1;
+    }
+    log_put(V2_EVT_ERASE_WREN, 0, spi_addr);
 
-    /* SE (0x20) + 3-byte address */
-    TX_SCRATCH[0] = 0x20;
+    set_phase(V2_PHASE_ERASE_CMD);
+    TX_SCRATCH[0] = SST_CMD_SE;
     TX_SCRATCH[1] = (spi_addr >> 16) & 0xFF;
     TX_SCRATCH[2] = (spi_addr >> 8) & 0xFF;
     TX_SCRATCH[3] = spi_addr & 0xFF;
-    if (dma_tx(TX_SCRATCH, 4) != 0)
-        return -1;
-
-    /* Poll RDSR until erase completes (tSE max 25ms) */
-    return poll_busy(100);
-}
-
-/* ── CMD 2: AAI Write ──────────────────────────────────────── */
-
-static int do_write(uint32_t spi_addr) {
-    spi_reset();
-    pio_cmd1(0x06);  /* WREN */
-
-    /* First AAI pair: 6 bytes [0xAD, A23, A15, A7, D0, D1] */
-    TX_SCRATCH[0] = 0xAD;
-    TX_SCRATCH[1] = (spi_addr >> 16) & 0xFF;
-    TX_SCRATCH[2] = (spi_addr >> 8) & 0xFF;
-    TX_SCRATCH[3] = spi_addr & 0xFF;
-    TX_SCRATCH[4] = DATA_BUF[0];
-    TX_SCRATCH[5] = DATA_BUF[1];
-
-    if (dma_tx(TX_SCRATCH, 6) != 0) {
-        pio_cmd1(0x04);  /* WRDI — abort AAI */
+    if (dma_tx(TX_SCRATCH, 4, 5000) != 0) {
+        set_error(V2_ERR_ERASE_CMD, spi_addr, 0);
         return -1;
     }
+    log_put(V2_EVT_ERASE_CMD, 0, spi_addr);
 
-    delay_us(10);  /* tBP max 10µs */
-
-    /* Subsequent pairs: 3 bytes [0xAD, Dn, Dn+1] via DMA TX.
-     * Full dma_tx() per pair — the SPI controller requires complete
-     * reconfiguration between DMA transfers. Optimized re-arm attempts
-     * (keeping SPI/DMA partially configured) produce corrupt data. */
-    for (uint32_t i = 2; i < SECTOR_SIZE; i += 2) {
-        TX_SCRATCH[0] = 0xAD;
-        TX_SCRATCH[1] = DATA_BUF[i];
-        TX_SCRATCH[2] = DATA_BUF[i + 1];
-
-        if (dma_tx(TX_SCRATCH, 3) != 0) {
-            pio_cmd1(0x04);
-            return -1;
-        }
-
-        delay_us(10);  /* tBP max 10µs */
-
-        if ((i & 0x1FF) == 0)
-            MB->progress = i;
+    set_phase(V2_PHASE_ERASE_POLL);
+    uint8_t sr = 0xFF;
+    if (wait_not_busy(60000, &sr) != 0) {  /* datasheet tSE max 25 ms */
+        set_error(V2_ERR_ERASE_TIMEOUT, spi_addr, sr);
+        return -1;
     }
-
-    pio_cmd1(0x04);  /* WRDI — exit AAI mode */
-    MB->progress = SECTOR_SIZE;
+    MBOX->last_sr = sr;
+    log_put(V2_EVT_ERASE_DONE, 0, spi_addr);
     return 0;
 }
 
-/* ── CMD 3: Read Sector ────────────────────────────────────── */
-
-static int do_read(uint32_t spi_addr) {
-    /* Flush SPI RX pipeline */
-    dma_rx(0x05, (uint8_t *)RX_SCRATCH, 1);
-
-    for (uint32_t off = 0; off < SECTOR_SIZE; off += READ_CHUNK) {
-        if (off > 0)
-            dma_rx(0x05, (uint8_t *)RX_SCRATCH, 1);  /* flush between chunks */
-
-        if (dma_bidir_read(spi_addr + off, READ_CHUNK) != 0)
-            return -1;
-
-        /* Copy from RX_TEMP (skip 4-byte cmd garbage) to READBACK_BUF */
-        for (uint32_t i = 0; i < READ_CHUNK; i++)
-            READBACK_BUF[off + i] = RX_TEMP[RX_OVERHEAD + i];
-
-        MB->progress = off + READ_CHUNK;
-    }
-    return 0;
-}
-
-/* ── CMD 4: Verify ─────────────────────────────────────────── */
-
-static int do_verify(uint32_t spi_addr) {
-    if (do_read(spi_addr) != 0)
+static int do_aai_program(uint32_t spi_addr, const uint8_t *data, uint32_t len) {
+    if (len < 2 || (len & 1)) {
+        set_error(V2_ERR_BAD_LENGTH, spi_addr, 0);
         return -1;
-
-    uint32_t mismatches = 0;
-    for (uint32_t i = 0; i < SECTOR_SIZE; i++) {
-        if (READBACK_BUF[i] != DATA_BUF[i])
-            mismatches++;
-    }
-    MB->errors = mismatches;
-    return (mismatches == 0) ? 0 : -1;
-}
-
-/* ── CMD 6: Flash All ──────────────────────────────────────── */
-
-static void do_flash_all(void) {
-    struct sector_entry *list = SECTOR_LIST;
-    const uint8_t *image = IMAGE_BASE;
-
-    uint32_t total = 0;
-    while (list[total].spi_addr != 0xFFFFFFFF && total < MAX_BATCH)
-        total++;
-    MB->total = total;
-
-    /* BP clear once */
-    do_bp_clear();
-    if (MB->errors != 0) return;
-
-    for (uint32_t i = 0; i < total; i++) {
-        uint32_t addr = list[i].spi_addr;
-        const uint8_t *src = image + list[i].sram_offset;
-
-        /* Stage sector data to DATA_BUF */
-        for (uint32_t j = 0; j < SECTOR_SIZE; j++)
-            DATA_BUF[j] = src[j];
-
-        MB->progress = i;
-        MB->spi_addr = addr;
-
-        /* Erase */
-        if (do_erase(addr) != 0) {
-            MB->fail_addr = addr;
-            MB->errors = 0xE001;
-            return;
-        }
-
-        /* Write */
-        if (do_write(addr) != 0) {
-            MB->fail_addr = addr;
-            MB->errors = 0xE002;
-            return;
-        }
-
-        /* Verify */
-        if (do_verify(addr) != 0) {
-            MB->fail_addr = addr;
-            if (MB->errors == 0) MB->errors = 0xE003;
-            return;
-        }
     }
 
-    MB->progress = total;
-}
+    set_phase(V2_PHASE_AAI_WREN);
+    spi_reset_clean();
+    if (spi_cmd1(SST_CMD_WREN) != 0) {
+        set_error(V2_ERR_AAI_WREN, spi_addr, 0);
+        return -1;
+    }
+    /* Do NOT verify WEL via rdsr here — the dma_rx mode switch right
+     * after a dma_tx is flaky on this controller (observed 2026-04-17:
+     * 5 ms timeouts). If WREN didn't take, the first AAI pair will fail
+     * and the post-program verify will catch any silent failure. */
+    busy_wait_us(10);   /* tiny settle before the next TX */
+    log_put(V2_EVT_AAI_WREN, 0, spi_addr);
 
-/* ── CMD 8: Fast AAI Write (PIO inner loop test) ───────────── */
-
-static int do_write_fast(uint32_t spi_addr) {
-    spi_reset();
-    pio_cmd1(0x06);  /* WREN */
-
-    /* First pair: 6 bytes via DMA (proven working) */
-    TX_SCRATCH[0] = 0xAD;
+    /* Silicon quirk (observed 2026-04-17): the first TWO AAI pairs after
+     * a sector erase are silently dropped AND the internal address
+     * pointer does NOT advance. Subsequent pairs then start writing at
+     * the target address. Compensate by sending two dummy 0xFF pairs
+     * first — 0xFF is a no-op on erased flash even if one happens to
+     * commit, and if they drop (expected) the real data still lands at
+     * the correct offset. Costs ~60 ms per sector. */
+    set_phase(V2_PHASE_AAI_FIRST);
+    TX_SCRATCH[0] = SST_CMD_AAI;
     TX_SCRATCH[1] = (spi_addr >> 16) & 0xFF;
     TX_SCRATCH[2] = (spi_addr >> 8) & 0xFF;
     TX_SCRATCH[3] = spi_addr & 0xFF;
-    TX_SCRATCH[4] = DATA_BUF[0];
-    TX_SCRATCH[5] = DATA_BUF[1];
-
-    if (dma_tx(TX_SCRATCH, 6) != 0) {
-        pio_cmd1(0x04);
+    TX_SCRATCH[4] = 0xFF;   /* dummy */
+    TX_SCRATCH[5] = 0xFF;   /* dummy */
+    if (dma_tx(TX_SCRATCH, 6, 5000) != 0) {
+        (void)spi_cmd1(SST_CMD_WRDI);
+        set_error(V2_ERR_AAI_FIRST_TX, spi_addr, 0);
         return -1;
     }
-    delay_us(10);
-
-    /* Subsequent pairs: PIO with minimal SPI_EN toggle.
-     * CTRL/CLK/DMAMD stay constant. Only toggle EN (re-arms LEN)
-     * and CS (triggers flash CE#). */
-    SPI_DMAMD = 0;
-    SPI_CTRL = 0x107;
-    SPI_CLK = 2;
-
-    for (uint32_t i = 2; i < SECTOR_SIZE; i += 2) {
-        spi_wait_idle();
-        SPI_EN = 0;
-        SPI_LEN = 2;    /* 3 bytes - 1 */
-        dwb();
-        SPI_EN = 1;
-        SPI_CS = 1;
-
-        while (!(SPI_STAT & 2)) {}
-        SPI_DATA = 0xAD;
-        while (!(SPI_STAT & 2)) {}
-        SPI_DATA = DATA_BUF[i];
-        while (!(SPI_STAT & 2)) {}
-        SPI_DATA = DATA_BUF[i + 1];
-
-        spi_wait_idle();
-        SPI_CS = 0;
-
-        delay_us(10);
-
-        if ((i & 0x1FF) == 0)
-            MB->progress = i;
+    log_put(V2_EVT_AAI_FIRST, 0, spi_addr);
+    if (aai_pair_wait(0) != 0) {
+        (void)spi_cmd1(SST_CMD_WRDI);
+        set_error(V2_ERR_AAI_PAIR_TIMEOUT, spi_addr, (uint8_t)MBOX->last_sr);
+        return -1;
     }
 
+    /* Second dummy pair — subsequent-pair form (3 bytes). */
+    TX_SCRATCH[0] = SST_CMD_AAI;
+    TX_SCRATCH[1] = 0xFF;
+    TX_SCRATCH[2] = 0xFF;
+    if (dma_tx(TX_SCRATCH, 3, 5000) != 0) {
+        (void)spi_cmd1(SST_CMD_WRDI);
+        set_error(V2_ERR_AAI_PAIR_TX, spi_addr, 0);
+        return -1;
+    }
+    if (aai_pair_wait(1) != 0) {
+        (void)spi_cmd1(SST_CMD_WRDI);
+        set_error(V2_ERR_AAI_PAIR_TIMEOUT, spi_addr, (uint8_t)MBOX->last_sr);
+        return -1;
+    }
+
+    set_phase(V2_PHASE_AAI_PAIR);
+    /* Real data pairs — i indexes data[], pair index in log is i/2 + 2
+     * (after the two dummy pairs). */
+    for (uint32_t i = 0; i < len; i += 2) {
+        MBOX->phase_detail = i >> 1;
+        TX_SCRATCH[0] = SST_CMD_AAI;
+        TX_SCRATCH[1] = data[i];
+        TX_SCRATCH[2] = data[i + 1];
+        if (dma_tx(TX_SCRATCH, 3, 5000) != 0) {
+            (void)spi_cmd1(SST_CMD_WRDI);
+            set_error(V2_ERR_AAI_PAIR_TX, spi_addr + i, 0);
+            return -1;
+        }
+        if (aai_pair_wait(i >> 1) != 0) {
+            (void)spi_cmd1(SST_CMD_WRDI);
+            set_error(V2_ERR_AAI_PAIR_TIMEOUT, spi_addr + i,
+                      (uint8_t)MBOX->last_sr);
+            return -1;
+        }
+        if ((i & 0xFF) == 0) MBOX->seq++;
+        if ((i & 0x7F) == 0)
+            log_put(V2_EVT_AAI_PAIR, (uint16_t)(i >> 1), spi_addr + i);
+    }
+
+    set_phase(V2_PHASE_AAI_WRDI);
+    (void)spi_cmd1(SST_CMD_WRDI);
+    (void)wait_not_busy(1000, (uint8_t *)0);
+    log_put(V2_EVT_AAI_WRDI, 0, spi_addr);
+    return 0;
+}
+
+/* Bidirectional DMA flash read. */
+#define READ_RX_SKIP 8u
+#define READ_CHUNK   0x800u
+
+static int dma_bidir_read(uint32_t spi_addr, uint8_t *out, uint32_t len,
+                          uint32_t budget_us)
+{
+    uint32_t xfer_len = READ_RX_SKIP + len;
+    if (xfer_len > 0xFFF) return -1;
+
+    BIDIR_TX_BUF[0] = SST_CMD_READ;
+    BIDIR_TX_BUF[1] = (spi_addr >> 16) & 0xFF;
+    BIDIR_TX_BUF[2] = (spi_addr >> 8) & 0xFF;
+    BIDIR_TX_BUF[3] = spi_addr & 0xFF;
+    for (uint32_t i = 4; i < xfer_len; i++) BIDIR_TX_BUF[i] = 0;
+    dwb();
+
+    while (SPI_STAT & SPI_STAT_BUSY) {}
     SPI_EN = 0;
-    pio_cmd1(0x04);  /* WRDI */
-    MB->progress = SECTOR_SIZE;
+    SPI_CS = 0;
+    SPI_DMAGO = 0;
+    SPI_CTRL = 0x007;
+    SPI_LEN = xfer_len - 1;
+    SPI_DMAMD = 3;
+    SPI_CLK = 2;
+    SPI_DMACFG0 = 4;
+    SPI_DMACFG1 = 3;
+    dwb();
+    SPI_EN = 1;
+    dwb();
+
+    DMA_EN = 3;
+    DMA_ICLR = 3;
+    DMA_CHCLR(0) = 1;
+    DMA_CHCLR(1) = 1;
+    dwb();
+
+    DMA_CHREG(0, 0x10) = 0;
+    DMA_CHREG(0, 0x00) = SPI_RX_PORT;
+    DMA_CHREG(0, 0x04) = (uint32_t)(uintptr_t)RX_TEMP;
+    DMA_CHREG(0, 0x08) = 0;
+    DMA_CHREG(0, 0x0C) = (xfer_len & 0xFFF) | DMA_CFG_RX;
+    dwb();
+    DMA_CHREG(0, 0x10) = DMA_TRG_RX;
+
+    DMA_CHREG(1, 0x10) = 0;
+    DMA_CHREG(1, 0x00) = (uint32_t)(uintptr_t)BIDIR_TX_BUF;
+    DMA_CHREG(1, 0x04) = SPI_TX_PORT;
+    DMA_CHREG(1, 0x08) = 0;
+    DMA_CHREG(1, 0x0C) = 0xFFF | DMA_CFG_TX;
+    dwb();
+    DMA_CHREG(1, 0x10) = DMA_TRG_TX;
+    dwb();
+
+    SPI_CS = 1;
+    SPI_CLRINT = 0;
+    dwb();
+
+    uint32_t t0 = now_us();
+    while (!(DMA_ISTAT & 1)) {
+        if (now_us() - t0 > budget_us) { dma_abort(); return -1; }
+    }
+    while (SPI_STAT & SPI_STAT_BUSY) {
+        if (now_us() - t0 > budget_us) { dma_abort(); return -1; }
+    }
+    SPI_CS = 0;
+    SPI_EN = 0;
+    DMA_EN = 0;
+    DMA_ICLR = 3;
+    for (uint32_t i = 0; i < len; i++) out[i] = RX_TEMP[READ_RX_SKIP + i];
     return 0;
 }
 
-/* ═══════════════════════════════════════════════════════════════
- * Main Command Loop
- * ═══════════════════════════════════════════════════════════════ */
+static int do_read(uint32_t spi_addr, uint8_t *dest, uint32_t len) {
+    set_phase(V2_PHASE_READ);
+    for (uint32_t off = 0; off < len; off += READ_CHUNK) {
+        uint32_t chunk = len - off;
+        if (chunk > READ_CHUNK) chunk = READ_CHUNK;
+        spi_reset_clean();   /* clean state per chunk */
+        if (dma_bidir_read(spi_addr + off, dest + off, chunk, 100000) != 0) {
+            set_error(V2_ERR_READ_DMA, spi_addr + off, (uint8_t)MBOX->last_sr);
+            return -1;
+        }
+        MBOX->phase_detail = off + chunk;
+    }
+    return 0;
+}
+
+static int do_verify(uint32_t spi_addr, const uint8_t *expected, uint32_t len) {
+    set_phase(V2_PHASE_VERIFY);
+    /* 4 KB scratch buffer at the start of SRAM — reused across the driver
+     * for single-sector readback. Host must not place data there while a
+     * verify is in progress. */
+    uint8_t *readback = (uint8_t *)0x00000000u;
+    uint32_t remaining = len;
+    uint32_t off = 0;
+    while (remaining) {
+        uint32_t chunk = remaining > V2_SECTOR_SIZE ? V2_SECTOR_SIZE : remaining;
+        if (do_read(spi_addr + off, readback, chunk) != 0)
+            return -1;
+        for (uint32_t i = 0; i < chunk; i++) {
+            if (readback[i] != expected[off + i]) {
+                uint8_t exp_b = expected[off + i];
+                uint8_t got_b = readback[i];
+                log_put(V2_EVT_VERIFY_MISS, (uint16_t)(off + i),
+                        spi_addr + off + i);
+                MBOX->last_sr = ((uint32_t)exp_b << 8) | got_b;
+                set_error(V2_ERR_VERIFY_MISMATCH, spi_addr + off + i, got_b);
+                return -1;
+            }
+        }
+        off       += chunk;
+        remaining -= chunk;
+    }
+    log_put(V2_EVT_VERIFY_OK, 0, spi_addr);
+    return 0;
+}
+
+/* ── Command dispatch ─────────────────────────────────────── */
+
+static void handle_command(uint32_t cmd) {
+    log_put(V2_EVT_CMD_RX, (uint16_t)cmd, MBOX->flash_addr);
+    MBOX->status = V2_STATUS_BUSY;
+    MBOX->err_code = V2_ERR_NONE;
+    MBOX->err_spi_addr = 0;
+    MBOX->phase_detail = 0;
+    uint32_t op_start_us = now_us();
+
+    int rc = -1;
+    switch (cmd) {
+    case V2_CMD_BP_CLEAR:
+        rc = do_bp_clear();
+        break;
+    case V2_CMD_ERASE:
+        rc = do_erase(MBOX->flash_addr);
+        break;
+    case V2_CMD_PROGRAM: {
+        const uint8_t *src = (const uint8_t *)(uintptr_t)MBOX->buf_addr;
+        rc = do_aai_program(MBOX->flash_addr, src, MBOX->length);
+        break;
+    }
+    case V2_CMD_READ: {
+        uint8_t *dst = (uint8_t *)(uintptr_t)MBOX->buf_addr;
+        rc = do_read(MBOX->flash_addr, dst, MBOX->length);
+        break;
+    }
+    case V2_CMD_VERIFY: {
+        const uint8_t *exp = (const uint8_t *)(uintptr_t)MBOX->buf_addr;
+        rc = do_verify(MBOX->flash_addr, exp, MBOX->length);
+        break;
+    }
+    default:
+        set_error(V2_ERR_BAD_COMMAND, 0, (uint8_t)cmd);
+        MBOX->elapsed_us = now_us() - op_start_us;
+        return;
+    }
+
+    MBOX->elapsed_us = now_us() - op_start_us;
+    if (rc == 0) {
+        MBOX->status = V2_STATUS_OK;
+        set_phase(V2_PHASE_DONE);
+    }
+    /* On failure set_error already flipped status to ERR. */
+}
+
+/* ── Main loop ────────────────────────────────────────────── */
 
 void do_main(void) {
-    struct mailbox *mb = MB;
+    /* Only touch DEV-owned fields in init. HOST may have pre-staged a
+     * command+magic before resume; do NOT clobber that. */
+    MBOX->status       = V2_STATUS_BUSY;
+    MBOX->phase        = V2_PHASE_INIT;
+    MBOX->phase_detail = 0;
+    MBOX->last_sr      = 0;
+    MBOX->err_code     = 0;
+    MBOX->err_spi_addr = 0;
+    MBOX->elapsed_us   = 0;
+    MBOX->seq          = 0;
+    MBOX->log_head     = 0;
+    MBOX->log_tail     = 0;
+    MBOX->build_tag    = 0x56324652u;   /* 'V2FR' marker */
+    dwb();
 
-    /* Initialize SPI */
-    spi_wait_idle();
-    SPI_EN = 0; SPI_CS = 0; SPI_CLK = 2;
-    pio_cmd1(0x04);  /* WRDI — exit AAI if stuck */
+    driver_setup();
 
-    mb->status = ST_IDLE;
-    mb->command = 0;
-    mb->progress = 0;
-    mb->errors = 0;
-    mb->last_sr = 0;
-    mb->fail_addr = 0;
+    MBOX->status = V2_STATUS_READY;
+    set_phase(V2_PHASE_IDLE);
 
     for (;;) {
-        uint32_t cmd = mb->command;
-        if (cmd == 0) continue;
-
-        mb->status = ST_RUNNING;
-        mb->progress = 0;
-        mb->errors = 0;
-        mb->fail_addr = 0;
-
-        uint32_t addr = mb->spi_addr;
-        int ret = 0;
-
-        switch (cmd) {
-        case 1: ret = do_erase(addr); break;
-        case 2: ret = do_write(addr); break;
-        case 3: ret = do_read(addr); break;
-        case 4: ret = do_verify(addr); break;
-        case 5: do_bp_clear(); ret = (mb->errors == 0) ? 0 : -1; break;
-        case 6: do_flash_all(); ret = (mb->errors == 0) ? 0 : -1; break;
-        case 7: do_jedec_id(); break;
-        case 8: ret = do_write_fast(addr); break;
-        default: ret = -1; break;
-        }
-
-        /* Status written LAST — host polls this */
-        mb->status = (ret == 0) ? ST_DONE : ST_ERROR;
-        /* Clear command AFTER status — prevents race */
+        if (MBOX->magic != V2_MAGIC_CMD) continue;
+        uint32_t cmd = MBOX->command;
+        /* Accept: clear magic (host re-arms by writing magic again). */
+        MBOX->magic = 0;
         dwb();
-        mb->command = 0;
+
+        handle_command(cmd);
+        set_phase(V2_PHASE_IDLE);
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════
- * Entry Point
- * ═══════════════════════════════════════════════════════════════ */
+/* ── Entry ────────────────────────────────────────────────── */
 
 void _start(void) __attribute__((naked, section(".text.entry")));
 void _start(void) {
     __asm__ volatile(
         "msr cpsr_c, #0xd3\n"
         "mov r0, #0\n"
-        "mcr p15, 0, r0, c7, c6, 0\n"    /* invalidate D-cache */
-        "mcr p15, 0, r0, c7, c5, 0\n"    /* invalidate I-cache */
+        "mcr p15, 0, r0, c7, c6, 0\n"
+        "mcr p15, 0, r0, c7, c5, 0\n"
         "mrc p15, 0, r0, c1, c0, 0\n"
-        "bic r0, r0, #5\n"               /* MMU off + D-cache off */
+        "bic r0, r0, #5\n"
         "mcr p15, 0, r0, c1, c0, 0\n"
         "ldr sp, =0x2AFFC\n"
         "bl  do_main\n"
