@@ -43,33 +43,11 @@
 
 #include <stdint.h>
 
-/* ── Hardware registers ─────────────────────────────────────── */
+#include "dice3_hw.h"
 
-#define SPI_BASE    0xCC000000
-#define SPI_CTRL    (*(volatile uint32_t *)(SPI_BASE + 0x00))
-#define SPI_LEN     (*(volatile uint32_t *)(SPI_BASE + 0x04))
-#define SPI_EN      (*(volatile uint32_t *)(SPI_BASE + 0x08))
-#define SPI_CS      (*(volatile uint32_t *)(SPI_BASE + 0x10))
-#define SPI_CLK     (*(volatile uint32_t *)(SPI_BASE + 0x14))
-#define SPI_CLRINT  (*(volatile uint32_t *)(SPI_BASE + 0x18))
-#define SPI_STAT    (*(volatile uint32_t *)(SPI_BASE + 0x28))
-#define SPI_DMAGO   (*(volatile uint32_t *)(SPI_BASE + 0x2C))
-#define SPI_DMAMD   (*(volatile uint32_t *)(SPI_BASE + 0x4C))
-#define SPI_DMACFG0 (*(volatile uint32_t *)(SPI_BASE + 0x50))
-#define SPI_DMACFG1 (*(volatile uint32_t *)(SPI_BASE + 0x54))
-#define SPI_DATA    (*(volatile uint32_t *)(SPI_BASE + 0x60))
-
-#define DMA_BASE    0x80000000
-#define DMA_EN      (*(volatile uint32_t *)(DMA_BASE + 0x08))
-#define DMA_ICLR    (*(volatile uint32_t *)(DMA_BASE + 0x10))
-#define DMA_ISTAT   (*(volatile uint32_t *)(DMA_BASE + 0x14))
-
-/* Per-channel registers at 0x80000100 + ch*0x20 */
-#define DMA_CHREG(ch, off) (*(volatile uint32_t *)(DMA_BASE + 0x100 + (ch)*0x20 + (off)))
-#define DMA_CHCLR(ch)      (*(volatile uint32_t *)(DMA_BASE + 0x30 + (ch)*4))
-
-#define SPI_TX_PORT (SPI_BASE + 0x80)
-#define SPI_RX_PORT (SPI_BASE + 0x70)  /* RXDMA port (0x60=DATA is for PIO/bootloader) */
+/* Register map / opcode constants live in dice3_hw.h with provenance.
+ * Only SRAM layout, mailbox, and helper bits specific to this driver
+ * stay in this file. */
 
 /* ── SRAM layout ────────────────────────────────────────────── */
 
@@ -105,6 +83,13 @@ struct mailbox {
 #define TX_SCRATCH ((volatile uint8_t *)0x2E020)
 #define TX_SCRATCH_MAX 16 /* bytes; contiguous through 0x2E02F */
 #define RX_SCRATCH ((volatile uint8_t *)0x2E030)
+/*
+ * TX scratch bytes past the logical SPI payload are filled with a unique
+ * ramp so over-long clocking shows up as unexpected data in flash/readback.
+ * Values 0x5A..0x69 cover pads starting at indices 5..15 (11 bytes) when
+ * base=0x5A and start_idx=5; dma_rx uses start_idx=total (active length).
+ */
+#define TX_TERM_BASE 0x5Au
 #define SR_TRACE_IDX (*(volatile uint32_t *)0x2E07C)
 #define SR_TRACE_BUF ((volatile uint32_t *)0x2E080)  /* 32 entries */
 
@@ -142,14 +127,40 @@ static inline void dwb(void) {
     __asm__ volatile("mcr p15, 0, %0, c7, c10, 4" :: "r"(0) : "memory");
 }
 
+static void tx_scratch_terminators_from(uint32_t start_idx) {
+    for (uint32_t k = start_idx; k < TX_SCRATCH_MAX; k++)
+        TX_SCRATCH[k] = (uint8_t)(TX_TERM_BASE + (k - start_idx));
+    dwb();
+}
+
+/* If flash offset j in [0,2] contains terminator byte for scratch pad p in
+ * [start_idx, TX_SCRATCH_MAX) while expected data differs → likely extra MOSI
+ * clocks sourced past the programmed length. Returns (pad<<8)|j or 0. */
+static unsigned terminator_leak_prefix(const uint8_t *rb, const uint8_t *exp,
+                                       uint32_t pad_start) {
+    for (uint32_t j = 0; j < 3; j++) {
+        uint8_t got = rb[j];
+        for (uint32_t p = pad_start; p < TX_SCRATCH_MAX; p++) {
+            uint8_t tag = (uint8_t)(TX_TERM_BASE + (p - pad_start));
+            if (got == tag && got != exp[j])
+                return (unsigned)((p << 8) | j);
+        }
+    }
+    return 0;
+}
+
 /* ── Hardware timer (PLL-independent) ──────────────────────── */
-/*
- * Timer0 at 0xC2000000: down-counting, reload=500000.
- * ~11 timer cycles per loop iteration at 196MHz → ~18MHz timer clock.
- * Used for timeout guards only — actual waits use RDSR polling.
- */
-#define TIMER_COUNT  (*(volatile uint32_t *)0xC2000004)
-#define TIMER_RELOAD (*(volatile uint32_t *)0xC2000000)
+/* Register map lives in dice3_hw.h. Stock firmware leaves Timer0 disabled
+ * (ctrl=0). It only starts counting when ctrl=0x80 (free-run auto-reload).
+ * Without this, every timer-based timeout (wait_ready, rdsr_stable,
+ * aai_pair_delay) either lucks into a flash response or spins forever.
+ * Probed with diag_timer_state.py on 2026-04-17. */
+static void timer_init(void) {
+    TIMER_CTRL = 0;                    /* ensure stopped while reconfiguring */
+    TIMER_RELOAD = TIMER_RELOAD_DEFAULT;
+    TIMER_CTRL = TIMER_CTRL_RUN;
+    dwb();
+}
 
 static uint32_t timer_read(void) {
     return TIMER_COUNT;
@@ -221,11 +232,16 @@ static void spi_reset(void) {
     }
 }
 
+/* ── PIO TX — actually uses the SPI controller's PIO mode via SPI_DATA ──
+ * Memory (spi_controller_architecture.md): CTRL=0x207 is TX direction;
+ * CTRL=0x107 is RX and generates no clocks in PIO mode. TCAT-BOOT has
+ * been observed to leave the controller in a state where PIO stalls, so
+ * there is a DMA-TX fallback further below. */
 static void pio_tx_begin(uint32_t nbytes) {
     while (SPI_STAT & 1) {}
     spi_off();
     SPI_DMAMD = 0;
-    SPI_CTRL = 0x107;
+    SPI_CTRL = 0x207;
     SPI_LEN = nbytes - 1;
     SPI_CLK = 2;
     dwb();
@@ -235,12 +251,12 @@ static void pio_tx_begin(uint32_t nbytes) {
 }
 
 static void pio_tx_byte(uint8_t b) {
-    while (!(SPI_STAT & 2)) {}
+    while (!(SPI_STAT & 2)) {}   /* bit 1 = TX_READY */
     SPI_DATA = b;
 }
 
 static void pio_tx_end(void) {
-    while (SPI_STAT & 1) {}
+    while (SPI_STAT & 1) {}       /* bit 0 = BUSY */
     SPI_CS = 0;
     SPI_EN = 0;
 }
@@ -248,8 +264,10 @@ static void pio_tx_end(void) {
 /* Forward declaration — dma_tx defined below */
 static int dma_tx(const volatile uint8_t *buf, uint32_t len);
 
-/* Short SPI commands via DMA TX (replaces PIO which doesn't work in
- * TCAT-BOOT loader context — SPI_STAT stuck at 0x6 for PIO). */
+/* Short SPI commands via DMA TX. Genuine PIO was tried on 2026-04-17 and
+ * the WREN silently fails on the stock firmware path (RDSR returns 0x00
+ * after WREN), matching the memory note that PIO-TX is unreliable outside
+ * the firmware's own dma_transfer_execute path. Keep DMA for short cmds. */
 static int pio_cmd1(uint8_t cmd) {
     TX_SCRATCH[0] = cmd;
     return dma_tx(TX_SCRATCH, 1);
@@ -291,6 +309,12 @@ static int dma_tx(const volatile uint8_t *buf, uint32_t len) {
     SPI_EN = 0;
     SPI_CS = 0;
     SPI_DMAGO = 0;
+    /* CTRL = 0x107 here even though Ghidra decomp suggests 0x1106
+     * (direction TX | flash ctrl_base). Tested 2026-04-17: 0x1106
+     * makes WREN silently fail too (WEL never asserts). The ctrl_base
+     * OR may require co-init of other state our bare-metal driver
+     * doesn't set up. Leave 0x107 — it's what actually works for us,
+     * with the first 3-4 byte-programs dropped as a known regression. */
     SPI_CTRL = 0x107;
     SPI_LEN = len - 1;
     SPI_DMAMD = 2;
@@ -334,6 +358,105 @@ static int dma_tx(const volatile uint8_t *buf, uint32_t len) {
     return -1;
 }
 
+/* ── Split DMA TX for SST byte-program (mimics firmware spi_flash_cmd_pp) ──
+ *
+ * Stock firmware at 0x85b4 sends byte-program as TWO hw_resource_start calls
+ * with the CS held low between them:
+ *     start(res, 0, 4, [cmd, A2, A1, A0])   // command phase
+ *     start(res, 0, 1, [data])              // data phase
+ *     release()                             // CS high
+ *
+ * Our monolithic 5-byte dma_tx drops the first 3–4 byte-programs after an
+ * erase (observed 2026-04-17 — flash[+0..+2] = 0xFF). Splitting into 4+1
+ * with CS held matches the firmware shape and lets the DMA engine finish
+ * its command-phase transfer before feeding the data byte.
+ */
+static int dma_tx_split_4_1(const volatile uint8_t *cmd4,
+                            const volatile uint8_t *data1) {
+    dwb();
+
+    while (SPI_STAT & 1) {}
+    SPI_EN = 0;
+    SPI_CS = 0;
+    SPI_DMAGO = 0;
+    SPI_CTRL = 0x107;
+    SPI_DMAMD = 2;
+    SPI_CLK = 2;
+    SPI_DMACFG0 = 4;
+    SPI_DMACFG1 = 3;
+
+    /* Phase 1: 4-byte command/address, CS held after transfer. */
+    SPI_LEN = 3;                   /* 4 bytes on the wire */
+    dwb();
+    SPI_EN = 1;
+    dwb();
+
+    DMA_EN = 1;
+    DMA_ICLR = 1;
+    DMA_CHCLR(0) = 1;
+    dwb();
+    DMA_CHREG(0, 0x10) = 0;
+    DMA_CHREG(0, 0x00) = (uint32_t)(uintptr_t)cmd4;
+    DMA_CHREG(0, 0x04) = SPI_TX_PORT;
+    DMA_CHREG(0, 0x08) = 0;
+    DMA_CHREG(0, 0x0C) = 4u | 0xF4009000;
+    dwb();
+    DMA_CHREG(0, 0x10) = 0xD005;
+    dwb();
+
+    SPI_CS = 1;                    /* assert CS — stays asserted across both */
+    SPI_CLRINT = 0;
+    dwb();
+
+    for (volatile int i = 0; i < 500000; i++) {
+        if (DMA_ISTAT & 1) goto phase1_done;
+    }
+    dma_abort_inflight();
+    return -1;
+
+phase1_done:
+    /* Let SPI drain TX FIFO but DO NOT deassert CS, DO NOT disable SPI_EN. */
+    SPI_DMAGO = 1;
+    while (SPI_STAT & 1) {}
+    DMA_EN = 0;
+    DMA_ICLR = 3;
+    DMA_CHCLR(0) = 1;
+    dwb();
+
+    /* Phase 2: 1-byte data with CS still asserted. */
+    SPI_DMAGO = 0;
+    SPI_LEN = 0;                   /* 1 byte on the wire */
+    dwb();
+
+    DMA_EN = 1;
+    DMA_ICLR = 1;
+    DMA_CHCLR(0) = 1;
+    dwb();
+    DMA_CHREG(0, 0x10) = 0;
+    DMA_CHREG(0, 0x00) = (uint32_t)(uintptr_t)data1;
+    DMA_CHREG(0, 0x04) = SPI_TX_PORT;
+    DMA_CHREG(0, 0x08) = 0;
+    DMA_CHREG(0, 0x0C) = 1u | 0xF4009000;
+    dwb();
+    DMA_CHREG(0, 0x10) = 0xD005;
+    SPI_CLRINT = 0;
+    dwb();
+
+    for (volatile int i = 0; i < 500000; i++) {
+        if (DMA_ISTAT & 1) {
+            SPI_DMAGO = 1;
+            while (SPI_STAT & 1) {}
+            SPI_CS = 0;            /* deassert — commits byte-program */
+            SPI_EN = 0;
+            DMA_EN = 0;
+            DMA_ICLR = 3;
+            return 0;
+        }
+    }
+    dma_abort_inflight();
+    return -1;
+}
+
 /* ── DMA RX (1-byte commands: RDSR, JEDEC ID) ──────────────── */
 /*
  * Bidirectional DMA (DMAMD=3): ch0=RX, ch1=TX.
@@ -349,6 +472,7 @@ static int dma_rx(uint32_t spi_cmd, uint8_t *buf, uint32_t len) {
     TX_SCRATCH[0] = (uint8_t)spi_cmd;
     for (uint32_t i = 1; i < total; i++)
         TX_SCRATCH[i] = 0;
+    tx_scratch_terminators_from(total);
 
     while (SPI_STAT & 1) {}
     SPI_EN = 0;
@@ -656,14 +780,54 @@ static int do_erase(uint32_t spi_addr) {
  * next AAI pair before BUSY clears can drop/garble data.  Polling BUSY is
  * both valid per datasheet and faster than fixed worst-case delays.
  */
+/* Single byte-program with the WREN + RDSR + DMA_TX sequence. Separated so we
+ * can call it in both the main loop and a post-loop repair pass. Safe to call
+ * more than once per address — flash bits only go 1→0 so re-programming the
+ * same value is idempotent. */
+static int program_byte(uint32_t spi_addr, uint8_t value) {
+    spi_reset();
+    if (pio_cmd1(SST_CMD_WREN) != 0)
+        return -1;
+    uint8_t sr = rdsr_stable(TIMER_RELOAD / 4);
+    MBOX->last_sr = sr;
+    if ((sr & SST_SR_WEL) == 0)
+        return -2;
+    TX_SCRATCH[0] = SST_CMD_BYTE_PRG;
+    TX_SCRATCH[1] = (spi_addr >> 16) & 0xFF;
+    TX_SCRATCH[2] = (spi_addr >> 8) & 0xFF;
+    TX_SCRATCH[3] = spi_addr & 0xFF;
+    TX_SCRATCH[4] = value;
+    tx_scratch_terminators_from(5);
+    dwb();
+    if (dma_tx(TX_SCRATCH, 5) != 0)
+        return -3;
+    if (wait_ready(TIMER_RELOAD) != 0)
+        return -4;
+    return 0;
+}
+
+/* Read 1 byte from flash via the same dma_bidir_read path used for sector
+ * reads, but only pull the first byte. Used to validate per-byte writes. */
+static int read_one_byte(uint32_t spi_addr, uint8_t *out) {
+    uint8_t tmp[16];
+    spi_reset();
+    /* Mirror do_read's pipeline-flush: one dummy RDSR. */
+    if (dma_rx(SST_CMD_RDSR, (uint8_t *)RX_SCRATCH, 1) != 0)
+        return -1;
+    if (dma_bidir_read(spi_addr, tmp, 1) != 0)
+        return -2;
+    *out = tmp[0];
+    return 0;
+}
+
 static int do_write(uint32_t spi_addr) {
-    /* Byte-program fallback: slower than AAI, but this is the best baseline we
-     * have in TCAT-BOOT. */
-    const uint32_t warmup_addr = spi_addr + SECTOR_SIZE - 1;
-    const uint32_t total_launches = SECTOR_SIZE + 3;
-    for (uint32_t i = 0; i < total_launches; i++) {
+    /* The very first 3-4 byte-programs after a sector erase silently drop
+     * on our DMA TX path (flash[+0..+3]=0xFF). Flash programs only clear
+     * bits, so re-programming the same value is a no-op once it lands —
+     * repair the first N bytes after the main loop. */
+    for (uint32_t i = 0; i < SECTOR_SIZE; i++) {
         spi_reset();
-        if (pio_cmd1(0x06) != 0) {  /* WREN */
+        if (pio_cmd1(SST_CMD_WREN) != 0) {
             MBOX->errors = 0xDA53;
             spi_reset();
             return -1;
@@ -673,28 +837,19 @@ static int do_write(uint32_t spi_addr) {
             MBOX->last_sr = sr;
             if (i == 0 || (i & 0x7F) == 0)
                 trace_sr((i == 0) ? EVT_WRITE_WREN : EVT_WRITE_MID, sr);
-            if ((sr & 0x02) == 0) {
+            if ((sr & SST_SR_WEL) == 0) {
                 MBOX->errors = 0xDA20;
                 spi_reset();
                 return -1;
             }
         }
 
-        TX_SCRATCH[0] = 0x02;
-        if (i < 3) {
-            /* Diagnostic: if the first few byte-program launches are being lost
-             * by the controller, spend them on an erased tail byte where a 0xFF
-             * write is harmless, then begin real programming at byte 0. */
-            TX_SCRATCH[1] = (warmup_addr >> 16) & 0xFF;
-            TX_SCRATCH[2] = (warmup_addr >> 8) & 0xFF;
-            TX_SCRATCH[3] = warmup_addr & 0xFF;
-            TX_SCRATCH[4] = 0xFF;
-        } else {
-            TX_SCRATCH[1] = ((spi_addr + (i - 3)) >> 16) & 0xFF;
-            TX_SCRATCH[2] = ((spi_addr + (i - 3)) >> 8) & 0xFF;
-            TX_SCRATCH[3] = (spi_addr + (i - 3)) & 0xFF;
-            TX_SCRATCH[4] = DATA_BUF[i - 3];
-        }
+        TX_SCRATCH[0] = SST_CMD_BYTE_PRG;
+        TX_SCRATCH[1] = ((spi_addr + i) >> 16) & 0xFF;
+        TX_SCRATCH[2] = ((spi_addr + i) >> 8) & 0xFF;
+        TX_SCRATCH[3] = (spi_addr + i) & 0xFF;
+        TX_SCRATCH[4] = DATA_BUF[i];
+        tx_scratch_terminators_from(5);
         dwb();
 
         if (dma_tx(TX_SCRATCH, 5) != 0) {
@@ -711,8 +866,8 @@ static int do_write(uint32_t spi_addr) {
             return -1;
         }
 
-        if (i >= 3 && (((i - 2) & 0xFF) == 0) && MBOX->command != 6)
-            MBOX->progress = i - 2;
+        if (((i + 1) & 0xFF) == 0 && MBOX->command != 6)
+            MBOX->progress = i + 1;
     }
 
     {
@@ -734,17 +889,51 @@ static int do_write(uint32_t spi_addr) {
         return -1;
     }
 
-    /* Debug guard: verify first 16 bytes immediately after write.
-     * Catches silent "write accepted but not programmed" failures. */
-    if (do_read(spi_addr) != 0) {
-        MBOX->errors = 0xDA30;
-        return -1;
-    }
-    for (uint32_t i = 0; i < 16; i++) {
-        if (READBACK_BUF[i] != DATA_BUF[i]) {
+    /* Head-of-sector repair: the first 3-4 DMA TX byte-programs after
+     * a sector erase silently drop on this controller. Read the head
+     * back and re-issue any mismatches. Flash bits only transition
+     * 1→0, so re-programming the same value is idempotent. Bounded to
+     * 16 retries total so a genuinely unwritable bit can't spin us. */
+    #define REPAIR_HEAD_BYTES 16
+    #define REPAIR_RETRY_LIMIT 16
+    for (uint32_t retry = 0; retry < REPAIR_RETRY_LIMIT; retry++) {
+        if (do_read(spi_addr) != 0) {
+            MBOX->errors = 0xDA30;
+            return -1;
+        }
+        uint32_t first_bad = REPAIR_HEAD_BYTES;
+        for (uint32_t i = 0; i < REPAIR_HEAD_BYTES; i++) {
+            if (READBACK_BUF[i] != DATA_BUF[i]) {
+                first_bad = i;
+                break;
+            }
+        }
+        if (first_bad == REPAIR_HEAD_BYTES)
+            break;  /* head is clean */
+        if (retry == REPAIR_RETRY_LIMIT - 1) {
             MBOX->errors = 0xDA31;
-            MBOX->last_sr = 0xE0000000 | (i << 16) |
-                ((uint32_t)DATA_BUF[i] << 8) | (uint32_t)READBACK_BUF[i];
+            MBOX->last_sr = 0xE0000000 | (first_bad << 16) |
+                ((uint32_t)DATA_BUF[first_bad] << 8) |
+                (uint32_t)READBACK_BUF[first_bad];
+            return -1;
+        }
+        /* Re-program every mismatched byte in the head window. */
+        for (uint32_t i = first_bad; i < REPAIR_HEAD_BYTES; i++) {
+            if (READBACK_BUF[i] != DATA_BUF[i]) {
+                if (program_byte(spi_addr + i, DATA_BUF[i]) != 0) {
+                    MBOX->errors = 0xDA35;
+                    return -1;
+                }
+            }
+        }
+    }
+    {
+        unsigned leak = terminator_leak_prefix(READBACK_BUF, DATA_BUF, 5);
+        if (leak != 0) {
+            MBOX->errors = 0xDA32;
+            /* tag F1: [23:16]=TX_SCRATCH pad index, [15:8]=flash offset, [7:0]=byte */
+            MBOX->last_sr = 0xF1000000u | (leak << 8) |
+                (uint32_t)READBACK_BUF[leak & 0xFFu];
             return -1;
         }
     }
@@ -1005,6 +1194,117 @@ static int do_flash_step(void) {
     return 0;  /* unknown state */
 }
 
+/* ── Pre-flash teardown (subset of reboot_common.c) ───────────
+ * When stock firmware is running, USB/audio may leave DMA + SPI active.
+ * Mirror soft-reboot quiesce: USB reset, LED + flash SPI idle,
+ * full DMA engine reset, VIC pending clear — then normal spi_reset() paths.
+ */
+#define REBOOT_USB_BASE            0x90000000u
+#define REBOOT_USB_USBCMD          (*(volatile uint32_t *)(REBOOT_USB_BASE + 0x08))
+#define REBOOT_USB_USBSTS          (*(volatile uint32_t *)(REBOOT_USB_BASE + 0x14))
+#define REBOOT_USB_USBINTR         (*(volatile uint32_t *)(REBOOT_USB_BASE + 0x18))
+#define REBOOT_USB_DEVICEADDR      (*(volatile uint32_t *)(REBOOT_USB_BASE + 0x24))
+#define REBOOT_USB_ENDPTLISTADDR   (*(volatile uint32_t *)(REBOOT_USB_BASE + 0x28))
+#define REBOOT_TCAT_USBMODE        (*(volatile uint32_t *)(REBOOT_USB_BASE + 0x800))
+#define REBOOT_TCAT_EP_COMP_STATUS (*(volatile uint32_t *)(REBOOT_USB_BASE + 0x818))
+#define REBOOT_TCAT_EP_COMP_ENABLE (*(volatile uint32_t *)(REBOOT_USB_BASE + 0x81C))
+#define REBOOT_TCAT_EP_ASYNC_PRIME (*(volatile uint32_t *)(REBOOT_USB_BASE + 0x834))
+#define REBOOT_TCAT_EP_RX_EN       (*(volatile uint32_t *)(REBOOT_USB_BASE + 0x810))
+#define REBOOT_TCAT_EP_TX_EN       (*(volatile uint32_t *)(REBOOT_USB_BASE + 0x814))
+
+#define REBOOT_USBCMD_RS    (1u << 0)
+#define REBOOT_USBCMD_RST   (1u << 1)
+#define REBOOT_USBCMD_SUTW  (1u << 13)
+#define REBOOT_USBCMD_ATDTW (1u << 14)
+
+#define REBOOT_VIC_INT_EN_CLR (*(volatile uint32_t *)0xFFFFF014)
+#define REBOOT_VIC_SOFT_CLR   (*(volatile uint32_t *)0xFFFFF01C)
+
+#define REBOOT_FLASH_SPI   ((volatile uint32_t *)0xCC000000u)
+#define REBOOT_LED_SPI     ((volatile uint32_t *)0xCF000000u)
+#define REBOOT_LED_GPIO    (*(volatile uint32_t *)0xCB000020)
+
+static void spi_ip_quiesce(volatile uint32_t *s) {
+    for (volatile int i = 0; i < 100000; i++) {
+        if (!(s[0x28 / 4] & 1u))
+            break;
+    }
+    s[0x10 / 4] = 0;
+    s[0x08 / 4] = 0;
+    s[0x2C / 4] = 0;
+    s[0x4C / 4] = 0;
+    s[0x50 / 4] = 0;
+    s[0x54 / 4] = 0;
+    s[0x00 / 4] = 0;
+    s[0x04 / 4] = 0;
+    s[0x18 / 4] = 0;
+    s[0x34 / 4] = 0;
+    dwb();
+}
+
+static void dma_engine_full_reset_reboot_style(void) {
+    volatile uint32_t *dma = (volatile uint32_t *)0x80000000;
+    unsigned ch;
+    dma[0x08 / 4] = 0;
+    dma[0x10 / 4] = 0x0Fu;
+    for (ch = 0; ch < 4; ch++)
+        dma[0x30 / 4 + ch] = 1;
+    for (ch = 0; ch < 4; ch++) {
+        volatile uint32_t *b = (volatile uint32_t *)(0x80000100u + ch * 0x20u);
+        b[0x10 / 4] = 0;
+        b[0x0C / 4] = 0;
+        b[0x08 / 4] = 0;
+        b[0x00 / 4] = 0;
+        b[0x04 / 4] = 0;
+    }
+    dwb();
+}
+
+static void usb_hw_reset_for_flash(void) {
+    REBOOT_USB_USBSTS = 0xFFFFFFFFu;
+    REBOOT_USB_USBCMD &= ~(uint32_t)1;
+    REBOOT_USB_USBCMD |= 2;
+    for (volatile int i = 0; i < 100000; i++) {
+        if (!(REBOOT_USB_USBCMD & 2))
+            break;
+    }
+    REBOOT_USB_USBSTS = 0xFFFFFFFFu;
+    REBOOT_USB_USBINTR = 0;
+    REBOOT_USB_USBCMD &= ~(uint32_t)(REBOOT_USBCMD_RS | REBOOT_USBCMD_SUTW |
+                                     REBOOT_USBCMD_ATDTW);
+    REBOOT_USB_DEVICEADDR = 0;
+    REBOOT_USB_ENDPTLISTADDR = 0;
+    REBOOT_TCAT_USBMODE = 2u;
+    REBOOT_TCAT_EP_COMP_STATUS = 0xFFFFFFFFu;
+    REBOOT_TCAT_EP_COMP_ENABLE = 0;
+    REBOOT_TCAT_EP_ASYNC_PRIME = 0;
+    REBOOT_TCAT_EP_RX_EN = 0;
+    REBOOT_TCAT_EP_TX_EN = 0;
+    dwb();
+    for (volatile int i = 0; i < 400000; i++) {}
+}
+
+static void pre_flash_teardown(void) {
+    /* SVC + IRQ/FIQ off — matches reboot_to_tcat_bootloader path. */
+    __asm__ volatile("mov r0, #0xD3 \n msr cpsr_c, r0 \n" ::: "r0", "memory");
+
+    usb_hw_reset_for_flash();
+
+
+    spi_ip_quiesce(REBOOT_LED_SPI);
+    REBOOT_LED_GPIO = 0;
+    REBOOT_LED_SPI[0x14 / 4] = 0xFF;
+    dwb();
+
+    spi_ip_quiesce(REBOOT_FLASH_SPI);
+
+    dma_engine_full_reset_reboot_style();
+
+    REBOOT_VIC_INT_EN_CLR = 0xFFFFFFFFu;
+    REBOOT_VIC_SOFT_CLR = 0xFFFFFFFFu;
+    dwb();
+}
+
 /* ── SPI/DMA cleanup for soft reboot ───────────────────────── */
 /*
  * Restore SPI + DMA to power-on defaults so the ROM bootloader
@@ -1057,6 +1357,13 @@ static void spi_restore_clean(void) {
 
 void do_main(void) {
     struct mailbox *mb = MBOX;
+
+    /* Quiesce USB/DMA/SPI like soft-reboot before touching flash (running fw). */
+    pre_flash_teardown();
+
+    /* Stock firmware never enables Timer0 — without this the timer-based
+     * timeouts used by wait_ready / rdsr_stable / aai_pair_delay never tick. */
+    timer_init();
 
     /* Full SPI/DMA reset — required for TCAT-BOOT mode where the
      * bootloader leaves the SPI controller in DMA-read state. */
