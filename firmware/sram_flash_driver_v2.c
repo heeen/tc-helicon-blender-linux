@@ -533,6 +533,13 @@ static int do_erase_any(uint32_t spi_addr, uint8_t opcode) {
 }
 
 static int do_erase(uint32_t spi_addr) {
+    /* SE (4 KB) requires flash_addr aligned to 4 KB; low 12 bits are
+     * ignored by hardware but we want loud failures, not silent
+     * truncation. */
+    if (spi_addr & 0xFFFu) {
+        set_error(V2_ERR_BAD_ADDR, spi_addr, 0);
+        return -1;
+    }
     return do_erase_any(spi_addr, SST_CMD_SE);
 }
 
@@ -555,6 +562,13 @@ static int do_erase_block_64k(uint32_t spi_addr) {
 static int do_aai_program(uint32_t spi_addr, const uint8_t *data, uint32_t len) {
     if (len < 2 || (len & 1)) {
         set_error(V2_ERR_BAD_LENGTH, spi_addr, 0);
+        return -1;
+    }
+    /* AAI ignores A0 in hardware (writes land at addr & ~1 and addr | 1).
+     * Require explicit even alignment so odd addresses don't silently
+     * truncate. */
+    if (spi_addr & 1u) {
+        set_error(V2_ERR_BAD_ADDR, spi_addr, 0);
         return -1;
     }
 

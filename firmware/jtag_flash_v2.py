@@ -362,13 +362,58 @@ class FlashClientV2:
                            est_us=30_000, overall_timeout=5.0)
 
 
+BLOCK_32K = 0x8000
 BLOCK_64K = 0x10000
 
 
+def plan_erase_ops(sectors, policy):
+    """Pick a sequence of (erase_kind, addr) ops covering all `sectors`.
+
+    Strategies:
+      'se'     — one 4 KB SE per sector (no over-erase)
+      'be64'   — one 64 KB BE per block containing any sector (may
+                 erase adjacent untouched regions)
+      'smart'  — use BE64 only when ≥8/16 sectors in that 64 KB block
+                 need programming, else BE32 when ≥4/8 in a 32 KB
+                 block, else per-sector SE.
+    Returns a list like [('be64', 0x40000), ('se', 0x3F000), ...].
+    """
+    sectors = sorted(set(sectors))
+    if policy == "se":
+        return [("se", s) for s in sectors]
+
+    # Group into 64 KB blocks.
+    blocks64 = {}
+    for s in sectors:
+        blocks64.setdefault(s & ~(BLOCK_64K - 1), []).append(s)
+
+    ops = []
+    if policy == "be64":
+        for blk_addr in sorted(blocks64):
+            ops.append(("be64", blk_addr))
+        return ops
+
+    # 'smart'
+    for blk_addr, sec_list in sorted(blocks64.items()):
+        n = len(sec_list)
+        if n >= 8:                     # majority of block — erase 64 KB
+            ops.append(("be64", blk_addr))
+            continue
+        # Try splitting into two 32 KB halves.
+        low  = [s for s in sec_list if s < blk_addr + BLOCK_32K]
+        high = [s for s in sec_list if s >= blk_addr + BLOCK_32K]
+        for halves in ((low, blk_addr), (high, blk_addr + BLOCK_32K)):
+            hsecs, haddr = halves
+            if not hsecs: continue
+            if len(hsecs) >= 4:
+                ops.append(("be32", haddr))
+            else:
+                for s in hsecs: ops.append(("se", s))
+    return ops
+
+
 def flash_all(client, args):
-    """Flash every non-empty sector of --ref. Groups sectors into 64 KB
-    blocks: one block-erase per block, then program+verify each
-    non-empty 4 KB sector within. ~8× fewer erases than sector-by-sector."""
+    """Flash every non-empty sector of --ref."""
     ref = Path(args.ref).read_bytes()
     print(f"Reference: {args.ref} ({len(ref)} bytes)")
 
@@ -382,40 +427,54 @@ def flash_all(client, args):
     if args.limit > 0:
         sectors = sectors[:args.limit]
 
-    # Group into 64 KB blocks.
-    blocks = {}
-    for addr in sectors:
-        blocks.setdefault(addr & ~(BLOCK_64K - 1), []).append(addr)
-
-    total_kb = sum(len(v) * SECTOR_SIZE for v in blocks.values()) // 1024
-    print(f"  {len(sectors)} non-empty sectors ({total_kb} KB) "
-          f"across {len(blocks)} × 64 KB blocks")
+    policy = args.erase_policy
+    erase_ops = plan_erase_ops(sectors, policy)
+    kinds = {}
+    for k, _ in erase_ops: kinds[k] = kinds.get(k, 0) + 1
+    kind_summary = ", ".join(f"{v}×{k.upper()}" for k, v in sorted(kinds.items()))
+    total_kb = len(sectors) * SECTOR_SIZE // 1024
+    print(f"  {len(sectors)} non-empty sectors ({total_kb} KB); "
+          f"erase plan ({policy}): {kind_summary}")
 
     if not client.bp_clear():
         return 1
 
     total_t0 = time.monotonic()
     failed = []
+
+    # 1. Execute all erase ops first.
+    erase_t0 = time.monotonic()
+    for kind, addr in erase_ops:
+        if kind == "se":
+            ok = client.erase(addr)
+        elif kind == "be32":
+            ok = client.erase_32k(addr)
+        else:
+            ok = client.erase_64k(addr)
+        if not ok:
+            # Mark all sectors within the erased region as failed.
+            span = {"se": SECTOR_SIZE, "be32": BLOCK_32K, "be64": BLOCK_64K}[kind]
+            for s in sectors:
+                if addr <= s < addr + span:
+                    failed.append(("erase", s))
+    print(f"  erase phase done {time.monotonic() - erase_t0:.2f}s")
+
+    # 2. Program + verify each sector (skip any already failed at erase).
     done_kb = 0
-    block_idx = 0
-    for block_addr, sec_list in sorted(blocks.items()):
-        block_idx += 1
-        sec_list = sorted(sec_list)
-        blk_t0 = time.monotonic()
-        print(f"[block {block_idx}/{len(blocks)}] 0x{block_addr:06x} "
-              f"({len(sec_list)} sectors)")
-        if not client.erase_64k(block_addr):
-            for s in sec_list: failed.append(("erase", s))
-            continue
-        for addr in sec_list:
-            expected = ref[addr:addr + SECTOR_SIZE]
-            if not client.program(addr, expected):
-                failed.append(("program", addr)); continue
-            if not args.skip_verify and not client.verify(addr, expected):
-                failed.append(("verify", addr)); continue
-            done_kb += SECTOR_SIZE // 1024
-        print(f"  block done {time.monotonic() - blk_t0:.2f}s "
-              f"({done_kb}/{total_kb} KB total)")
+    failed_at_erase = {s for _, s in failed}
+    for idx, addr in enumerate(sectors):
+        if addr in failed_at_erase: continue
+        expected = ref[addr:addr + SECTOR_SIZE]
+        sec_t0 = time.monotonic()
+        if not client.program(addr, expected):
+            failed.append(("program", addr)); continue
+        if not args.skip_verify and not client.verify(addr, expected):
+            failed.append(("verify", addr)); continue
+        done_kb += SECTOR_SIZE // 1024
+        dt = time.monotonic() - sec_t0
+        if (idx + 1) % 8 == 0 or idx == len(sectors) - 1:
+            print(f"  [{idx+1}/{len(sectors)}] 0x{addr:06x} OK {dt:.2f}s "
+                  f"({done_kb}/{total_kb} KB)")
 
     total = time.monotonic() - total_t0
     print(f"\n=== flash-all done in {total:.1f}s ===")
@@ -447,6 +506,13 @@ def main():
     p.add_argument("--sectors", type=str, default="",
                    help="flash-all: comma-separated hex sector addrs "
                         "(overrides the non-empty scan of --ref)")
+    p.add_argument("--erase-policy", choices=("se", "be32", "be64", "smart"),
+                   default="smart",
+                   help="flash-all erase strategy: "
+                        "'se' = one 4 KB SE per sector (no over-erase), "
+                        "'be64' = always 64 KB BE per block, "
+                        "'smart' = BE64 for ≥8/16 sectors, BE32 for ≥4/8, "
+                        "SE otherwise (default)")
     args = p.parse_args()
 
     if not DRIVER_BIN.exists():
