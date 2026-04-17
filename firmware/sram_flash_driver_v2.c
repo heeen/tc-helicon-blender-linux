@@ -430,6 +430,35 @@ static int wait_not_busy(uint32_t budget_us, uint8_t *out_sr) {
     }
 }
 
+/* Wait a fixed interval (long enough to cover the typical operation
+ * time) then poll RDSR at poll_interval_us until BUSY clears or
+ * max_extra_us is reached. Avoids the expensive dma_rx overhead during
+ * the normal-case erase/program wait. */
+static int wait_fixed_then_poll(uint32_t fixed_us,
+                                uint32_t poll_interval_us,
+                                uint32_t max_extra_us,
+                                uint8_t *out_sr)
+{
+    busy_wait_us(fixed_us);
+    uint32_t t_extra = 0;
+    for (;;) {
+        uint8_t sr = rdsr();
+        if (sr != 0xFF) {
+            MBOX->last_sr = sr;
+            if (!(sr & SST_SR_BUSY)) {
+                if (out_sr) *out_sr = sr;
+                return 0;
+            }
+        }
+        if (t_extra >= max_extra_us) {
+            if (out_sr) *out_sr = sr;
+            return -1;
+        }
+        busy_wait_us(poll_interval_us);
+        t_extra += poll_interval_us;
+    }
+}
+
 static int aai_pair_wait(uint32_t pair_idx) {
     /* Pure fixed delay. RDSR polling between pairs turned out to
      * sometimes drop the flash out of AAI mode after ~73 pairs
@@ -449,7 +478,9 @@ static int do_bp_clear(void) {
     if (spi_cmd1(SST_CMD_EWSR) != 0) { set_error(V2_ERR_BP_CLEAR_WREN, 0, 0); return -1; }
     if (spi_cmd2(SST_CMD_WRSR, 0x00) != 0) { set_error(V2_ERR_BP_CLEAR_WRSR, 0, 0); return -1; }
     uint8_t sr = 0xFF;
-    if (wait_not_busy(30000, &sr) != 0) {
+    /* Datasheet tWRSR max 10 ms. Wait 12 ms fixed, poll 5 ms every
+     * 20 ms extra. */
+    if (wait_fixed_then_poll(12000, 5000, 20000, &sr) != 0) {
         set_error(V2_ERR_BP_CLEAR_STUCK, 0, sr);
         return -1;
     }
@@ -457,7 +488,7 @@ static int do_bp_clear(void) {
         /* Retry with WREN (some SST parts want WREN, not EWSR). */
         (void)spi_cmd1(SST_CMD_WREN);
         (void)spi_cmd2(SST_CMD_WRSR, 0x00);
-        (void)wait_not_busy(30000, &sr);
+        (void)wait_fixed_then_poll(12000, 5000, 20000, &sr);
     }
     MBOX->last_sr = sr;
     log_put(V2_EVT_BP_CLEAR_POST, 0, 0);
@@ -486,10 +517,14 @@ static int do_erase(uint32_t spi_addr) {
 
     set_phase(V2_PHASE_ERASE_POLL);
     uint8_t sr = 0xFF;
-    /* Datasheet tSE max 25 ms. Observed up to ~56 ms on this controller
-     * because our wait_not_busy polls via dma_rx which itself takes
-     * several ms per sample. 150 ms gives generous headroom. */
-    if (wait_not_busy(150000, &sr) != 0) {
+    /* Datasheet tSE max 25 ms; observed ~55 ms on this part (verified
+     * via fixed 50 ms + poll hitting at 56 ms total). Use 55 ms fixed
+     * with a single RDSR verify at the end — polling mid-busy adds
+     * dma_rx overhead (~26 ms when we tried 18 ms fixed + 2 ms poll).
+     * Fall back to polling for up to 30 ms extra if the first RDSR
+     * still reports BUSY. */
+    busy_wait_us(55000);
+    if (wait_fixed_then_poll(0, 2000, 30000, &sr) != 0) {
         set_error(V2_ERR_ERASE_TIMEOUT, spi_addr, sr);
         return -1;
     }
