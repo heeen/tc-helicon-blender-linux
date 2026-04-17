@@ -556,28 +556,95 @@ static int do_aai_program(uint32_t spi_addr, const uint8_t *data, uint32_t len) 
     }
 
     set_phase(V2_PHASE_AAI_PAIR);
-    /* Real data pairs — i indexes data[], pair index in log is i/2 + 2
-     * (after the two dummy pairs). */
+    /* Hot pair loop — SPI is already configured from the last dma_tx
+     * (CTRL=0x107, LEN=2, DMAMD=2, CLK=2, DMACFG0=4, DMACFG1=3, EN=0
+     * after dma_tx). Keep SPI_EN across pairs and only reprogram the
+     * DMA channel + toggle CS. Drops the ~3 ms/pair overhead of full
+     * SPI reconfig to ~microseconds.
+     *
+     * Three slots per pair live in TX_SCRATCH (volatile) so the DMA
+     * channel's SRC pointer doesn't move; only the data bytes change. */
+    SPI_EN = 0;
+    SPI_CS = 0;
+    SPI_DMAGO = 0;
+    SPI_CTRL = 0x107;
+    SPI_LEN = 2;                 /* 3 bytes on the wire per sub-pair */
+    SPI_DMAMD = 2;
+    SPI_CLK = 2;
+    SPI_DMACFG0 = 4;
+    SPI_DMACFG1 = 3;
+    dwb();
+    SPI_EN = 1;
+    dwb();
+
+    DMA_EN = 1;
+    dwb();
+    /* Preload the channel registers that don't change. SRC, CFG, TRG
+     * get touched per pair; DST, NXT are set once. */
+    DMA_CHREG(0, 0x04) = SPI_TX_PORT;
+    DMA_CHREG(0, 0x08) = 0;
+    dwb();
+
+    TX_SCRATCH[0] = SST_CMD_AAI;       /* stays 0xAD for every pair */
+    dwb();
+
     for (uint32_t i = 0; i < len; i += 2) {
-        MBOX->phase_detail = i >> 1;
-        TX_SCRATCH[0] = SST_CMD_AAI;
         TX_SCRATCH[1] = data[i];
         TX_SCRATCH[2] = data[i + 1];
-        if (dma_tx(TX_SCRATCH, 3, 5000) != 0) {
-            (void)spi_cmd1(SST_CMD_WRDI);
-            set_error(V2_ERR_AAI_PAIR_TX, spi_addr + i, 0);
-            return -1;
+        dwb();
+
+        DMA_ICLR = 1;
+        DMA_CHCLR(0) = 1;
+        DMA_CHREG(0, 0x10) = 0;
+        DMA_CHREG(0, 0x00) = (uint32_t)(uintptr_t)TX_SCRATCH;
+        DMA_CHREG(0, 0x0C) = 3u | DMA_CFG_TX;
+        dwb();
+        DMA_CHREG(0, 0x10) = DMA_TRG_TX;
+        dwb();
+
+        SPI_CS = 1;
+        SPI_CLRINT = 0;
+        dwb();
+
+        /* Tight poll — at ~25 MHz CPU each iter is ~10 cycles, so
+         * 20000 iters ≈ 8 ms which is well over the datasheet
+         * combined transfer+tBP window. */
+        int spun = 0;
+        while (!(DMA_ISTAT & 1)) {
+            if (++spun > 20000) {
+                dma_abort();
+                (void)spi_cmd1(SST_CMD_WRDI);
+                set_error(V2_ERR_AAI_PAIR_TX, spi_addr + i, 0);
+                return -1;
+            }
         }
-        if (aai_pair_wait(i >> 1) != 0) {
-            (void)spi_cmd1(SST_CMD_WRDI);
-            set_error(V2_ERR_AAI_PAIR_TIMEOUT, spi_addr + i,
-                      (uint8_t)MBOX->last_sr);
-            return -1;
+        while (SPI_STAT & SPI_STAT_BUSY) {
+            if (++spun > 30000) {
+                dma_abort();
+                (void)spi_cmd1(SST_CMD_WRDI);
+                set_error(V2_ERR_AAI_PAIR_TX, spi_addr + i, 0);
+                return -1;
+            }
         }
-        if ((i & 0xFF) == 0) MBOX->seq++;
-        if ((i & 0x7F) == 0)
+        SPI_CS = 0;
+        dwb();
+
+        /* Fixed tBP delay before the next pair (datasheet max 10 µs). */
+        busy_wait_us(30);
+
+        if ((i & 0x1FF) == 0) {
+            MBOX->phase_detail = i >> 1;
+            MBOX->seq++;
             log_put(V2_EVT_AAI_PAIR, (uint16_t)(i >> 1), spi_addr + i);
+        }
     }
+
+    /* Clean teardown of DMA + SPI now that the pair loop is done. */
+    SPI_CS = 0;
+    SPI_EN = 0;
+    DMA_EN = 0;
+    DMA_ICLR = 3;
+    dwb();
 
     set_phase(V2_PHASE_AAI_WRDI);
     (void)spi_cmd1(SST_CMD_WRDI);
