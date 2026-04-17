@@ -453,8 +453,47 @@ def plan_erase_ops(sectors, policy):
     return ops
 
 
+def plan_flash_ops(sectors, block_threshold_64k=12, block_threshold_32k=6):
+    """Pick flash ops covering `sectors`. Each op is one JTAG round-trip.
+
+    Per 64 KB block containing any non-empty sector:
+      - If ≥ block_threshold_64k sectors non-empty → FLASH_BLOCK(64K)
+      - Else split into two 32 KB halves:
+          - Half with ≥ block_threshold_32k sectors → FLASH_BLOCK(32K)
+          - Else per-sector FLASH_SECTOR
+    Returns a list of ("block_64k"|"block_32k"|"sector", addr, span) tuples.
+    The span is 0x10000, 0x8000, or 0x1000 respectively — tells flash_all
+    how many bytes to upload.
+    """
+    sectors = sorted(set(sectors))
+    by_64k = {}
+    for s in sectors:
+        by_64k.setdefault(s & ~(BLOCK_64K - 1), []).append(s)
+
+    ops = []
+    for blk_addr, sec_list in sorted(by_64k.items()):
+        if len(sec_list) >= block_threshold_64k:
+            ops.append(("block_64k", blk_addr, BLOCK_64K))
+            continue
+        low  = [s for s in sec_list if s < blk_addr + BLOCK_32K]
+        high = [s for s in sec_list if s >= blk_addr + BLOCK_32K]
+        for half_secs, half_addr in ((low, blk_addr),
+                                     (high, blk_addr + BLOCK_32K)):
+            if not half_secs: continue
+            if len(half_secs) >= block_threshold_32k:
+                ops.append(("block_32k", half_addr, BLOCK_32K))
+            else:
+                for s in half_secs:
+                    ops.append(("sector", s, SECTOR_SIZE))
+    return ops
+
+
 def flash_all(client, args):
-    """Flash every non-empty sector of --ref."""
+    """Flash every non-empty sector of --ref.
+
+    Prefers one autonomous block op per 64 KB region when the block is
+    mostly full (≥12 sectors non-empty), else falls back to per-sector
+    ops. Saves round-trips vs the old erase+program+verify loop."""
     ref = Path(args.ref).read_bytes()
     print(f"Reference: {args.ref} ({len(ref)} bytes)")
 
@@ -468,59 +507,42 @@ def flash_all(client, args):
     if args.limit > 0:
         sectors = sectors[:args.limit]
 
-    policy = args.erase_policy
-    erase_ops = plan_erase_ops(sectors, policy)
+    ops = plan_flash_ops(sectors)
     kinds = {}
-    for k, _ in erase_ops: kinds[k] = kinds.get(k, 0) + 1
-    kind_summary = ", ".join(f"{v}×{k.upper()}" for k, v in sorted(kinds.items()))
+    for k, *_ in ops: kinds[k] = kinds.get(k, 0) + 1
+    kind_summary = ", ".join(f"{v}×{k}" for k, v in sorted(kinds.items()))
     total_kb = len(sectors) * SECTOR_SIZE // 1024
     print(f"  {len(sectors)} non-empty sectors ({total_kb} KB); "
-          f"erase plan ({policy}): {kind_summary}")
+          f"plan: {kind_summary} ({len(ops)} commands)")
 
     if not client.bp_clear():
         return 1
 
     total_t0 = time.monotonic()
     failed = []
-
-    # 1. Execute all erase ops first.
-    erase_t0 = time.monotonic()
-    for kind, addr in erase_ops:
-        if kind == "se":
-            ok = client.erase(addr)
-        elif kind == "be32":
-            ok = client.erase_32k(addr)
+    for op_idx, (kind, addr, span) in enumerate(ops):
+        # Pull the block data from ref.
+        data = ref[addr:addr + span]
+        op_t0 = time.monotonic()
+        if kind == "sector":
+            ok = client.flash_sector(addr, data)
         else:
-            ok = client.erase_64k(addr)
+            ok = client.flash_block(addr, data)
+        dt = time.monotonic() - op_t0
+        label = kind if kind != "sector" else "sector"
+        status = "OK" if ok else "FAIL"
+        print(f"  [{op_idx+1}/{len(ops)}] {label} 0x{addr:06x} "
+              f"len={span} {status} {dt:.2f}s")
         if not ok:
-            # Mark all sectors within the erased region as failed.
-            span = {"se": SECTOR_SIZE, "be32": BLOCK_32K, "be64": BLOCK_64K}[kind]
+            # Mark all sectors covered by this op as failed.
             for s in sectors:
                 if addr <= s < addr + span:
-                    failed.append(("erase", s))
-    print(f"  erase phase done {time.monotonic() - erase_t0:.2f}s")
-
-    # 2. Program + verify each sector (skip any already failed at erase).
-    done_kb = 0
-    failed_at_erase = {s for _, s in failed}
-    for idx, addr in enumerate(sectors):
-        if addr in failed_at_erase: continue
-        expected = ref[addr:addr + SECTOR_SIZE]
-        sec_t0 = time.monotonic()
-        if not client.program(addr, expected):
-            failed.append(("program", addr)); continue
-        if not args.skip_verify and not client.verify(addr, expected):
-            failed.append(("verify", addr)); continue
-        done_kb += SECTOR_SIZE // 1024
-        dt = time.monotonic() - sec_t0
-        if (idx + 1) % 8 == 0 or idx == len(sectors) - 1:
-            print(f"  [{idx+1}/{len(sectors)}] 0x{addr:06x} OK {dt:.2f}s "
-                  f"({done_kb}/{total_kb} KB)")
+                    failed.append((kind, s))
 
     total = time.monotonic() - total_t0
     print(f"\n=== flash-all done in {total:.1f}s ===")
     if failed:
-        print(f"FAILED sectors: {failed}")
+        print(f"FAILED ops: {failed}")
         return 1
     return 0
 
