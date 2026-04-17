@@ -69,6 +69,8 @@ CMD_VERIFY    = 4
 CMD_BP_CLEAR  = 5
 CMD_FLASH_ALL = 6
 CMD_QUIT      = 7
+CMD_ERASE_32K = 8
+CMD_ERASE_64K = 9
 
 PHASE_NAMES = {
     0: "INIT", 1: "TEARDOWN", 2: "T0_ENABLE", 3: "IDLE", 4: "BP_CLEAR",
@@ -305,6 +307,16 @@ class FlashClientV2:
         return self._issue(CMD_ERASE, flash_addr=spi_addr,
                            est_us=30_000, overall_timeout=5.0)
 
+    def erase_64k(self, spi_addr):
+        print(f"erase_64k 0x{spi_addr:06x}...")
+        return self._issue(CMD_ERASE_64K, flash_addr=spi_addr,
+                           est_us=30_000, overall_timeout=5.0)
+
+    def erase_32k(self, spi_addr):
+        print(f"erase_32k 0x{spi_addr:06x}...")
+        return self._issue(CMD_ERASE_32K, flash_addr=spi_addr,
+                           est_us=30_000, overall_timeout=5.0)
+
     def program(self, spi_addr, data_bytes):
         """Upload data_bytes to DATA_BUF_ADDR, then issue PROGRAM."""
         tmp = f"/tmp/v2_prog_{spi_addr:x}.bin"
@@ -350,8 +362,13 @@ class FlashClientV2:
                            est_us=30_000, overall_timeout=5.0)
 
 
+BLOCK_64K = 0x10000
+
+
 def flash_all(client, args):
-    """Flash every non-empty sector of --ref through the v2 driver."""
+    """Flash every non-empty sector of --ref. Groups sectors into 64 KB
+    blocks: one block-erase per block, then program+verify each
+    non-empty 4 KB sector within. ~8× fewer erases than sector-by-sector."""
     ref = Path(args.ref).read_bytes()
     print(f"Reference: {args.ref} ({len(ref)} bytes)")
 
@@ -360,32 +377,45 @@ def flash_all(client, args):
     else:
         sectors = []
         for addr in range(0, len(ref), SECTOR_SIZE):
-            sec = ref[addr:addr + SECTOR_SIZE]
-            if any(b != 0xFF for b in sec):
+            if any(b != 0xFF for b in ref[addr:addr + SECTOR_SIZE]):
                 sectors.append(addr)
     if args.limit > 0:
         sectors = sectors[:args.limit]
-    print(f"  {len(sectors)} sectors to flash "
-          f"({len(sectors) * SECTOR_SIZE // 1024} KB)")
+
+    # Group into 64 KB blocks.
+    blocks = {}
+    for addr in sectors:
+        blocks.setdefault(addr & ~(BLOCK_64K - 1), []).append(addr)
+
+    total_kb = sum(len(v) * SECTOR_SIZE for v in blocks.values()) // 1024
+    print(f"  {len(sectors)} non-empty sectors ({total_kb} KB) "
+          f"across {len(blocks)} × 64 KB blocks")
 
     if not client.bp_clear():
         return 1
 
     total_t0 = time.monotonic()
     failed = []
-    for idx, addr in enumerate(sectors):
-        expected = ref[addr:addr + SECTOR_SIZE]
-        sec_t0 = time.monotonic()
-        if not client.erase(addr):
-            failed.append(("erase", addr)); continue
-        if not client.program(addr, expected):
-            failed.append(("program", addr)); continue
-        if not args.skip_verify and not client.verify(addr, expected):
-            failed.append(("verify", addr)); continue
-        dt = time.monotonic() - sec_t0
-        done_kb = (idx + 1) * SECTOR_SIZE // 1024
-        print(f"[{idx+1}/{len(sectors)}] 0x{addr:06x} OK {dt:.2f}s "
-              f"({done_kb}/{len(sectors)*SECTOR_SIZE//1024} KB)")
+    done_kb = 0
+    block_idx = 0
+    for block_addr, sec_list in sorted(blocks.items()):
+        block_idx += 1
+        sec_list = sorted(sec_list)
+        blk_t0 = time.monotonic()
+        print(f"[block {block_idx}/{len(blocks)}] 0x{block_addr:06x} "
+              f"({len(sec_list)} sectors)")
+        if not client.erase_64k(block_addr):
+            for s in sec_list: failed.append(("erase", s))
+            continue
+        for addr in sec_list:
+            expected = ref[addr:addr + SECTOR_SIZE]
+            if not client.program(addr, expected):
+                failed.append(("program", addr)); continue
+            if not args.skip_verify and not client.verify(addr, expected):
+                failed.append(("verify", addr)); continue
+            done_kb += SECTOR_SIZE // 1024
+        print(f"  block done {time.monotonic() - blk_t0:.2f}s "
+              f"({done_kb}/{total_kb} KB total)")
 
     total = time.monotonic() - total_t0
     print(f"\n=== flash-all done in {total:.1f}s ===")

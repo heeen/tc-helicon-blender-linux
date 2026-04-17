@@ -38,6 +38,8 @@
 #define V2_CMD_BP_CLEAR     5u    /* clear block protection */
 #define V2_CMD_FLASH_ALL    6u    /* iterate sector list, erase+program+verify */
 #define V2_CMD_QUIT         7u    /* exit driver (halt for JTAG pickup) */
+#define V2_CMD_ERASE_32K    8u    /* 32 KB block erase (flash_addr 32K-aligned) */
+#define V2_CMD_ERASE_64K    9u    /* 64 KB block erase (flash_addr 64K-aligned) */
 
 /* ── Status (DEV) ─────────────────────────────────────────── */
 #define V2_STATUS_READY     0u

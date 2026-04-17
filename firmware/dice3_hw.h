@@ -15,6 +15,13 @@
 
 #include <stdint.h>
 
+/*
+ * Scope: SPI flash + system DMA engine (0xCC…, 0x8000…). USB MIDI bulk OUT/RX
+ * uses the USB device controller at 0x90000000 (ChipIdea-like + TCAT), QH banks,
+ * and TCAT async prime at +0x834 — not SPI_DMAMD / DMA_TRG_* here. See
+ * firmware/patch/dice_usb_regs.h and firmware/usb_dma_ep_ghidra.txt.
+ */
+
 /* ──────────────────────────────────────────────────────────────
  * SPI controller IP block  —  two instances on DICE3
  *
@@ -46,19 +53,30 @@
  *     | 0x80  if res.byte6 != 0  (16-bit word mode)
  *     | 0x40  if res.byte7 != 0  (MSB-first / polarity)
  *     | 0x07  if res.byte5 == 0  (std 8-bit) else | 0x0F
- *     | 0x1000                   (IRQ-enable / ring bit — seen on flash+LED)
+ *     | 0x1000                   (silicon-level IRQ/descriptor-ring
+ *                                 participation bit — see note below)
  *
- *   Resulting CTRL value for our flash driver (8-bit, std, IRQ on):
+ *   Stock-fw CTRL values for flash (from spi_resource_flash_cfg_singleton
+ *   @ 0x000237d0):
  *     TX    = 0x100 | 0x1006 = 0x1106
  *     BIDIR = 0x000 | 0x1006 = 0x1006
  *     RX    = 0x200 | 0x1006 = 0x1206
  *
+ *   Polling-mode driver (what we ship) uses direction_bits | 0x06 instead
+ *   — bit 12 is the silicon's "participate in the DMA IRQ / descriptor
+ *   ring handshake" flag. Stock fw sets it because it drives the whole
+ *   transaction from the IRQ vector 10 completion callbacks
+ *   (spi_dma_tx_done_cb @ 0xf618, spi_dma_rx_done_cb @ 0xf63c), which
+ *   cyg_cond_signal a flag at engine_ctx+0x88. dma_engine_commit_and_wait
+ *   @ 0xf7b4 blocks on cyg_flag_timed_wait until the ISR fires. Our
+ *   bare-metal driver polls DMA_ISTAT directly, does not install vector
+ *   10, and empirically breaks WREN when bit 12 is set — the silicon
+ *   seems to stall the controller waiting for the descriptor-ring
+ *   handshake that never comes.
+ *
  *   WARNING: Earlier memory notes labelled 0x107 = "TX" and 0x207 = "RX".
- *   That was based on an incomplete decompile. Per the full transaction
- *   engine (spi_engine_queue_and_arm) the bits are `direction | ctrl_base`,
- *   not `0xN07` standalone — our old 0x107/0x207 values worked partially
- *   by accident because ctrl_base ORs onto bit 12+ which the hardware
- *   tolerates for short bursts but destabilises on the cold first transfer. */
+ *   That was a partial decompile — the real format is direction | base,
+ *   not `0xN07` standalone. */
 #define SPI_CTRL_OFF    0x00
 
 /* Direction bits to OR into CTRL (shift position already baked in). */
@@ -67,8 +85,11 @@
 #define SPI_CTRL_DIR_RX         0x200u
 #define SPI_CTRL_DIR_BIDIR_CH   0x300u
 
-/* Flash-controller ctrl_base (res-struct @0x237ac, byte5=0 / byte6=0 / byte7=0, IRQ). */
-#define SPI_CTRL_BASE_FLASH     0x1006u
+/* Flash ctrl_base variants. Stock fw uses _IRQ (0x1006); our polling
+ * driver uses _POLL (0x006) because bit 12 wants the IRQ+descriptor-ring
+ * context we don't set up. */
+#define SPI_CTRL_BASE_FLASH_IRQ     0x1006u
+#define SPI_CTRL_BASE_FLASH_POLL    0x0006u
 
 /* +0x04 LEN — frame length in bytes minus 1 (e.g. 4 ⇒ 5 bytes on the wire). */
 #define SPI_LEN_OFF     0x04
@@ -198,6 +219,9 @@
 #define SST_CMD_RDSR      0x05  /* Read Status Register */
 #define SST_CMD_WREN      0x06  /* Write Enable */
 #define SST_CMD_SE        0x20  /* 4 KB Sector Erase (cmd + 3B addr) */
+#define SST_CMD_BE_32K    0x52  /* 32 KB Block Erase (addr 32K-aligned) */
+#define SST_CMD_BE_64K    0xD8  /* 64 KB Block Erase (addr 64K-aligned) */
+#define SST_CMD_CHIP_ERASE 0xC7 /* Whole-chip erase (no addr) */
 #define SST_CMD_EWSR      0x50  /* Enable-Write-Status-Register (NOT WREN) */
 #define SST_CMD_EBSY      0x70  /* Enable RY/BY# on SO (AAI) */
 #define SST_CMD_AAI       0xAD  /* Auto-Address Increment word-program */

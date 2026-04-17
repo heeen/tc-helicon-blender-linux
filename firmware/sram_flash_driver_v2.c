@@ -495,17 +495,17 @@ static int do_bp_clear(void) {
     return (sr & SST_SR_BP_MASK) ? -1 : 0;
 }
 
-static int do_erase(uint32_t spi_addr) {
+static int do_erase_any(uint32_t spi_addr, uint8_t opcode) {
     set_phase(V2_PHASE_ERASE_WREN);
     spi_reset_clean();
     if (spi_cmd1(SST_CMD_WREN) != 0) {
         set_error(V2_ERR_ERASE_WREN, spi_addr, 0);
         return -1;
     }
-    log_put(V2_EVT_ERASE_WREN, 0, spi_addr);
+    log_put(V2_EVT_ERASE_WREN, opcode, spi_addr);
 
     set_phase(V2_PHASE_ERASE_CMD);
-    TX_SCRATCH[0] = SST_CMD_SE;
+    TX_SCRATCH[0] = opcode;
     TX_SCRATCH[1] = (spi_addr >> 16) & 0xFF;
     TX_SCRATCH[2] = (spi_addr >> 8) & 0xFF;
     TX_SCRATCH[3] = spi_addr & 0xFF;
@@ -513,24 +513,43 @@ static int do_erase(uint32_t spi_addr) {
         set_error(V2_ERR_ERASE_CMD, spi_addr, 0);
         return -1;
     }
-    log_put(V2_EVT_ERASE_CMD, 0, spi_addr);
+    log_put(V2_EVT_ERASE_CMD, opcode, spi_addr);
 
     set_phase(V2_PHASE_ERASE_POLL);
     uint8_t sr = 0xFF;
-    /* Datasheet tSE max 25 ms; observed ~55 ms on this part (verified
-     * via fixed 50 ms + poll hitting at 56 ms total). Use 55 ms fixed
-     * with a single RDSR verify at the end — polling mid-busy adds
-     * dma_rx overhead (~26 ms when we tried 18 ms fixed + 2 ms poll).
-     * Fall back to polling for up to 30 ms extra if the first RDSR
-     * still reports BUSY. */
+    /* Datasheet tSE == tBE32 == tBE64 == 25 ms max; observed ~55 ms on
+     * this part for 4 KB SE. Block erases typically same-order. Wait
+     * 55 ms fixed then RDSR slack. Polling mid-busy adds dma_rx
+     * overhead (~5 ms per failed sample), so the fixed-wait is both
+     * faster and more predictable. */
     busy_wait_us(55000);
     if (wait_fixed_then_poll(0, 2000, 30000, &sr) != 0) {
         set_error(V2_ERR_ERASE_TIMEOUT, spi_addr, sr);
         return -1;
     }
     MBOX->last_sr = sr;
-    log_put(V2_EVT_ERASE_DONE, 0, spi_addr);
+    log_put(V2_EVT_ERASE_DONE, opcode, spi_addr);
     return 0;
+}
+
+static int do_erase(uint32_t spi_addr) {
+    return do_erase_any(spi_addr, SST_CMD_SE);
+}
+
+static int do_erase_block_32k(uint32_t spi_addr) {
+    if (spi_addr & 0x7FFFu) {
+        set_error(V2_ERR_BAD_ADDR, spi_addr, 0);
+        return -1;
+    }
+    return do_erase_any(spi_addr, SST_CMD_BE_32K);
+}
+
+static int do_erase_block_64k(uint32_t spi_addr) {
+    if (spi_addr & 0xFFFFu) {
+        set_error(V2_ERR_BAD_ADDR, spi_addr, 0);
+        return -1;
+    }
+    return do_erase_any(spi_addr, SST_CMD_BE_64K);
 }
 
 static int do_aai_program(uint32_t spi_addr, const uint8_t *data, uint32_t len) {
@@ -828,6 +847,12 @@ static void handle_command(uint32_t cmd) {
         break;
     case V2_CMD_ERASE:
         rc = do_erase(MBOX->flash_addr);
+        break;
+    case V2_CMD_ERASE_32K:
+        rc = do_erase_block_32k(MBOX->flash_addr);
+        break;
+    case V2_CMD_ERASE_64K:
+        rc = do_erase_block_64k(MBOX->flash_addr);
         break;
     case V2_CMD_PROGRAM: {
         const uint8_t *src = (const uint8_t *)(uintptr_t)MBOX->buf_addr;
