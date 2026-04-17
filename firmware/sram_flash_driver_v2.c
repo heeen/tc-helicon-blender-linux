@@ -629,8 +629,10 @@ static int do_aai_program(uint32_t spi_addr, const uint8_t *data, uint32_t len) 
         SPI_CS = 0;
         dwb();
 
-        /* Fixed tBP delay before the next pair (datasheet max 10 µs). */
-        busy_wait_us(30);
+        /* Fixed tBP delay before the next pair. Datasheet max 10 µs;
+         * 12 µs gives 20 % margin and shaves 37 ms off a 4 KB sector
+         * vs 30 µs. */
+        busy_wait_us(12);
 
         if ((i & 0x1FF) == 0) {
             MBOX->phase_detail = i >> 1;
