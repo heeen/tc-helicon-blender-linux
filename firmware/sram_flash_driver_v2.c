@@ -844,6 +844,41 @@ static int do_verify(uint32_t spi_addr, const uint8_t *expected, uint32_t len) {
     return 0;
 }
 
+/* Autonomous "flash block" op — erase (largest fitting SE/BE32/BE64)
+ * → AAI program the whole span → verify — all in one command.
+ *
+ * Erase-size auto-pick:
+ *   64 KB: len ≤ 0x10000 AND addr 64 KB-aligned
+ *   32 KB: len ≤ 0x08000 AND addr 32 KB-aligned
+ *    4 KB: len ≤ 0x01000 AND addr  4 KB-aligned
+ *   else: V2_ERR_BAD_ADDR / V2_ERR_BAD_LENGTH
+ *
+ * AAI auto-increments the internal address pointer, so a single
+ * do_aai_program call can cover up to the erased span contiguously.
+ * 0xFF stretches in the data still cost AAI cycles (no skip logic);
+ * if that becomes a bottleneck we'll add a sector-skip variant. */
+static int do_flash_block(uint32_t spi_addr, const uint8_t *data, uint32_t len) {
+    if (len == 0) {
+        set_error(V2_ERR_BAD_LENGTH, spi_addr, 0);
+        return -1;
+    }
+    uint8_t erase_op;
+    if ((spi_addr & 0xFFFFu) == 0 && len <= 0x10000u) {
+        erase_op = SST_CMD_BE_64K;
+    } else if ((spi_addr & 0x7FFFu) == 0 && len <= 0x8000u) {
+        erase_op = SST_CMD_BE_32K;
+    } else if ((spi_addr & 0xFFFu) == 0 && len <= V2_SECTOR_SIZE) {
+        erase_op = SST_CMD_SE;
+    } else {
+        set_error(V2_ERR_BAD_ADDR, spi_addr, 0);
+        return -1;
+    }
+    if (do_erase_any(spi_addr, erase_op) != 0) return -1;
+    if (do_aai_program(spi_addr, data, len) != 0) return -1;
+    if (do_verify(spi_addr, data, len) != 0) return -1;
+    return 0;
+}
+
 /* Autonomous "flash one sector" op — erase + AAI program + verify in
  * one command. Saves the host ~2/3 of the JTAG round-trips it would
  * otherwise spend issuing ERASE → PROGRAM → VERIFY separately. */
@@ -889,6 +924,11 @@ static void handle_command(uint32_t cmd) {
     case V2_CMD_FLASH_SECTOR: {
         const uint8_t *src = (const uint8_t *)(uintptr_t)MBOX->buf_addr;
         rc = do_flash_sector(MBOX->flash_addr, src, MBOX->length);
+        break;
+    }
+    case V2_CMD_FLASH_BLOCK: {
+        const uint8_t *src = (const uint8_t *)(uintptr_t)MBOX->buf_addr;
+        rc = do_flash_block(MBOX->flash_addr, src, MBOX->length);
         break;
     }
     case V2_CMD_PROGRAM: {

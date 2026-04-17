@@ -72,6 +72,7 @@ CMD_QUIT      = 7
 CMD_ERASE_32K = 8
 CMD_ERASE_64K = 9
 CMD_FLASH_SECTOR = 10
+CMD_FLASH_BLOCK  = 11
 
 PHASE_NAMES = {
     0: "INIT", 1: "TEARDOWN", 2: "T0_ENABLE", 3: "IDLE", 4: "BP_CLEAR",
@@ -349,6 +350,27 @@ class FlashClientV2:
         self.o.resume()
         return data
 
+    def flash_block(self, spi_addr, data_bytes, load_addr=IMAGE_BASE_ADDR):
+        """Autonomous erase+AAI-program+verify for up to 64 KB in one cmd.
+        Driver auto-picks SE/BE32/BE64 from addr alignment + length.
+        Data is uploaded to `load_addr` in SRAM (default IMAGE_BASE so we
+        can fit up to 64 KB safely)."""
+        tmp = f"/tmp/v2_fb_{spi_addr:x}.bin"
+        Path(tmp).write_bytes(data_bytes)
+        self.o.halt()
+        self.o.load_image(tmp, load_addr)
+        self.o.resume()
+        try: os.unlink(tmp)
+        except FileNotFoundError: pass
+        print(f"flash_block 0x{spi_addr:06x} (len={len(data_bytes)})...")
+        pairs = max(1, len(data_bytes) // 2)
+        # program ~245 µs/pair + erase ~60 ms + verify ~20 ms/KB
+        est_us = pairs * 260 + 60_000 + (len(data_bytes) // 1024) * 20_000
+        return self._issue(CMD_FLASH_BLOCK, flash_addr=spi_addr,
+                           buf_addr=load_addr, length=len(data_bytes),
+                           est_us=est_us,
+                           overall_timeout=max(est_us / 1e6 * 2, 10.0))
+
     def flash_sector(self, spi_addr, data_bytes):
         """Autonomous erase+program+verify for one sector in a single cmd.
         Saves 2 of the 3 JTAG handshakes per sector vs erase/program/verify."""
@@ -512,11 +534,13 @@ def main():
     p.add_argument("--test-sector", type=lambda x: int(x, 0), default=0x3F000,
                    help="Scratch sector for test mode (default 0x3F000)")
     p.add_argument("--mode", choices=("test", "erase-only", "readback",
-                                       "flash-all", "autonomous"),
+                                       "flash-all", "autonomous",
+                                       "block-sector", "block-64k"),
                    default="test",
                    help="'test' = host-driven erase+program+verify on test sector, "
-                        "'autonomous' = same but via single V2_CMD_FLASH_SECTOR "
-                        "(driver does all three), "
+                        "'autonomous' = single V2_CMD_FLASH_SECTOR (4 KB only), "
+                        "'block-sector' = V2_CMD_FLASH_BLOCK with a 4 KB payload "
+                        "(exercises auto-pick → SE), "
                         "'erase-only' = just erase, "
                         "'readback' = read 4 KB from --test-sector to stdout hex, "
                         "'flash-all' = write every non-empty sector from --ref")
@@ -555,6 +579,36 @@ def main():
             ok = client.flash_sector(args.test_sector, pattern)
             dt = time.monotonic() - t0
             print(f"autonomous flash_sector: {dt:.2f}s wall, "
+                  f"{'OK' if ok else 'FAIL'}")
+            return 0 if ok else 1
+        if args.mode == "block-sector":
+            # V2_CMD_FLASH_BLOCK with a single-sector (4 KB) payload —
+            # exercises the auto-pick logic on its SE branch.
+            if not client.bp_clear():
+                raise SystemExit(1)
+            pattern = bytes(((i * 37) & 0xFF) if (i % 257) else 0
+                            for i in range(SECTOR_SIZE))
+            t0 = time.monotonic()
+            ok = client.flash_block(args.test_sector, pattern)
+            dt = time.monotonic() - t0
+            print(f"flash_block(4 KB): {dt:.2f}s wall, "
+                  f"{'OK' if ok else 'FAIL'}")
+            return 0 if ok else 1
+        if args.mode == "block-64k":
+            # FLASH_BLOCK with a 64 KB payload — auto-pick → BE64.
+            # --test-sector must be 64 KB-aligned and pointing at an
+            # expendable region (0x90000+ is all-0xFF in the patched
+            # image, safe).
+            if args.test_sector & 0xFFFF:
+                raise SystemExit("--test-sector must be 64 KB-aligned for block-64k")
+            if not client.bp_clear():
+                raise SystemExit(1)
+            pattern = bytes(((i * 37) & 0xFF) if (i % 257) else 0
+                            for i in range(0x10000))
+            t0 = time.monotonic()
+            ok = client.flash_block(args.test_sector, pattern)
+            dt = time.monotonic() - t0
+            print(f"flash_block(64 KB): {dt:.2f}s wall, "
                   f"{'OK' if ok else 'FAIL'}")
             return 0 if ok else 1
         if args.mode == "erase-only":

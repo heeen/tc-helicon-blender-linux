@@ -41,6 +41,8 @@
 #define V2_CMD_ERASE_32K    8u    /* 32 KB block erase (flash_addr 32K-aligned) */
 #define V2_CMD_ERASE_64K    9u    /* 64 KB block erase (flash_addr 64K-aligned) */
 #define V2_CMD_FLASH_SECTOR 10u   /* erase+program+verify one 4 KB sector autonomously */
+#define V2_CMD_FLASH_BLOCK  11u   /* erase+AAI-program+verify up to 64 KB; auto-picks
+                                   * SE/BE32/BE64 from flash_addr alignment + length */
 
 /* ── Status (DEV) ─────────────────────────────────────────── */
 #define V2_STATUS_READY     0u
