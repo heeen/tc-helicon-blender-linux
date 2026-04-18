@@ -29,11 +29,43 @@ DRIVER_BIN = FIRMWARE_DIR / "sram_flash_driver_v2.bin"
 
 # Keep in sync with sram_flash_mailbox_v2.h.
 MBOX_ADDR        = 0x0002E000
+TIMINGS_ADDR     = 0x0002E180
 LOG_RING_ADDR    = 0x0002E200
 DATA_BUF_ADDR    = 0x0002B000
 IMAGE_BASE_ADDR  = 0x0002F900
 SECTOR_LIST_ADDR = 0x0002F100
 DRIVER_CODE_ADDR = 0x0002C000
+
+# v2_timings struct (matches sram_flash_mailbox_v2.h). All u32 LE.
+TIMINGS_MAGIC = 0x54494D32   # 'TIM2'
+TIMING_FIELDS = (
+    "aai_pair_fixed_us",
+    "aai_pair_poll_interval_us",
+    "aai_pair_poll_budget_us",
+    "pre_wrdi_fixed_us",
+    "pre_wrdi_poll_interval_us",
+    "pre_wrdi_poll_budget_us",
+    "post_wrdi_fixed_us",
+    "post_wrdi_poll_interval_us",
+    "post_wrdi_poll_budget_us",
+    "erase_fixed_us",
+    "erase_poll_interval_us",
+    "erase_poll_budget_us",
+)
+TIMING_DEFAULTS = {
+    "aai_pair_fixed_us":          10,
+    "aai_pair_poll_interval_us":  5,
+    "aai_pair_poll_budget_us":    100,
+    "pre_wrdi_fixed_us":          40,
+    "pre_wrdi_poll_interval_us":  500,
+    "pre_wrdi_poll_budget_us":    5000,
+    "post_wrdi_fixed_us":         200,
+    "post_wrdi_poll_interval_us": 500,
+    "post_wrdi_poll_budget_us":   20000,
+    "erase_fixed_us":             60000,
+    "erase_poll_interval_us":     2000,
+    "erase_poll_budget_us":       500000,
+}
 
 MAGIC_CMD = 0x4D324657  # 'M2FW'
 
@@ -73,6 +105,7 @@ CMD_ERASE_32K = 8
 CMD_ERASE_64K = 9
 CMD_FLASH_SECTOR = 10
 CMD_FLASH_BLOCK  = 11
+CMD_BYTE_PATCH   = 12
 
 PHASE_NAMES = {
     0: "INIT", 1: "TEARDOWN", 2: "T0_ENABLE", 3: "IDLE", 4: "BP_CLEAR",
@@ -304,6 +337,37 @@ class FlashClientV2:
         print("bp_clear...")
         return self._issue(CMD_BP_CLEAR, est_us=30_000, overall_timeout=5.0)
 
+    def read_timings(self):
+        """Read the active v2_timings struct. Returns a dict (empty if
+        driver hasn't stamped the magic yet)."""
+        self.o.halt()
+        magic = self.o.mdw(TIMINGS_ADDR)
+        out = {"magic": magic}
+        if magic != TIMINGS_MAGIC:
+            return out
+        for i, name in enumerate(TIMING_FIELDS):
+            out[name] = self.o.mdw(TIMINGS_ADDR + 4 + i * 4)
+        return out
+
+    def set_timings(self, **overrides):
+        """Write defaults + overrides into the v2_timings struct, then
+        stamp the magic last so the driver picks up a consistent set.
+        Unrecognized keys raise; values clamped to u32. Defaults fill
+        any fields not overridden."""
+        for k in overrides:
+            if k not in TIMING_DEFAULTS:
+                raise ValueError(f"unknown timing {k!r}; known: {list(TIMING_DEFAULTS)}")
+        values = {**TIMING_DEFAULTS, **overrides}
+        self.o.halt()
+        # Clear magic first so driver won't pick up a torn struct.
+        self.o.mww(TIMINGS_ADDR, 0)
+        for i, name in enumerate(TIMING_FIELDS):
+            v = int(values[name]) & 0xFFFFFFFF
+            self.o.mww(TIMINGS_ADDR + 4 + i * 4, v)
+        # Stamp magic last.
+        self.o.mww(TIMINGS_ADDR, TIMINGS_MAGIC)
+        print(f"timings set: {values}")
+
     def erase(self, spi_addr):
         print(f"erase 0x{spi_addr:06x}...")
         return self._issue(CMD_ERASE, flash_addr=spi_addr,
@@ -349,6 +413,26 @@ class FlashClientV2:
         data = self.o.dump_image(DATA_BUF_ADDR, length)
         self.o.resume()
         return data
+
+    def byte_patch(self, spi_addr, data_bytes):
+        """BYTE_PROGRAM each byte. Requires target cells to be erased
+        (0xFF) or to contain a superset of the target bits. Used to fix
+        AAI-dropped tail bytes."""
+        if not data_bytes:
+            return True
+        tmp = f"/tmp/v2_bp_{spi_addr:x}.bin"
+        Path(tmp).write_bytes(data_bytes)
+        self.o.halt()
+        self.o.load_image(tmp, DATA_BUF_ADDR)
+        self.o.resume()
+        try: os.unlink(tmp)
+        except FileNotFoundError: pass
+        print(f"byte_patch 0x{spi_addr:06x} len={len(data_bytes)}...")
+        est_us = len(data_bytes) * 5000   # ~5 ms per byte (WREN+TX+poll)
+        return self._issue(CMD_BYTE_PATCH, flash_addr=spi_addr,
+                           buf_addr=DATA_BUF_ADDR, length=len(data_bytes),
+                           est_us=est_us,
+                           overall_timeout=max(est_us / 1e6 * 2, 5.0))
 
     def flash_block(self, spi_addr, data_bytes, load_addr=IMAGE_BASE_ADDR):
         """Autonomous erase+AAI-program+verify for up to 64 KB in one cmd.
@@ -543,7 +627,45 @@ def flash_all(client, args):
     print(f"\n=== flash-all done in {total:.1f}s ===")
     if failed:
         print(f"FAILED ops: {failed}")
-        return 1
+        # Keep going — repair step below will catch the dropped bytes.
+
+    # Host-side verify + byte-patch repair. Both on-device verify AND
+    # on-device CMD_READ read through a post-write buffer that hides tail
+    # drops. Use JTAG-driven bidir DMA (skip=12) to see true cell state.
+    if args.repair:
+        import sys as _sys
+        _sys.path.insert(0, str(FIRMWARE_DIR))
+        from debug_flash_harness import jtag_dma_read
+        import debug_flash_harness as h
+        h.READ_RX_SKIP = 12
+        print(f"\n=== host-side verify + byte-patch repair ===")
+        repair_t0 = time.monotonic()
+        repairs = 0
+        total_bad = 0
+        for op_idx, (kind, addr, span) in enumerate(ops):
+            want = ref[addr:addr + span]
+            got = jtag_dma_read(client.o, addr, span)
+            diffs = [i for i in range(span) if got[i] != want[i]]
+            if not diffs: continue
+            total_bad += len(diffs)
+            print(f"  [{op_idx+1}/{len(ops)}] 0x{addr:06x} {len(diffs)} diffs, "
+                  f"first offs={diffs[:4]} last={diffs[-4:]}")
+            # Group contiguous runs of mismatched bytes.
+            runs = []
+            s = diffs[0]; prev = s
+            for b in diffs[1:]:
+                if b == prev + 1: prev = b
+                else: runs.append((s, prev + 1)); s = prev = b
+            runs.append((s, prev + 1))
+            for rs, re in runs:
+                chunk = want[rs:re]
+                if client.byte_patch(addr + rs, chunk):
+                    repairs += 1
+                else:
+                    print(f"  repair 0x{addr+rs:06x}+{re-rs} FAILED")
+        rdt = time.monotonic() - repair_t0
+        print(f"=== repair done: {total_bad} mismatched bytes "
+              f"in {repairs} runs, {rdt:.1f}s ===")
     return 0
 
 
@@ -568,6 +690,10 @@ def main():
                         "'flash-all' = write every non-empty sector from --ref")
     p.add_argument("--limit", type=int, default=0,
                    help="flash-all: stop after N sectors (0 = all)")
+    p.add_argument("--repair", action=argparse.BooleanOptionalAction, default=True,
+                   help="flash-all: after flashing, host-side-verify every op via "
+                        "CMD_READ and byte-program any mismatched bytes (default on). "
+                        "Counters the on-device verify's tendency to miss tail drops.")
     p.add_argument("--skip-verify", action="store_true",
                    help="flash-all: skip per-sector verify (faster, riskier)")
     p.add_argument("--sectors", type=str, default="",
@@ -580,16 +706,41 @@ def main():
                         "'be64' = always 64 KB BE per block, "
                         "'smart' = BE64 for ≥8/16 sectors, BE32 for ≥4/8, "
                         "SE otherwise (default)")
+    p.add_argument("--timing", action="append", default=[],
+                   metavar="NAME=VALUE",
+                   help=f"Override a v2_timings field (in µs). Repeatable. "
+                        f"Known names: {', '.join(TIMING_FIELDS)}. "
+                        f"Unset fields use the on-device defaults.")
+    p.add_argument("--show-timings", action="store_true",
+                   help="Print the active on-device timings and exit.")
     args = p.parse_args()
 
     if not DRIVER_BIN.exists():
         raise SystemExit(f"ERROR: driver binary not found: {DRIVER_BIN}. "
                          "Run: arm-none-eabi-gcc ... && objcopy ...")
 
+    timing_overrides = {}
+    for spec in args.timing:
+        if "=" not in spec:
+            raise SystemExit(f"bad --timing {spec!r}: need NAME=VALUE")
+        name, val = spec.split("=", 1)
+        name = name.strip()
+        if name not in TIMING_DEFAULTS:
+            raise SystemExit(f"unknown --timing field {name!r}; "
+                             f"known: {list(TIMING_DEFAULTS)}")
+        timing_overrides[name] = int(val.strip(), 0)
+
     ocd = OpenOCD(speed=args.speed)
     try:
         client = FlashClientV2(ocd)
         client.load_driver()
+        if timing_overrides:
+            client.set_timings(**timing_overrides)
+        if args.show_timings:
+            t = client.read_timings()
+            for k, v in t.items():
+                print(f"  {k} = {v}")
+            return 0
         if args.mode == "flash-all":
             return flash_all(client, args)
         if args.mode == "autonomous":

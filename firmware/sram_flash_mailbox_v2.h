@@ -17,6 +17,7 @@
 
 /* ── Fixed SRAM addresses ─────────────────────────────────── */
 #define V2_MBOX_ADDR        0x0002E000u
+#define V2_TIMINGS_ADDR     0x0002E180u   /* 64 B, all DEV/HOST-R/W */
 #define V2_LOG_RING_ADDR    0x0002E200u
 #define V2_DATA_BUF_ADDR    0x0002B000u   /* single-sector source/dest */
 #define V2_IMAGE_BASE_ADDR  0x0002F900u   /* bulk sector payload */
@@ -43,6 +44,9 @@
 #define V2_CMD_FLASH_SECTOR 10u   /* erase+program+verify one 4 KB sector autonomously */
 #define V2_CMD_FLASH_BLOCK  11u   /* erase+AAI-program+verify up to 64 KB; auto-picks
                                    * SE/BE32/BE64 from flash_addr alignment + length */
+#define V2_CMD_BYTE_PATCH   12u   /* BYTE_PROGRAM each byte in buf_addr[0..length-1]
+                                   * onto flash[flash_addr..flash_addr+length-1].
+                                   * No erase. Used to fix AAI-dropped tail bytes. */
 
 /* ── Status (DEV) ─────────────────────────────────────────── */
 #define V2_STATUS_READY     0u
@@ -147,5 +151,50 @@ struct v2_log_entry {
 
 #define V2_LOG_RING_ENTRIES 128u
 #define V2_LOG_RING_MASK    (V2_LOG_RING_ENTRIES - 1u)
+
+/* ── Tunable timings (HOST R/W, DEV R) ────────────────────── */
+struct v2_timings {
+    volatile uint32_t magic;                     /* 0 = driver uses defaults */
+
+    /* Per-AAI-pair wait (datasheet §4.4 "check BUSY before next pair"). */
+    volatile uint32_t aai_pair_fixed_us;         /* fixed prologue */
+    volatile uint32_t aai_pair_poll_interval_us; /* RDSR poll interval */
+    volatile uint32_t aai_pair_poll_budget_us;   /* max extra poll time */
+
+    /* Pre-WRDI wait at end of an AAI run. */
+    volatile uint32_t pre_wrdi_fixed_us;
+    volatile uint32_t pre_wrdi_poll_interval_us;
+    volatile uint32_t pre_wrdi_poll_budget_us;
+
+    /* Post-WRDI wait before the next op (verify / next run). */
+    volatile uint32_t post_wrdi_fixed_us;
+    volatile uint32_t post_wrdi_poll_interval_us;
+    volatile uint32_t post_wrdi_poll_budget_us;
+
+    /* Erase wait (SE / BE32 / BE64 share these values). */
+    volatile uint32_t erase_fixed_us;
+    volatile uint32_t erase_poll_interval_us;
+    volatile uint32_t erase_poll_budget_us;
+
+    /* Reserved for growth. */
+    volatile uint32_t reserved[2];
+};
+
+#define V2_TIMINGS_MAGIC      0x54494D32u  /* 'TIM2' — HOST sets when valid */
+
+/* Conservative datasheet-sourced defaults. Driver uses these if the host
+ * hasn't written a valid v2_timings struct (magic != V2_TIMINGS_MAGIC). */
+#define V2_TIM_DEFAULT_AAI_PAIR_FIXED_US         10u
+#define V2_TIM_DEFAULT_AAI_PAIR_POLL_INTERVAL_US 5u
+#define V2_TIM_DEFAULT_AAI_PAIR_POLL_BUDGET_US   100u
+#define V2_TIM_DEFAULT_PRE_WRDI_FIXED_US         40u
+#define V2_TIM_DEFAULT_PRE_WRDI_POLL_INTERVAL_US 500u
+#define V2_TIM_DEFAULT_PRE_WRDI_POLL_BUDGET_US   5000u
+#define V2_TIM_DEFAULT_POST_WRDI_FIXED_US        200u
+#define V2_TIM_DEFAULT_POST_WRDI_POLL_INTERVAL_US 500u
+#define V2_TIM_DEFAULT_POST_WRDI_POLL_BUDGET_US  20000u
+#define V2_TIM_DEFAULT_ERASE_FIXED_US            60000u
+#define V2_TIM_DEFAULT_ERASE_POLL_INTERVAL_US    2000u
+#define V2_TIM_DEFAULT_ERASE_POLL_BUDGET_US      500000u
 
 #endif /* SRAM_FLASH_MAILBOX_V2_H */

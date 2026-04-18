@@ -110,15 +110,27 @@
 /* +0x18 CLRINT — write 0 to clear pending IRQ edge (done right before
  * kickoff so the completion interrupt is armed fresh). */
 #define SPI_CLRINT_OFF  0x18
-/* +0x28 STAT — bit 0 = BUSY (in-flight). Stock driver polls only this.
- * Must be drained before reconfiguring the controller. Bit 1 was
- * previously labelled TX_READY; the firmware never reads it. */
+/* +0x28 STAT — transfer-status flags.
+ *   bit 0 BUSY     — transfer in flight. DMA completion drains this.
+ *   bit 1 TX_READY — set when TX FIFO can accept another byte.
+ *                    v1 pio_tx_byte polls this before each DATA write.
+ *   bit 3 RX_READY — set when a received byte is available in DATA.
+ *                    Bootloader's led_spi_read_jedec polls this. */
 #define SPI_STAT_OFF    0x28
-#define SPI_STAT_BUSY   0x01u
-/* +0x2C DMAGO — stock firmware *never writes 1 here*. Reset only
- * (written 0 during setup). Our older drivers wrote 1 to "signal DMA
- * done" but the kickoff is actually SPI_EN=1 after the DMA is armed. */
+#define SPI_STAT_BUSY     0x01u
+#define SPI_STAT_TX_RDY   0x02u
+#define SPI_STAT_RX_RDY   0x08u
+/* +0x2C DMAGO — stock v1 firmware never writes 1 here (reset only).
+ * Our v2 follows the same convention. */
 #define SPI_DMAGO_OFF   0x2C
+/* +0x34 ERR — error flags. Bootloader `dma_poll_complete` reads this
+ * after every DMA RX completion; bit 2 = transfer error. If set, it
+ * increments an error counter and surfaces nothing to the caller.
+ * We should check this in our AAI pair loop too — a silent DMA error
+ * here could explain the tail-drop we see (silicon writes that never
+ * actually reach the cell). */
+#define SPI_ERR_OFF     0x34
+#define SPI_ERR_XFER    0x04u
 /* +0x4C DMAMD — DMA mode select.
  *   0 = PIO (writes to SPI_DATA)
  *   1 = DMA RX-only
@@ -149,6 +161,7 @@
 #define SPI_CLRINT  (*(volatile uint32_t *)(SPI_BASE + SPI_CLRINT_OFF))
 #define SPI_STAT    (*(volatile uint32_t *)(SPI_BASE + SPI_STAT_OFF))
 #define SPI_DMAGO   (*(volatile uint32_t *)(SPI_BASE + SPI_DMAGO_OFF))
+#define SPI_ERR     (*(volatile uint32_t *)(SPI_BASE + SPI_ERR_OFF))
 #define SPI_DMAMD   (*(volatile uint32_t *)(SPI_BASE + SPI_DMAMD_OFF))
 #define SPI_DMACFG0 (*(volatile uint32_t *)(SPI_BASE + SPI_DMACFG0_OFF))
 #define SPI_DMACFG1 (*(volatile uint32_t *)(SPI_BASE + SPI_DMACFG1_OFF))
@@ -208,6 +221,44 @@
 #define TIMER_CTRL      (*(volatile uint32_t *)(TIMER0_BASE + 0x08))
 #define TIMER_CTRL_RUN  0x80u
 #define TIMER_RELOAD_DEFAULT 500000u   /* stock fw value; ~28ms @ 18MHz tick */
+
+/* ──────────────────────────────────────────────────────────────
+ * Clock / PLL / pin-mux block @ 0xC9000000
+ *
+ * Heavy block with PLL config, peripheral clock enables, and GPIO
+ * alt-function muxes. Full register-level exploration is in
+ * memory/dice3_clock_pll.md; here we only expose the handful our
+ * flash driver touches.
+ *
+ * Writes to this block require a 0xABCD prefix in the UPPER 16 bits
+ * of the written word (e.g. to set +0x34 to 0x4666, write 0xABCD4666).
+ * Without the prefix the write is silently ignored — learned the
+ * hard way during the JTAG bus exploration on 2026-04-13.
+ * ────────────────────────────────────────────────────────────── */
+#define CLOCK_BASE          0xC9000000u
+#define CLOCK_WRITE_KEY     0xABCD0000u
+#define PIN_MUX_SPI_OFF     0x34
+/* Value 0x4666 selects SPI alt-functions on the flash pins. Bootloader
+ * writes this at init time; if the block was partially torn down (e.g.
+ * by our flash driver teardown hitting 0xC9 registers) we may need
+ * to rewrite it before flash ops. */
+#define PIN_MUX_SPI_VALUE   0x4666u
+#define PIN_MUX_SPI         (*(volatile uint32_t *)(CLOCK_BASE + PIN_MUX_SPI_OFF))
+
+/* ──────────────────────────────────────────────────────────────
+ * 0xCB000000 — unlabelled peripheral block ("CB").
+ *
+ * Bootloader `boot_check_and_load` writes 0xCB000400 = 8 early on,
+ * and LED SPI RX path sets something here to 8 during the 4-byte
+ * RX-trigger sequence. Not clear what it gates yet — candidates are:
+ * peripheral clock enable, SPI-to-GPIO routing, or DMA-to-SPI handshake
+ * enable. Likely harmless to leave at 0 for the flash path (hasn't
+ * blocked anything observed), but worth probing if flash ops fail
+ * from a cold boot state.
+ * ────────────────────────────────────────────────────────────── */
+#define PERIPH_CB_BASE      0xCB000000u
+#define PERIPH_CB_CTRL      (*(volatile uint32_t *)(PERIPH_CB_BASE + 0x000))
+#define PERIPH_CB_CTRL_400  (*(volatile uint32_t *)(PERIPH_CB_BASE + 0x400))
 
 /* ──────────────────────────────────────────────────────────────
  * SST25VF016B SPI flash opcodes (datasheet DS20005044C)

@@ -35,6 +35,24 @@
 
 /* ── Lvalue accessors for the fixed SRAM addresses ──────────── */
 #define MBOX      ((struct v2_mailbox *)V2_MBOX_ADDR)
+#define TIM       ((struct v2_timings *)V2_TIMINGS_ADDR)
+
+static void init_timings_if_needed(void) {
+    if (TIM->magic == V2_TIMINGS_MAGIC) return;
+    TIM->aai_pair_fixed_us         = V2_TIM_DEFAULT_AAI_PAIR_FIXED_US;
+    TIM->aai_pair_poll_interval_us = V2_TIM_DEFAULT_AAI_PAIR_POLL_INTERVAL_US;
+    TIM->aai_pair_poll_budget_us   = V2_TIM_DEFAULT_AAI_PAIR_POLL_BUDGET_US;
+    TIM->pre_wrdi_fixed_us         = V2_TIM_DEFAULT_PRE_WRDI_FIXED_US;
+    TIM->pre_wrdi_poll_interval_us = V2_TIM_DEFAULT_PRE_WRDI_POLL_INTERVAL_US;
+    TIM->pre_wrdi_poll_budget_us   = V2_TIM_DEFAULT_PRE_WRDI_POLL_BUDGET_US;
+    TIM->post_wrdi_fixed_us        = V2_TIM_DEFAULT_POST_WRDI_FIXED_US;
+    TIM->post_wrdi_poll_interval_us= V2_TIM_DEFAULT_POST_WRDI_POLL_INTERVAL_US;
+    TIM->post_wrdi_poll_budget_us  = V2_TIM_DEFAULT_POST_WRDI_POLL_BUDGET_US;
+    TIM->erase_fixed_us            = V2_TIM_DEFAULT_ERASE_FIXED_US;
+    TIM->erase_poll_interval_us    = V2_TIM_DEFAULT_ERASE_POLL_INTERVAL_US;
+    TIM->erase_poll_budget_us      = V2_TIM_DEFAULT_ERASE_POLL_BUDGET_US;
+    TIM->magic                     = V2_TIMINGS_MAGIC;
+}
 #define LOG_RING  ((struct v2_log_entry *)V2_LOG_RING_ADDR)
 #define DATA_BUF  ((uint8_t *)V2_DATA_BUF_ADDR)
 
@@ -399,6 +417,13 @@ static void driver_setup(void) {
     REBOOT_VIC_SOFT_CLR   = 0xFFFFFFFFu;
     dwb();
 
+    /* Ensure SPI flash pins are muxed to the SPI controller. Bootloader
+     * normally does this but our teardown may have touched 0xC9 regs
+     * (or we may come up from a TCAT-BOOT recovery state where muxes
+     * are partially set). Write requires the 0xABCD upper-half key. */
+    PIN_MUX_SPI = CLOCK_WRITE_KEY | PIN_MUX_SPI_VALUE;
+    dwb();
+
     spi_reset_clean();
     /* If a previous run left flash in AAI mode, WRDI exits it. Safe
      * to send unconditionally. */
@@ -460,15 +485,34 @@ static int wait_fixed_then_poll(uint32_t fixed_us,
 }
 
 static int aai_pair_wait(uint32_t pair_idx) {
-    /* Pure fixed delay. RDSR polling between pairs turned out to
-     * sometimes drop the flash out of AAI mode after ~73 pairs
-     * (observed 2026-04-17). Datasheet tBP max is 10 µs; use 30 µs
-     * (3× margin). Short AAI runs (< 128 pairs) with this scheme verified
-     * clean; long runs still need the dummy-pair head workaround above. */
-    busy_wait_us(30);
-    if ((pair_idx & 0x3F) == 0)
-        log_put(V2_EVT_AAI_BUSY_FAST, (uint16_t)pair_idx, 0);
-    return 0;
+    /* Fixed prologue (always) + optional RDSR poll (only if budget>0).
+     * RDSR between AAI pairs drops the chip out of AAI on this part —
+     * confirmed 2026-04-18 via aai_pair_poll_budget_us>0 timing test.
+     * Host can still opt in when debugging tunings. */
+    uint32_t fixed    = TIM->aai_pair_fixed_us;
+    uint32_t interval = TIM->aai_pair_poll_interval_us;
+    uint32_t budget   = TIM->aai_pair_poll_budget_us;
+    if (fixed) busy_wait_us(fixed);
+    if (budget == 0) {
+        if ((pair_idx & 0x3F) == 0)
+            log_put(V2_EVT_AAI_BUSY_FAST, (uint16_t)pair_idx, 0);
+        return 0;
+    }
+    uint8_t sr = rdsr();
+    if (sr != 0xFF && !(sr & SST_SR_BUSY)) {
+        if ((pair_idx & 0x3F) == 0)
+            log_put(V2_EVT_AAI_BUSY_FAST, (uint16_t)pair_idx, sr);
+        return 0;
+    }
+    log_put(V2_EVT_AAI_BUSY_POLL, (uint16_t)pair_idx, sr);
+    for (uint32_t t = 0; t < budget; t += interval) {
+        busy_wait_us(interval);
+        sr = rdsr();
+        if (sr != 0xFF && !(sr & SST_SR_BUSY))
+            return 0;
+    }
+    log_put(V2_EVT_TIMEOUT, (uint16_t)pair_idx, sr);
+    return -1;
 }
 
 static int do_bp_clear(void) {
@@ -498,6 +542,13 @@ static int do_bp_clear(void) {
 static int do_erase_any(uint32_t spi_addr, uint8_t opcode) {
     set_phase(V2_PHASE_ERASE_WREN);
     spi_reset_clean();
+    /* Give the chip a moment to settle after whatever came before
+     * (often a VERIFY bidir-DMA read). Without this, back-to-back
+     * BE_64K ops wedged at pair_idx >=16128 on 2026-04-18 — chip
+     * started returning 0xFF to RDSR for 400+ms (observed as
+     * V2_ERR_ERASE_TIMEOUT at err_spi_addr=0x70000 after 0x60000
+     * programmed cleanly). */
+    busy_wait_us(500);
     if (spi_cmd1(SST_CMD_WREN) != 0) {
         set_error(V2_ERR_ERASE_WREN, spi_addr, 0);
         return -1;
@@ -517,13 +568,10 @@ static int do_erase_any(uint32_t spi_addr, uint8_t opcode) {
 
     set_phase(V2_PHASE_ERASE_POLL);
     uint8_t sr = 0xFF;
-    /* Datasheet tSE == tBE32 == tBE64 == 25 ms max; observed ~55 ms on
-     * this part for 4 KB SE. Block erases typically same-order. Wait
-     * 55 ms fixed then RDSR slack. Polling mid-busy adds dma_rx
-     * overhead (~5 ms per failed sample), so the fixed-wait is both
-     * faster and more predictable. */
-    busy_wait_us(55000);
-    if (wait_fixed_then_poll(0, 2000, 30000, &sr) != 0) {
+    /* Erase wait (tunable via TIM->erase_*). */
+    busy_wait_us(TIM->erase_fixed_us);
+    if (wait_fixed_then_poll(0, TIM->erase_poll_interval_us,
+                             TIM->erase_poll_budget_us, &sr) != 0) {
         set_error(V2_ERR_ERASE_TIMEOUT, spi_addr, sr);
         return -1;
     }
@@ -559,18 +607,74 @@ static int do_erase_block_64k(uint32_t spi_addr) {
     return do_erase_any(spi_addr, SST_CMD_BE_64K);
 }
 
+/* SST25VF016B AAI silicon appears to corrupt the last ~3 bytes when a
+ * single AAI run exceeds 32 KB (observed 2026-04-18: 4 KB, 32 KB clean;
+ * 64 KB reliably wrong at offsets 0xFFFD/0xFFFE/0xFFFF with values that
+ * look like the target AND'd with some stale mask). Cap each AAI burst
+ * at 32 KB; larger spans are split into multiple back-to-back runs
+ * (each with its own WREN + first-pair + WRDI). */
+/* Long AAI runs (≥32 KB) silently drop the last 2 pairs on this part
+ * (observed 2026-04-18). Short AAI runs commit cleanly. Compromise:
+ * do_aai_program issues the bulk as one big run minus the final 4 bytes,
+ * then a separate tiny 4-byte AAI run for those last 4 bytes — short
+ * runs don't trigger the quirk. Total overhead per big run: one extra
+ * WREN + AAI_FIRST + 2 pairs + WRDI ≈ ~100 µs. */
+#define AAI_MAX_RUN 0x8000u
+#define AAI_TAIL_SPLIT 4u
+
+static int do_aai_program_run(uint32_t spi_addr, const uint8_t *data, uint32_t len);
+
+/* Byte-program a single byte at spi_addr. Used to patch the 4-byte tail
+ * of each AAI run, which AAI silently drops on this silicon. */
+static int do_byte_program(uint32_t spi_addr, uint8_t byte) {
+    log_put(V2_EVT_AAI_WREN, byte, spi_addr);
+    spi_reset_clean();
+    if (spi_cmd1(SST_CMD_WREN) != 0) {
+        log_put(V2_EVT_BAD_STATE, 0x01, spi_addr);
+        return -1;
+    }
+    busy_wait_us(5);
+    TX_SCRATCH[0] = SST_CMD_BYTE_PRG;
+    TX_SCRATCH[1] = (spi_addr >> 16) & 0xFF;
+    TX_SCRATCH[2] = (spi_addr >> 8) & 0xFF;
+    TX_SCRATCH[3] = spi_addr & 0xFF;
+    TX_SCRATCH[4] = byte;
+    if (dma_tx(TX_SCRATCH, 5, 5000) != 0) {
+        log_put(V2_EVT_BAD_STATE, 0x02, spi_addr);
+        return -1;
+    }
+    log_put(V2_EVT_AAI_PAIR, byte, spi_addr);
+    busy_wait_us(50);
+    uint8_t sr;
+    if (wait_fixed_then_poll(0, 20, 5000, &sr) != 0) {
+        log_put(V2_EVT_TIMEOUT, sr, spi_addr);
+        return -1;
+    }
+    log_put(V2_EVT_AAI_WRDI, sr, spi_addr);
+    return 0;
+}
+
 static int do_aai_program(uint32_t spi_addr, const uint8_t *data, uint32_t len) {
     if (len < 2 || (len & 1)) {
         set_error(V2_ERR_BAD_LENGTH, spi_addr, 0);
         return -1;
     }
-    /* AAI ignores A0 in hardware (writes land at addr & ~1 and addr | 1).
-     * Require explicit even alignment so odd addresses don't silently
-     * truncate. */
     if (spi_addr & 1u) {
         set_error(V2_ERR_BAD_ADDR, spi_addr, 0);
         return -1;
     }
+    uint32_t off = 0;
+    while (off < len) {
+        uint32_t run = len - off;
+        if (run > AAI_MAX_RUN) run = AAI_MAX_RUN;
+        if (do_aai_program_run(spi_addr + off, data + off, run) != 0)
+            return -1;
+        off += run;
+    }
+    return 0;
+}
+
+static int do_aai_program_run(uint32_t spi_addr, const uint8_t *data, uint32_t len) {
 
     set_phase(V2_PHASE_AAI_WREN);
     spi_reset_clean();
@@ -627,20 +731,18 @@ static int do_aai_program(uint32_t spi_addr, const uint8_t *data, uint32_t len) 
     }
 
     set_phase(V2_PHASE_AAI_PAIR);
-    /* Hot pair loop — SPI is already configured from the last dma_tx
-     * (CTRL=0x107, LEN=2, DMAMD=2, CLK=2, DMACFG0=4, DMACFG1=3, EN=0
-     * after dma_tx). Keep SPI_EN across pairs and only reprogram the
-     * DMA channel + toggle CS. Drops the ~3 ms/pair overhead of full
-     * SPI reconfig to ~microseconds.
+    /* Hot pair loop — bidir DMA (CTRL=0x007 / DMAMD=3). ch1 drives TX
+     * (cmd + 2 data bytes), ch0 captures RX into throwaway.
      *
-     * Three slots per pair live in TX_SCRATCH (volatile) so the DMA
-     * channel's SRC pointer doesn't move; only the data bytes change. */
+     * Silicon still drops last 2-4 pairs of each run on this chip; the
+     * host-side post-flash JTAG verify + BYTE_PATCH repair step catches
+     * and fixes those (flash_all with --repair, default on). */
     SPI_EN = 0;
     SPI_CS = 0;
     SPI_DMAGO = 0;
-    SPI_CTRL = 0x107;
-    SPI_LEN = 2;                 /* 3 bytes on the wire per sub-pair */
-    SPI_DMAMD = 2;
+    SPI_CTRL = 0x007;
+    SPI_LEN = 2;
+    SPI_DMAMD = 3;
     SPI_CLK = 2;
     SPI_DMACFG0 = 4;
     SPI_DMACFG1 = 3;
@@ -648,38 +750,47 @@ static int do_aai_program(uint32_t spi_addr, const uint8_t *data, uint32_t len) 
     SPI_EN = 1;
     dwb();
 
-    DMA_EN = 1;
+    DMA_EN = 3;
     dwb();
-    /* Preload the channel registers that don't change. SRC, CFG, TRG
-     * get touched per pair; DST, NXT are set once. */
-    DMA_CHREG(0, 0x04) = SPI_TX_PORT;
+    DMA_CHREG(0, 0x04) = (uint32_t)(uintptr_t)RX_SCRATCH;
     DMA_CHREG(0, 0x08) = 0;
+    DMA_CHREG(1, 0x04) = SPI_TX_PORT;
+    DMA_CHREG(1, 0x08) = 0;
     dwb();
 
-    TX_SCRATCH[0] = SST_CMD_AAI;       /* stays 0xAD for every pair */
+    TX_SCRATCH[0] = SST_CMD_AAI;
     dwb();
 
-    for (uint32_t i = 0; i < len; i += 2) {
-        TX_SCRATCH[1] = data[i];
-        TX_SCRATCH[2] = data[i + 1];
+    uint32_t total_bytes = len + 8;
+    for (uint32_t i = 0; i < total_bytes; i += 2) {
+        TX_SCRATCH[1] = (i     < len) ? data[i]     : 0xFF;
+        TX_SCRATCH[2] = (i + 1 < len) ? data[i + 1] : 0xFF;
         dwb();
 
-        DMA_ICLR = 1;
+        DMA_ICLR = 3;
         DMA_CHCLR(0) = 1;
+        DMA_CHCLR(1) = 1;
+
         DMA_CHREG(0, 0x10) = 0;
-        DMA_CHREG(0, 0x00) = (uint32_t)(uintptr_t)TX_SCRATCH;
-        DMA_CHREG(0, 0x0C) = 3u | DMA_CFG_TX;
+        DMA_CHREG(0, 0x00) = SPI_RX_PORT;
+        DMA_CHREG(0, 0x04) = (uint32_t)(uintptr_t)RX_SCRATCH;
+        DMA_CHREG(0, 0x08) = 0;
+        DMA_CHREG(0, 0x0C) = 3u | DMA_CFG_RX;
+        DMA_CHREG(1, 0x10) = 0;
+        DMA_CHREG(1, 0x00) = (uint32_t)(uintptr_t)TX_SCRATCH;
+        DMA_CHREG(1, 0x04) = SPI_TX_PORT;
+        DMA_CHREG(1, 0x08) = 0;
+        DMA_CHREG(1, 0x0C) = 3u | DMA_CFG_TX;
         dwb();
-        DMA_CHREG(0, 0x10) = DMA_TRG_TX;
+
+        DMA_CHREG(0, 0x10) = DMA_TRG_RX;
+        DMA_CHREG(1, 0x10) = DMA_TRG_TX;
         dwb();
 
         SPI_CS = 1;
         SPI_CLRINT = 0;
         dwb();
 
-        /* Tight poll — at ~25 MHz CPU each iter is ~10 cycles, so
-         * 20000 iters ≈ 8 ms which is well over the datasheet
-         * combined transfer+tBP window. */
         int spun = 0;
         while (!(DMA_ISTAT & 1)) {
             if (++spun > 20000) {
@@ -697,13 +808,17 @@ static int do_aai_program(uint32_t spi_addr, const uint8_t *data, uint32_t len) 
                 return -1;
             }
         }
+        /* Bootloader always reads SPI_ERR after DMA completion — bit 2
+         * is the transfer-error flag. Log any non-zero value we see so
+         * we can correlate with the observed tail drops. */
+        uint32_t err = SPI_ERR;
+        if (err != 0) {
+            log_put(V2_EVT_BAD_STATE, (uint16_t)err, spi_addr + i);
+        }
         SPI_CS = 0;
         dwb();
 
-        /* Fixed tBP delay before the next pair. Datasheet max 10 µs;
-         * 12 µs gives 20 % margin and shaves 37 ms off a 4 KB sector
-         * vs 30 µs. */
-        busy_wait_us(12);
+        busy_wait_us(TIM->aai_pair_fixed_us);
 
         if ((i & 0x1FF) == 0) {
             MBOX->phase_detail = i >> 1;
@@ -712,16 +827,29 @@ static int do_aai_program(uint32_t spi_addr, const uint8_t *data, uint32_t len) 
         }
     }
 
-    /* Clean teardown of DMA + SPI now that the pair loop is done. */
     SPI_CS = 0;
     SPI_EN = 0;
     DMA_EN = 0;
     DMA_ICLR = 3;
     dwb();
 
+    /* Pre-WRDI settle (tunable via TIM->pre_wrdi_*). */
+    {
+        uint8_t sr;
+        (void)wait_fixed_then_poll(TIM->pre_wrdi_fixed_us,
+                                   TIM->pre_wrdi_poll_interval_us,
+                                   TIM->pre_wrdi_poll_budget_us, &sr);
+    }
+
     set_phase(V2_PHASE_AAI_WRDI);
     (void)spi_cmd1(SST_CMD_WRDI);
-    (void)wait_not_busy(1000, (uint8_t *)0);
+    /* Post-WRDI settle (tunable via TIM->post_wrdi_*). */
+    {
+        uint8_t sr;
+        (void)wait_fixed_then_poll(TIM->post_wrdi_fixed_us,
+                                   TIM->post_wrdi_poll_interval_us,
+                                   TIM->post_wrdi_poll_budget_us, &sr);
+    }
     log_put(V2_EVT_AAI_WRDI, 0, spi_addr);
     return 0;
 }
@@ -946,6 +1074,18 @@ static void handle_command(uint32_t cmd) {
         rc = do_verify(MBOX->flash_addr, exp, MBOX->length);
         break;
     }
+    case V2_CMD_BYTE_PATCH: {
+        const uint8_t *src = (const uint8_t *)(uintptr_t)MBOX->buf_addr;
+        rc = 0;
+        for (uint32_t k = 0; k < MBOX->length; k++) {
+            if (do_byte_program(MBOX->flash_addr + k, src[k]) != 0) {
+                set_error(V2_ERR_AAI_PAIR_TX, MBOX->flash_addr + k, src[k]);
+                rc = -1;
+                break;
+            }
+        }
+        break;
+    }
     default:
         set_error(V2_ERR_BAD_COMMAND, 0, (uint8_t)cmd);
         MBOX->elapsed_us = now_us() - op_start_us;
@@ -976,6 +1116,7 @@ void do_main(void) {
     MBOX->log_head     = 0;
     MBOX->log_tail     = 0;
     MBOX->build_tag    = 0x56324652u;   /* 'V2FR' marker */
+    init_timings_if_needed();
     dwb();
 
     driver_setup();
