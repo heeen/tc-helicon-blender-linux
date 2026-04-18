@@ -51,7 +51,10 @@ TIMING_FIELDS = (
     "erase_fixed_us",
     "erase_poll_interval_us",
     "erase_poll_budget_us",
+    "xport_mode",
 )
+XPORT_DMA = 0
+XPORT_PIO = 1
 TIMING_DEFAULTS = {
     "aai_pair_fixed_us":          10,
     "aai_pair_poll_interval_us":  5,
@@ -65,6 +68,7 @@ TIMING_DEFAULTS = {
     "erase_fixed_us":             60000,
     "erase_poll_interval_us":     2000,
     "erase_poll_budget_us":       500000,
+    "xport_mode":                 XPORT_DMA,
 }
 
 MAGIC_CMD = 0x4D324657  # 'M2FW'
@@ -750,6 +754,11 @@ def main():
                         f"Unset fields use the on-device defaults.")
     p.add_argument("--show-timings", action="store_true",
                    help="Print the active on-device timings and exit.")
+    p.add_argument("--xport", choices=("dma", "pio"), default=None,
+                   help="Select AAI hot-loop transport backend on the "
+                        "driver (dma = current; pio = byte-by-byte DATA "
+                        "register writes). Diagnostic lever for isolating "
+                        "DMA-engine drops from silicon-level drops.")
     args = p.parse_args()
 
     if not DRIVER_BIN.exists():
@@ -766,6 +775,8 @@ def main():
             raise SystemExit(f"unknown --timing field {name!r}; "
                              f"known: {list(TIMING_DEFAULTS)}")
         timing_overrides[name] = int(val.strip(), 0)
+    if args.xport is not None:
+        timing_overrides["xport_mode"] = XPORT_PIO if args.xport == "pio" else XPORT_DMA
 
     ocd = OpenOCD(speed=args.speed)
     try:

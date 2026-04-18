@@ -51,6 +51,7 @@ static void init_timings_if_needed(void) {
     TIM->erase_fixed_us            = V2_TIM_DEFAULT_ERASE_FIXED_US;
     TIM->erase_poll_interval_us    = V2_TIM_DEFAULT_ERASE_POLL_INTERVAL_US;
     TIM->erase_poll_budget_us      = V2_TIM_DEFAULT_ERASE_POLL_BUDGET_US;
+    TIM->xport_mode                = V2_TIM_DEFAULT_XPORT_MODE;
     TIM->magic                     = V2_TIMINGS_MAGIC;
 }
 #define LOG_RING  ((struct v2_log_entry *)V2_LOG_RING_ADDR)
@@ -654,6 +655,32 @@ static int do_byte_program(uint32_t spi_addr, uint8_t byte) {
     return 0;
 }
 
+/* ── AAI transport vtable (diagnostic: DMA vs PIO) ───────────
+ *
+ * The AAI hot pair loop is abstracted behind this vtable so we can swap
+ * between DMA (current path) and PIO (byte-by-byte DATA register writes)
+ * at runtime without recompiling. Helps us isolate whether the observed
+ * tail drops originate in the SPI DMA engine or in the flash silicon.
+ * Short commands (WREN, WRDI, erase, byte-program) still go through the
+ * existing DMA helpers — they aren't in the drop signal path.
+ * ─────────────────────────────────────────────────────────────── */
+typedef struct {
+    /* Begin an AAI run. Sends AAI_FIRST (6 bytes: 0xAD + 3-byte addr
+     * + 2 dummy FF) and the 2nd dummy pair (3 bytes: 0xAD FF FF).
+     * Leaves the controller configured and ready for aai_pair(). */
+    int  (*aai_begin)(uint32_t spi_addr);
+    /* Send one AAI subsequent pair (3 bytes: 0xAD + d0 + d1) as a
+     * single CS cycle. `pair_idx` is the 0-based pair index for logs. */
+    int  (*aai_pair)(uint8_t d0, uint8_t d1, uint32_t pair_idx,
+                     uint32_t spi_addr_for_log);
+    /* Tear down after the last pair: CS=0, EN=0, DMA idle. */
+    void (*aai_end)(void);
+} spi_xport_t;
+
+static const spi_xport_t xport_dma;
+static const spi_xport_t xport_pio;
+static const spi_xport_t *XPORT = &xport_dma;
+
 static int do_aai_program(uint32_t spi_addr, const uint8_t *data, uint32_t len) {
     if (len < 2 || (len & 1)) {
         set_error(V2_ERR_BAD_LENGTH, spi_addr, 0);
@@ -674,69 +701,30 @@ static int do_aai_program(uint32_t spi_addr, const uint8_t *data, uint32_t len) 
     return 0;
 }
 
-static int do_aai_program_run(uint32_t spi_addr, const uint8_t *data, uint32_t len) {
+/* ─── xport_dma: current DMA-based AAI backend ──────────────── */
 
-    set_phase(V2_PHASE_AAI_WREN);
-    spi_reset_clean();
-    if (spi_cmd1(SST_CMD_WREN) != 0) {
-        set_error(V2_ERR_AAI_WREN, spi_addr, 0);
-        return -1;
-    }
-    /* Do NOT verify WEL via rdsr here — the dma_rx mode switch right
-     * after a dma_tx is flaky on this controller (observed 2026-04-17:
-     * 5 ms timeouts). If WREN didn't take, the first AAI pair will fail
-     * and the post-program verify will catch any silent failure. */
-    busy_wait_us(10);   /* tiny settle before the next TX */
-    log_put(V2_EVT_AAI_WREN, 0, spi_addr);
-
-    /* Silicon quirk (observed 2026-04-17): the first TWO AAI pairs after
-     * a sector erase are silently dropped AND the internal address
-     * pointer does NOT advance. Subsequent pairs then start writing at
-     * the target address. Compensate by sending two dummy 0xFF pairs
-     * first — 0xFF is a no-op on erased flash even if one happens to
-     * commit, and if they drop (expected) the real data still lands at
-     * the correct offset. Costs ~60 ms per sector. */
+static int xport_dma_aai_begin(uint32_t spi_addr) {
+    /* Send AAI_FIRST (6 bytes: cmd + 3 addr + 2 dummy FF) via a short
+     * DMA TX. This matches the historical v2 behavior. */
     set_phase(V2_PHASE_AAI_FIRST);
     TX_SCRATCH[0] = SST_CMD_AAI;
     TX_SCRATCH[1] = (spi_addr >> 16) & 0xFF;
     TX_SCRATCH[2] = (spi_addr >> 8) & 0xFF;
     TX_SCRATCH[3] = spi_addr & 0xFF;
-    TX_SCRATCH[4] = 0xFF;   /* dummy */
-    TX_SCRATCH[5] = 0xFF;   /* dummy */
-    if (dma_tx(TX_SCRATCH, 6, 5000) != 0) {
-        (void)spi_cmd1(SST_CMD_WRDI);
-        set_error(V2_ERR_AAI_FIRST_TX, spi_addr, 0);
-        return -1;
-    }
+    TX_SCRATCH[4] = 0xFF;
+    TX_SCRATCH[5] = 0xFF;
+    if (dma_tx(TX_SCRATCH, 6, 5000) != 0) return -1;
     log_put(V2_EVT_AAI_FIRST, 0, spi_addr);
-    if (aai_pair_wait(0) != 0) {
-        (void)spi_cmd1(SST_CMD_WRDI);
-        set_error(V2_ERR_AAI_PAIR_TIMEOUT, spi_addr, (uint8_t)MBOX->last_sr);
-        return -1;
-    }
+    if (aai_pair_wait(0) != 0) return -1;
 
     /* Second dummy pair — subsequent-pair form (3 bytes). */
     TX_SCRATCH[0] = SST_CMD_AAI;
     TX_SCRATCH[1] = 0xFF;
     TX_SCRATCH[2] = 0xFF;
-    if (dma_tx(TX_SCRATCH, 3, 5000) != 0) {
-        (void)spi_cmd1(SST_CMD_WRDI);
-        set_error(V2_ERR_AAI_PAIR_TX, spi_addr, 0);
-        return -1;
-    }
-    if (aai_pair_wait(1) != 0) {
-        (void)spi_cmd1(SST_CMD_WRDI);
-        set_error(V2_ERR_AAI_PAIR_TIMEOUT, spi_addr, (uint8_t)MBOX->last_sr);
-        return -1;
-    }
+    if (dma_tx(TX_SCRATCH, 3, 5000) != 0) return -1;
+    if (aai_pair_wait(1) != 0) return -1;
 
-    set_phase(V2_PHASE_AAI_PAIR);
-    /* Hot pair loop — bidir DMA (CTRL=0x007 / DMAMD=3). ch1 drives TX
-     * (cmd + 2 data bytes), ch0 captures RX into throwaway.
-     *
-     * Silicon still drops last 2-4 pairs of each run on this chip; the
-     * host-side post-flash JTAG verify + BYTE_PATCH repair step catches
-     * and fixes those (flash_all with --repair, default on). */
+    /* Configure the controller for the bidir DMA hot loop. */
     SPI_EN = 0;
     SPI_CS = 0;
     SPI_DMAGO = 0;
@@ -760,66 +748,211 @@ static int do_aai_program_run(uint32_t spi_addr, const uint8_t *data, uint32_t l
 
     TX_SCRATCH[0] = SST_CMD_AAI;
     dwb();
+    return 0;
+}
 
+static int xport_dma_aai_pair(uint8_t d0, uint8_t d1, uint32_t pair_idx,
+                              uint32_t spi_addr_for_log) {
+    TX_SCRATCH[1] = d0;
+    TX_SCRATCH[2] = d1;
+    dwb();
+
+    DMA_ICLR = 3;
+    DMA_CHCLR(0) = 1;
+    DMA_CHCLR(1) = 1;
+
+    DMA_CHREG(0, 0x10) = 0;
+    DMA_CHREG(0, 0x00) = SPI_RX_PORT;
+    DMA_CHREG(0, 0x04) = (uint32_t)(uintptr_t)RX_SCRATCH;
+    DMA_CHREG(0, 0x08) = 0;
+    DMA_CHREG(0, 0x0C) = 3u | DMA_CFG_RX;
+    DMA_CHREG(1, 0x10) = 0;
+    DMA_CHREG(1, 0x00) = (uint32_t)(uintptr_t)TX_SCRATCH;
+    DMA_CHREG(1, 0x04) = SPI_TX_PORT;
+    DMA_CHREG(1, 0x08) = 0;
+    DMA_CHREG(1, 0x0C) = 3u | DMA_CFG_TX;
+    dwb();
+
+    DMA_CHREG(0, 0x10) = DMA_TRG_RX;
+    DMA_CHREG(1, 0x10) = DMA_TRG_TX;
+    dwb();
+
+    SPI_CS = 1;
+    SPI_CLRINT = 0;
+    dwb();
+
+    int spun = 0;
+    while (!(DMA_ISTAT & 1)) {
+        if (++spun > 20000) { dma_abort(); return -1; }
+    }
+    while (SPI_STAT & SPI_STAT_BUSY) {
+        if (++spun > 30000) { dma_abort(); return -1; }
+    }
+    /* SPI_ERR bit 2 = transfer error (bootloader pattern). */
+    uint32_t err = SPI_ERR;
+    if (err != 0)
+        log_put(V2_EVT_BAD_STATE, (uint16_t)err, spi_addr_for_log);
+    SPI_CS = 0;
+    dwb();
+
+    busy_wait_us(TIM->aai_pair_fixed_us);
+    (void)pair_idx;
+    return 0;
+}
+
+static void xport_dma_aai_end(void) {
+    SPI_CS = 0;
+    SPI_EN = 0;
+    DMA_EN = 0;
+    DMA_ICLR = 3;
+    dwb();
+}
+
+static const spi_xport_t xport_dma = {
+    .aai_begin = xport_dma_aai_begin,
+    .aai_pair  = xport_dma_aai_pair,
+    .aai_end   = xport_dma_aai_end,
+};
+
+/* ─── xport_pio: byte-by-byte DATA-register backend ───────────
+ *
+ * WARNING (2026-04-18): PIO TX on the flash SPI controller (0xCC) does
+ * not clock bytes reliably. v1's `pio_cmd1` uses `dma_tx` internally
+ * despite the misleading name, and a commit-time note in v1
+ * (sram_flash_driver.c:267-270) documents that "genuine PIO was tried
+ * and the WREN silently fails on the stock firmware path." Matches what
+ * we see here: this AAI-via-PIO path compiles, completes its spin
+ * loops, leaves last_sr=0xFF and writes nothing to flash. Kept as a
+ * stub for documentation and future debugging; not production-viable.
+ * Use xport_dma for real flashing. */
+
+static int pio_send_bytes(const uint8_t *buf, uint32_t len) {
+    /* Caller must have CS asserted and LEN / EN configured. Pushes each
+     * byte into the DATA register after TX_READY. Returns 0 on success,
+     * -1 on spin-timeout. */
+    for (uint32_t i = 0; i < len; i++) {
+        int spun = 0;
+        while (!(SPI_STAT & SPI_STAT_TX_RDY)) {
+            if (++spun > 20000) return -1;
+        }
+        SPI_DATA = buf[i];
+    }
+    int spun = 0;
+    while (SPI_STAT & SPI_STAT_BUSY) {
+        if (++spun > 30000) return -1;
+    }
+    return 0;
+}
+
+static int pio_cs_cycle(const uint8_t *buf, uint32_t len) {
+    /* Full CS cycle + PIO burst for a short transfer (up to TX_SCRATCH_MAX
+     * bytes). Reconfigures the controller each call so we can interleave
+     * with other modes cleanly. */
+    while (SPI_STAT & SPI_STAT_BUSY) {}
+    SPI_EN = 0;
+    SPI_CS = 0;
+    SPI_DMAGO = 0;
+    SPI_DMAMD = 0;
+    SPI_CTRL = 0x207;            /* PIO TX (v1 validated value) */
+    SPI_LEN = len - 1;
+    SPI_CLK = 2;
+    dwb();
+    SPI_EN = 1;
+    SPI_CS = 1;
+    SPI_CLRINT = 0;
+    dwb();
+
+    int rc = pio_send_bytes(buf, len);
+
+    SPI_CS = 0;
+    SPI_EN = 0;
+    dwb();
+    return rc;
+}
+
+static int xport_pio_aai_begin(uint32_t spi_addr) {
+    set_phase(V2_PHASE_AAI_FIRST);
+    TX_SCRATCH[0] = SST_CMD_AAI;
+    TX_SCRATCH[1] = (uint8_t)(spi_addr >> 16);
+    TX_SCRATCH[2] = (uint8_t)(spi_addr >> 8);
+    TX_SCRATCH[3] = (uint8_t)spi_addr;
+    TX_SCRATCH[4] = 0xFF;
+    TX_SCRATCH[5] = 0xFF;
+    if (pio_cs_cycle((const uint8_t *)TX_SCRATCH, 6) != 0) return -1;
+    log_put(V2_EVT_AAI_FIRST, 0, spi_addr);
+    if (aai_pair_wait(0) != 0) return -1;
+
+    TX_SCRATCH[0] = SST_CMD_AAI;
+    TX_SCRATCH[1] = 0xFF;
+    TX_SCRATCH[2] = 0xFF;
+    if (pio_cs_cycle((const uint8_t *)TX_SCRATCH, 3) != 0) return -1;
+    if (aai_pair_wait(1) != 0) return -1;
+
+    /* Leave SPI off/idle — each aai_pair call configures fresh. */
+    return 0;
+}
+
+static int xport_pio_aai_pair(uint8_t d0, uint8_t d1, uint32_t pair_idx,
+                              uint32_t spi_addr_for_log) {
+    TX_SCRATCH[0] = SST_CMD_AAI;
+    TX_SCRATCH[1] = d0;
+    TX_SCRATCH[2] = d1;
+    if (pio_cs_cycle((const uint8_t *)TX_SCRATCH, 3) != 0) return -1;
+    busy_wait_us(TIM->aai_pair_fixed_us);
+    (void)pair_idx; (void)spi_addr_for_log;
+    return 0;
+}
+
+static void xport_pio_aai_end(void) {
+    SPI_CS = 0;
+    SPI_EN = 0;
+    dwb();
+}
+
+static const spi_xport_t xport_pio = {
+    .aai_begin = xport_pio_aai_begin,
+    .aai_pair  = xport_pio_aai_pair,
+    .aai_end   = xport_pio_aai_end,
+};
+
+/* ─── do_aai_program_run: xport-dispatched ──────────────────── */
+
+static int do_aai_program_run(uint32_t spi_addr, const uint8_t *data, uint32_t len) {
+
+    set_phase(V2_PHASE_AAI_WREN);
+    spi_reset_clean();
+    if (spi_cmd1(SST_CMD_WREN) != 0) {
+        set_error(V2_ERR_AAI_WREN, spi_addr, 0);
+        return -1;
+    }
+    busy_wait_us(10);
+    log_put(V2_EVT_AAI_WREN, 0, spi_addr);
+
+    /* Silicon quirk: first 2 AAI pairs drop on this part. Both our DMA
+     * and PIO backends handle the 2 dummy-FF prefix internally via
+     * aai_begin(). Data starts at logical addr+0. */
+    if (XPORT->aai_begin(spi_addr) != 0) {
+        (void)spi_cmd1(SST_CMD_WRDI);
+        set_error(V2_ERR_AAI_FIRST_TX, spi_addr, 0);
+        return -1;
+    }
+
+    set_phase(V2_PHASE_AAI_PAIR);
+
+    /* Write `len` real data bytes + 8 trailing dummy FF bytes. The tail
+     * pad absorbs the symmetric "last 2 pairs drop" silicon quirk where
+     * possible. Remaining tail drops are fixed by the host-side verify +
+     * BYTE_PATCH repair step (flash_all --repair). */
     uint32_t total_bytes = len + 8;
     for (uint32_t i = 0; i < total_bytes; i += 2) {
-        TX_SCRATCH[1] = (i     < len) ? data[i]     : 0xFF;
-        TX_SCRATCH[2] = (i + 1 < len) ? data[i + 1] : 0xFF;
-        dwb();
-
-        DMA_ICLR = 3;
-        DMA_CHCLR(0) = 1;
-        DMA_CHCLR(1) = 1;
-
-        DMA_CHREG(0, 0x10) = 0;
-        DMA_CHREG(0, 0x00) = SPI_RX_PORT;
-        DMA_CHREG(0, 0x04) = (uint32_t)(uintptr_t)RX_SCRATCH;
-        DMA_CHREG(0, 0x08) = 0;
-        DMA_CHREG(0, 0x0C) = 3u | DMA_CFG_RX;
-        DMA_CHREG(1, 0x10) = 0;
-        DMA_CHREG(1, 0x00) = (uint32_t)(uintptr_t)TX_SCRATCH;
-        DMA_CHREG(1, 0x04) = SPI_TX_PORT;
-        DMA_CHREG(1, 0x08) = 0;
-        DMA_CHREG(1, 0x0C) = 3u | DMA_CFG_TX;
-        dwb();
-
-        DMA_CHREG(0, 0x10) = DMA_TRG_RX;
-        DMA_CHREG(1, 0x10) = DMA_TRG_TX;
-        dwb();
-
-        SPI_CS = 1;
-        SPI_CLRINT = 0;
-        dwb();
-
-        int spun = 0;
-        while (!(DMA_ISTAT & 1)) {
-            if (++spun > 20000) {
-                dma_abort();
-                (void)spi_cmd1(SST_CMD_WRDI);
-                set_error(V2_ERR_AAI_PAIR_TX, spi_addr + i, 0);
-                return -1;
-            }
+        uint8_t d0 = (i     < len) ? data[i]     : 0xFF;
+        uint8_t d1 = (i + 1 < len) ? data[i + 1] : 0xFF;
+        if (XPORT->aai_pair(d0, d1, i >> 1, spi_addr + i) != 0) {
+            XPORT->aai_end();
+            (void)spi_cmd1(SST_CMD_WRDI);
+            set_error(V2_ERR_AAI_PAIR_TX, spi_addr + i, 0);
+            return -1;
         }
-        while (SPI_STAT & SPI_STAT_BUSY) {
-            if (++spun > 30000) {
-                dma_abort();
-                (void)spi_cmd1(SST_CMD_WRDI);
-                set_error(V2_ERR_AAI_PAIR_TX, spi_addr + i, 0);
-                return -1;
-            }
-        }
-        /* Bootloader always reads SPI_ERR after DMA completion — bit 2
-         * is the transfer-error flag. Log any non-zero value we see so
-         * we can correlate with the observed tail drops. */
-        uint32_t err = SPI_ERR;
-        if (err != 0) {
-            log_put(V2_EVT_BAD_STATE, (uint16_t)err, spi_addr + i);
-        }
-        SPI_CS = 0;
-        dwb();
-
-        busy_wait_us(TIM->aai_pair_fixed_us);
-
         if ((i & 0x1FF) == 0) {
             MBOX->phase_detail = i >> 1;
             MBOX->seq++;
@@ -827,11 +960,7 @@ static int do_aai_program_run(uint32_t spi_addr, const uint8_t *data, uint32_t l
         }
     }
 
-    SPI_CS = 0;
-    SPI_EN = 0;
-    DMA_EN = 0;
-    DMA_ICLR = 3;
-    dwb();
+    XPORT->aai_end();
 
     /* Pre-WRDI settle (tunable via TIM->pre_wrdi_*). */
     {
@@ -1117,6 +1246,10 @@ void do_main(void) {
     MBOX->log_tail     = 0;
     MBOX->build_tag    = 0x56324652u;   /* 'V2FR' marker */
     init_timings_if_needed();
+    /* Latch the AAI transport backend from the timings struct. The
+     * default is DMA; host may set xport_mode=V2_XPORT_PIO before
+     * issuing the first command. */
+    XPORT = (TIM->xport_mode == V2_XPORT_PIO) ? &xport_pio : &xport_dma;
     dwb();
 
     driver_setup();
@@ -1129,6 +1262,8 @@ void do_main(void) {
         uint32_t cmd = MBOX->command;
         /* Accept: clear magic (host re-arms by writing magic again). */
         MBOX->magic = 0;
+        /* Re-latch the AAI xport — host may have toggled between cmds. */
+        XPORT = (TIM->xport_mode == V2_XPORT_PIO) ? &xport_pio : &xport_dma;
         dwb();
 
         handle_command(cmd);

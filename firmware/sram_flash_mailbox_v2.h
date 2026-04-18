@@ -176,9 +176,18 @@ struct v2_timings {
     volatile uint32_t erase_poll_interval_us;
     volatile uint32_t erase_poll_budget_us;
 
+    /* SPI transport backend: 0 = DMA (default), 1 = PIO. Latched once
+     * at driver init; host must set before the first command. Diagnostic
+     * lever for isolating AAI tail drops between SPI DMA engine and the
+     * flash silicon itself. */
+    volatile uint32_t xport_mode;
+
     /* Reserved for growth. */
-    volatile uint32_t reserved[2];
+    volatile uint32_t reserved[1];
 };
+
+#define V2_XPORT_DMA 0u
+#define V2_XPORT_PIO 1u
 
 #define V2_TIMINGS_MAGIC      0x54494D32u  /* 'TIM2' — HOST sets when valid */
 
@@ -196,5 +205,6 @@ struct v2_timings {
 #define V2_TIM_DEFAULT_ERASE_FIXED_US            60000u
 #define V2_TIM_DEFAULT_ERASE_POLL_INTERVAL_US    2000u
 #define V2_TIM_DEFAULT_ERASE_POLL_BUDGET_US      500000u
+#define V2_TIM_DEFAULT_XPORT_MODE                V2_XPORT_DMA
 
 #endif /* SRAM_FLASH_MAILBOX_V2_H */
