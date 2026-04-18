@@ -89,6 +89,7 @@ O_ELAPSED_US   = 0x2C
 O_SEQ          = 0x30
 O_LOG_HEAD     = 0x34
 O_LOG_TAIL     = 0x38
+O_PAIR_RETRIES = 0x3C
 O_BUILD_TAG    = 0x40
 
 STATUS_READY = 0
@@ -613,6 +614,7 @@ def flash_all(client, args):
 
     total_t0 = time.monotonic()
     failed = []
+    total_retries = 0
     for op_idx, (kind, addr, span) in enumerate(ops):
         # Pull the block data from ref.
         data = ref[addr:addr + span]
@@ -622,10 +624,15 @@ def flash_all(client, args):
         else:
             ok = client.flash_block(addr, data)
         dt = time.monotonic() - op_t0
+        # Driver resets pair_retries per command, so snapshot after each op.
+        try: op_retries = client.o.mdw(MBOX_ADDR + O_PAIR_RETRIES)
+        except Exception: op_retries = 0
+        total_retries += op_retries
         label = kind if kind != "sector" else "sector"
         status = "OK" if ok else "FAIL"
+        retry_note = f" retries={op_retries}" if op_retries else ""
         print(f"  [{op_idx+1}/{len(ops)}] {label} 0x{addr:06x} "
-              f"len={span} {status} {dt:.2f}s")
+              f"len={span} {status} {dt:.2f}s{retry_note}")
         if not ok:
             # Mark all sectors covered by this op as failed.
             for s in sectors:
@@ -633,7 +640,8 @@ def flash_all(client, args):
                     failed.append((kind, s))
 
     total = time.monotonic() - total_t0
-    print(f"\n=== flash-all done in {total:.1f}s ===")
+    print(f"\n=== flash-all done in {total:.1f}s, "
+          f"{total_retries} AAI pair retries ===")
     if failed:
         print(f"FAILED ops: {failed}")
         # Keep going — repair step below will catch the dropped bytes.
@@ -676,14 +684,14 @@ def flash_all(client, args):
         print(f"=== repair done: {total_bad} mismatched bytes "
               f"in {repairs} runs, {rdt:.1f}s ===")
         _append_run_stats(args, client, total, rdt, len(ops), len(failed),
-                          total_bad, repairs)
+                          total_bad, repairs, total_retries)
     return 0
 
 
 def _append_run_stats(args, client, flash_s, repair_s, ops, failed_ops,
-                      patched_bytes, repair_runs):
+                      patched_bytes, repair_runs, pair_retries):
     """Append a row to firmware/flash_stats.csv so we can correlate drop
-    counts with timing configs over many runs."""
+    counts + AAI pair retries with timing configs over many runs."""
     import csv, os, datetime
     tim = client.read_timings()
     stats_path = FIRMWARE_DIR / "flash_stats.csv"
@@ -694,8 +702,9 @@ def _append_run_stats(args, client, flash_s, repair_s, ops, failed_ops,
             w.writerow([
                 "timestamp", "ref",
                 "aai_pair_fixed_us", "aai_pair_poll_budget_us",
-                "erase_fixed_us",
-                "ops", "failed_ops", "patched_bytes", "repair_runs",
+                "erase_fixed_us", "xport_mode",
+                "ops", "failed_ops", "pair_retries",
+                "patched_bytes", "repair_runs",
                 "flash_s", "repair_s",
             ])
         w.writerow([
@@ -704,7 +713,9 @@ def _append_run_stats(args, client, flash_s, repair_s, ops, failed_ops,
             tim.get("aai_pair_fixed_us", ""),
             tim.get("aai_pair_poll_budget_us", ""),
             tim.get("erase_fixed_us", ""),
-            ops, failed_ops, patched_bytes, repair_runs,
+            tim.get("xport_mode", ""),
+            ops, failed_ops, pair_retries,
+            patched_bytes, repair_runs,
             f"{flash_s:.1f}", f"{repair_s:.1f}",
         ])
     print(f"  stats appended → {stats_path}")

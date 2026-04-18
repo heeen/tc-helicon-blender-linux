@@ -418,12 +418,12 @@ static void driver_setup(void) {
     REBOOT_VIC_SOFT_CLR   = 0xFFFFFFFFu;
     dwb();
 
-    /* Ensure SPI flash pins are muxed to the SPI controller. Bootloader
-     * normally does this but our teardown may have touched 0xC9 regs
-     * (or we may come up from a TCAT-BOOT recovery state where muxes
-     * are partially set). Write requires the 0xABCD upper-half key. */
-    PIN_MUX_SPI = CLOCK_WRITE_KEY | PIN_MUX_SPI_VALUE;
-    dwb();
+    /* PIN_MUX left untouched. ROM gpio_configure (0x4F090) disassembly
+     * shows pinmux registers at 0xC9000030-0x3C are 8 nibbles × 4 bits
+     * each — one nibble per pin — written via direct RMW (no write key).
+     * A blanket `PIN_MUX_SPI = 0xABCD4666` would clobber 7 unrelated
+     * pins with invalid mux selectors. Whatever code loaded us already
+     * set the muxes correctly; don't touch. */
 
     spi_reset_clean();
     /* If a previous run left flash in AAI mode, WRDI exits it. Safe
@@ -751,12 +751,11 @@ static int xport_dma_aai_begin(uint32_t spi_addr) {
     return 0;
 }
 
-static int xport_dma_aai_pair(uint8_t d0, uint8_t d1, uint32_t pair_idx,
-                              uint32_t spi_addr_for_log) {
-    TX_SCRATCH[1] = d0;
-    TX_SCRATCH[2] = d1;
-    dwb();
-
+/* Core pair transmission: one CS cycle shifting [0xAD, d0, d1] via bidir
+ * DMA. Caller sets TX_SCRATCH[1..2] before calling. Returns the SPI_ERR
+ * value latched right after the DMA/SPI busy drain; 0 == clean.
+ * Returns -1 on spin timeout. */
+static int xport_dma_aai_shift_once(uint32_t *out_err) {
     DMA_ICLR = 3;
     DMA_CHCLR(0) = 1;
     DMA_CHCLR(1) = 1;
@@ -788,12 +787,33 @@ static int xport_dma_aai_pair(uint8_t d0, uint8_t d1, uint32_t pair_idx,
     while (SPI_STAT & SPI_STAT_BUSY) {
         if (++spun > 30000) { dma_abort(); return -1; }
     }
-    /* SPI_ERR bit 2 = transfer error (bootloader pattern). */
-    uint32_t err = SPI_ERR;
-    if (err != 0)
-        log_put(V2_EVT_BAD_STATE, (uint16_t)err, spi_addr_for_log);
+    /* Sample SPI_ERR BEFORE dropping CS — the bit may be cleared by the
+     * next CS assert edge, so sampling after is racy. Bit 2 == transfer
+     * error per bootloader's dma_poll_complete. */
+    *out_err = SPI_ERR;
     SPI_CS = 0;
     dwb();
+    return 0;
+}
+
+static int xport_dma_aai_pair(uint8_t d0, uint8_t d1, uint32_t pair_idx,
+                              uint32_t spi_addr_for_log) {
+    TX_SCRATCH[1] = d0;
+    TX_SCRATCH[2] = d1;
+    dwb();
+
+    /* First attempt. If SPI_ERR flags the transfer-error bit (bit 2 per
+     * bootloader dma_poll_complete @ 0x4F16C-0x4F184), retry up to 3x.
+     * Bit 0 is a benign "transfer happened" flag — fires on every pair,
+     * not a drop indicator. Retry count is mirrored into
+     * MBOX->pair_retries for host visibility. */
+    uint32_t err = 0;
+    for (int attempt = 0; attempt < 4; attempt++) {
+        if (xport_dma_aai_shift_once(&err) != 0) return -1;
+        if ((err & SPI_ERR_XFER) == 0) break;
+        MBOX->pair_retries++;
+        log_put(V2_EVT_BAD_STATE, (uint16_t)err, spi_addr_for_log);
+    }
 
     busy_wait_us(TIM->aai_pair_fixed_us);
     (void)pair_idx;
@@ -1162,6 +1182,7 @@ static void handle_command(uint32_t cmd) {
     MBOX->err_code = V2_ERR_NONE;
     MBOX->err_spi_addr = 0;
     MBOX->phase_detail = 0;
+    MBOX->pair_retries = 0;
     uint32_t op_start_us = now_us();
 
     int rc = -1;

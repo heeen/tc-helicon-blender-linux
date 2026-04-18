@@ -136,7 +136,8 @@ struct v2_mailbox {
     volatile uint32_t seq;            /* +0x30 — monotonic; host polls */
     volatile uint32_t log_head;       /* +0x34 */
     volatile uint32_t log_tail;       /* +0x38 — host's advisory cursor */
-    volatile uint32_t reserved;       /* +0x3C */
+    volatile uint32_t pair_retries;   /* +0x3C — AAI pair SPI_ERR retries,
+                                       * reset per command */
     volatile uint32_t build_tag;      /* +0x40 */
 };
 
