@@ -448,8 +448,9 @@ class FlashClientV2:
         except FileNotFoundError: pass
         print(f"flash_block 0x{spi_addr:06x} (len={len(data_bytes)})...")
         pairs = max(1, len(data_bytes) // 2)
-        # program ~245 µs/pair + erase ~60 ms + verify ~20 ms/KB
-        est_us = pairs * 260 + 60_000 + (len(data_bytes) // 1024) * 20_000
+        tim = self.read_timings()
+        per_pair = max(260, int(tim.get("aai_pair_fixed_us", 20)) + 20_000)
+        est_us = pairs * per_pair + 60_000 + (len(data_bytes) // 1024) * 20_000
         return self._issue(CMD_FLASH_BLOCK, flash_addr=spi_addr,
                            buf_addr=load_addr, length=len(data_bytes),
                            est_us=est_us,
@@ -467,7 +468,11 @@ class FlashClientV2:
         except FileNotFoundError: pass
         print(f"flash_sector 0x{spi_addr:06x} (len={len(data_bytes)})...")
         pairs = max(1, len(data_bytes) // 2)
-        est_us = pairs * 260 + 55_000 + 80_000   # program + erase + verify
+        tim = self.read_timings()
+        # Observed: actual per-pair time ≈ aai_pair_fixed_us + ~20 µs DMA
+        # overhead at 1 MHz JTAG.
+        per_pair = max(260, int(tim.get("aai_pair_fixed_us", 20)) + 20_000)
+        est_us = pairs * per_pair + 55_000 + 80_000   # program + erase + verify
         return self._issue(CMD_FLASH_SECTOR, flash_addr=spi_addr,
                            buf_addr=DATA_BUF_ADDR, length=len(data_bytes),
                            est_us=est_us,
@@ -666,7 +671,39 @@ def flash_all(client, args):
         rdt = time.monotonic() - repair_t0
         print(f"=== repair done: {total_bad} mismatched bytes "
               f"in {repairs} runs, {rdt:.1f}s ===")
+        _append_run_stats(args, client, total, rdt, len(ops), len(failed),
+                          total_bad, repairs)
     return 0
+
+
+def _append_run_stats(args, client, flash_s, repair_s, ops, failed_ops,
+                      patched_bytes, repair_runs):
+    """Append a row to firmware/flash_stats.csv so we can correlate drop
+    counts with timing configs over many runs."""
+    import csv, os, datetime
+    tim = client.read_timings()
+    stats_path = FIRMWARE_DIR / "flash_stats.csv"
+    new_file = not stats_path.exists()
+    with open(stats_path, "a", newline="") as f:
+        w = csv.writer(f)
+        if new_file:
+            w.writerow([
+                "timestamp", "ref",
+                "aai_pair_fixed_us", "aai_pair_poll_budget_us",
+                "erase_fixed_us",
+                "ops", "failed_ops", "patched_bytes", "repair_runs",
+                "flash_s", "repair_s",
+            ])
+        w.writerow([
+            datetime.datetime.now().isoformat(timespec="seconds"),
+            os.path.basename(args.ref),
+            tim.get("aai_pair_fixed_us", ""),
+            tim.get("aai_pair_poll_budget_us", ""),
+            tim.get("erase_fixed_us", ""),
+            ops, failed_ops, patched_bytes, repair_runs,
+            f"{flash_s:.1f}", f"{repair_s:.1f}",
+        ])
+    print(f"  stats appended → {stats_path}")
 
 
 def main():
