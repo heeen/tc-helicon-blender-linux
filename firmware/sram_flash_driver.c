@@ -309,12 +309,11 @@ static int dma_tx(const volatile uint8_t *buf, uint32_t len) {
     SPI_EN = 0;
     SPI_CS = 0;
     SPI_DMAGO = 0;
-    /* CTRL = 0x107 here even though Ghidra decomp suggests 0x1106
-     * (direction TX | flash ctrl_base). Tested 2026-04-17: 0x1106
-     * makes WREN silently fail too (WEL never asserts). The ctrl_base
-     * OR may require co-init of other state our bare-metal driver
-     * doesn't set up. Leave 0x107 — it's what actually works for us,
-     * with the first 3-4 byte-programs dropped as a known regression. */
+    /* CTRL = 0x107. Tried alternatives 2026-04-17 and neither worked:
+     *   0x1106 (TX | ctrl_base w/ IRQ bit): WREN fails entirely
+     *   0x0106 (TX | ctrl_base no IRQ):     WREN/RDSR flaky, needs retries
+     * 0x107 is empirical — first 3-4 byte-programs drop but everything
+     * else works. Head-repair loop in do_write() catches the drop. */
     SPI_CTRL = 0x107;
     SPI_LEN = len - 1;
     SPI_DMAMD = 2;
@@ -344,7 +343,21 @@ static int dma_tx(const volatile uint8_t *buf, uint32_t len) {
 
     for (volatile int i = 0; i < 500000; i++) {
         if (DMA_ISTAT & 1) {
-            SPI_DMAGO = 1;
+            /* Race we used to hit (2026-04-17): DMA_ISTAT fires when DMA has
+             * delivered all bytes to SPI_TX_PORT, but on the cold first
+             * transaction the SPI controller may not have asserted BUSY yet
+             * (FIFO-backed handshake still starting up). A bare
+             * `while (SPI_STAT & 1) {}` then exits immediately and we yank
+             * CS before a single clock has gone out.
+             *
+             * Fix: spin a bounded number of cycles giving BUSY a chance to
+             * assert; then wait for it to deassert. Either condition exits
+             * cleanly (BUSY either never asserts because the transfer is
+             * already fully shifted out in <1 ARM clock, or it asserts and
+             * we do the normal idle-wait). */
+            for (volatile int j = 0; j < 200; j++) {
+                if (SPI_STAT & 1) break;
+            }
             while (SPI_STAT & 1) {}
             SPI_CS = 0;
             SPI_EN = 0;
@@ -385,8 +398,8 @@ static int dma_tx_split_4_1(const volatile uint8_t *cmd4,
     SPI_DMACFG0 = 4;
     SPI_DMACFG1 = 3;
 
-    /* Phase 1: 4-byte command/address, CS held after transfer. */
-    SPI_LEN = 3;                   /* 4 bytes on the wire */
+    /* Phase 1: 4-byte SPI frame, DMA delivers 4 bytes. */
+    SPI_LEN = 3;
     dwb();
     SPI_EN = 1;
     dwb();
@@ -404,34 +417,30 @@ static int dma_tx_split_4_1(const volatile uint8_t *cmd4,
     DMA_CHREG(0, 0x10) = 0xD005;
     dwb();
 
-    SPI_CS = 1;                    /* assert CS — stays asserted across both */
+    SPI_CS = 1;                    /* CS held across both phases */
     SPI_CLRINT = 0;
     dwb();
 
+    /* Wait DMA delivered 4 bytes AND SPI clocked them out. */
     for (volatile int i = 0; i < 500000; i++) {
-        if (DMA_ISTAT & 1) goto phase1_done;
+        if (DMA_ISTAT & 1) goto phase1_dma_done;
     }
     dma_abort_inflight();
     return -1;
 
-phase1_done:
-    /* Let SPI drain TX FIFO but DO NOT deassert CS, DO NOT disable SPI_EN. */
-    SPI_DMAGO = 1;
+phase1_dma_done:
+    for (volatile int j = 0; j < 200; j++) { if (SPI_STAT & 1) break; }
     while (SPI_STAT & 1) {}
-    DMA_EN = 0;
-    DMA_ICLR = 3;
-    DMA_CHCLR(0) = 1;
-    dwb();
 
-    /* Phase 2: 1-byte data with CS still asserted. */
-    SPI_DMAGO = 0;
-    SPI_LEN = 0;                   /* 1 byte on the wire */
-    dwb();
-
-    DMA_EN = 1;
+    /* Phase 2: 1-byte SPI frame, DMA delivers data byte. CS stays asserted.
+     * SPI_EN toggles are the only clean way to retarget SPI_LEN without
+     * forcing a CS drop — but the controller resets CS internally when
+     * SPI_EN goes 1→0. So we keep SPI_EN up and just reprogram LEN. */
     DMA_ICLR = 1;
     DMA_CHCLR(0) = 1;
+    SPI_LEN = 0;                   /* 1 byte */
     dwb();
+
     DMA_CHREG(0, 0x10) = 0;
     DMA_CHREG(0, 0x00) = (uint32_t)(uintptr_t)data1;
     DMA_CHREG(0, 0x04) = SPI_TX_PORT;
@@ -444,7 +453,7 @@ phase1_done:
 
     for (volatile int i = 0; i < 500000; i++) {
         if (DMA_ISTAT & 1) {
-            SPI_DMAGO = 1;
+            for (volatile int j = 0; j < 200; j++) { if (SPI_STAT & 1) break; }
             while (SPI_STAT & 1) {}
             SPI_CS = 0;            /* deassert — commits byte-program */
             SPI_EN = 0;
@@ -821,10 +830,12 @@ static int read_one_byte(uint32_t spi_addr, uint8_t *out) {
 }
 
 static int do_write(uint32_t spi_addr) {
-    /* The very first 3-4 byte-programs after a sector erase silently drop
-     * on our DMA TX path (flash[+0..+3]=0xFF). Flash programs only clear
-     * bits, so re-programming the same value is a no-op once it lands —
-     * repair the first N bytes after the main loop. */
+    /* Byte-program loop (reliable but slow ~30 s/sector). An AAI
+     * word-program path exists at commit cdc031c that did ~38 ms/sector
+     * but depends on PIO TX working in stock-fw mode — attempts to
+     * revive it (2026-04-17) stalled the driver silently. Keep byte
+     * program for now; head-of-sector repair below handles the "first
+     * 3-4 bytes drop" silicon quirk. */
     for (uint32_t i = 0; i < SECTOR_SIZE; i++) {
         spi_reset();
         if (pio_cmd1(SST_CMD_WREN) != 0) {
@@ -890,10 +901,10 @@ static int do_write(uint32_t spi_addr) {
     }
 
     /* Head-of-sector repair: the first 3-4 DMA TX byte-programs after
-     * a sector erase silently drop on this controller. Read the head
-     * back and re-issue any mismatches. Flash bits only transition
-     * 1→0, so re-programming the same value is idempotent. Bounded to
-     * 16 retries total so a genuinely unwritable bit can't spin us. */
+     * a sector erase silently drop on this controller. Split-DMA and
+     * SPI_CTRL experiments didn't solve it (see commit log); the only
+     * working approach is a readback + retry. Flash bits only go 1→0
+     * so re-programming with the same value is idempotent. */
     #define REPAIR_HEAD_BYTES 16
     #define REPAIR_RETRY_LIMIT 16
     for (uint32_t retry = 0; retry < REPAIR_RETRY_LIMIT; retry++) {
@@ -909,7 +920,7 @@ static int do_write(uint32_t spi_addr) {
             }
         }
         if (first_bad == REPAIR_HEAD_BYTES)
-            break;  /* head is clean */
+            break;
         if (retry == REPAIR_RETRY_LIMIT - 1) {
             MBOX->errors = 0xDA31;
             MBOX->last_sr = 0xE0000000 | (first_bad << 16) |
@@ -917,7 +928,6 @@ static int do_write(uint32_t spi_addr) {
                 (uint32_t)READBACK_BUF[first_bad];
             return -1;
         }
-        /* Re-program every mismatched byte in the head window. */
         for (uint32_t i = first_bad; i < REPAIR_HEAD_BYTES; i++) {
             if (READBACK_BUF[i] != DATA_BUF[i]) {
                 if (program_byte(spi_addr + i, DATA_BUF[i]) != 0) {
@@ -1208,9 +1218,9 @@ static int do_flash_step(void) {
 #define REBOOT_TCAT_USBMODE        (*(volatile uint32_t *)(REBOOT_USB_BASE + 0x800))
 #define REBOOT_TCAT_EP_COMP_STATUS (*(volatile uint32_t *)(REBOOT_USB_BASE + 0x818))
 #define REBOOT_TCAT_EP_COMP_ENABLE (*(volatile uint32_t *)(REBOOT_USB_BASE + 0x81C))
-#define REBOOT_TCAT_EP_ASYNC_PRIME (*(volatile uint32_t *)(REBOOT_USB_BASE + 0x834))
-#define REBOOT_TCAT_EP_RX_EN       (*(volatile uint32_t *)(REBOOT_USB_BASE + 0x810))
-#define REBOOT_TCAT_EP_TX_EN       (*(volatile uint32_t *)(REBOOT_USB_BASE + 0x814))
+#define REBOOT_TCAT_EP_ASYNC_PRIME (*(volatile uint32_t *)(REBOOT_USB_BASE + 0x834))  /* IN prime */
+#define REBOOT_TCAT_EP_TX_EN       (*(volatile uint32_t *)(REBOOT_USB_BASE + 0x810))  /* IN/TX enable */
+#define REBOOT_TCAT_EP_RX_EN       (*(volatile uint32_t *)(REBOOT_USB_BASE + 0x814))  /* OUT/RX enable */
 
 #define REBOOT_USBCMD_RS    (1u << 0)
 #define REBOOT_USBCMD_RST   (1u << 1)
@@ -1375,10 +1385,12 @@ void do_main(void) {
     if (pio_cmd1(0x04) != 0)  /* WRDI — safe to send even if not in AAI mode */
         spi_reset();
 
-    mb->status = 0;
-    mb->command = 0;
-    mb->progress = 0;
-    mb->errors = 0;
+    /* Do NOT clobber mb->command / mb->status here — the host writes them
+     * between `o.halt()` and `o.resume()` while this init is mid-flight,
+     * and any late write from here would lose the first command. Only
+     * touch driver-owned scratch. Host already zeroes the mailbox before
+     * loading us. (Bug diagnosed 2026-04-17: driver stuck at cmd-wait
+     * because its own init wiped the just-written flash command.) */
     mb->last_sr = 0;
     SR_TRACE_IDX = 0;
 

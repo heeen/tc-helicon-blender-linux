@@ -1,0 +1,346 @@
+USB EP RX / MIDI bulk OUT — Ghidra (blender_primary_body.bin) reference
+========================================================================
+Source: Ghidra MCP /decompile_function on program blender_primary_body.bin
+Cross-check: scripts/ghidra_uds_query.py --addr 0x... --decompile
+
+Addresses (primary SRAM image — verify in your Ghidra program)
+----------------------------------------------------------------
+usb_endpoint_submit_transfer     0x2077C
+usb_hw_ep_start_transfer         0x2140C   (generic TX path; uses usb_hw_ep_dma_start @ 0x20EAC, NO 0x834)
+usb_hw_ep_dma_start              0x20EAC   (no write to 0x90000834)
+usb_hw_ep_dma_continue           0x217DC
+usb_hw_ep_dma_start_rx           0x21930   (writes QH[0]/QH[4] + ORs 0x90000834 async prime)
+usb_hw_ep_start_transfer_rx      0x21A6C   (RX OUT submit; calls dma_start_rx(ep+0x1C))
+usb_midi_rx_complete             0x1B9E4
+usb_midi_rx_start                0x1BE50
+usb_midi_rx_dispatch             0x1B7F0   (calls usb_endpoint_submit_transfer → start_fn)
+
+Note: A loose *.bin on disk (e.g. blender_primary_fixed.bin) may not match SRAM layout at the
+same numeric offset — disassemble usb_hw_ep_dma_start_rx only from the Ghidra database or JTAG
+dump of running firmware, not from an arbitrary flash dump without a base map.
+
+usb_endpoint_submit_transfer(ep, buf, size, callback, ctx)  @ 0x2077C
+-----------------------------------------------------------------------
+  *(ep+0x08) = callback;     // must be non-zero before start_fn runs
+  *(ep+0x10) = buf;
+  *(ep+0x0C) = ctx;
+  *(ep+0x14) = size;
+  (*(void(**)(void))ep)();    // calls ep->start_fn with NO args
+
+usb_hw_ep_start_transfer_rx(ep)  @ 0x21A6C
+--------------------------------------------
+  if ( (char)*(ep+0x24) != 0x02 ) goto fail_with_minus_16;
+  if ( *(int*)(ep+0x08) == 0 ) goto fail_with_minus_5;
+  if ( *(uint*)(ep+0x10) == 0 ) goto fail_with_minus_5;
+  if ( (*(uint*)(ep+0x10) & 3) != 0 ) goto fail_with_minus_5;   // buffer 4-byte aligned
+  cyg_scheduler_lock();
+  *(ep+0x2C) = *(ep+0x10);      // copy buffer ptr for DMA path
+  *(ep+0x30) = *(ep+0x14);      // copy size
+  usb_hw_ep_dma_start_rx( ep + 0x1C );   // param_1 points at ep->qh_ptr storage
+  // optional sched_lock_dec path if global flag set
+  return;
+fail:  completion_cb(ctx, -5 or -16);
+
+Critical: If ep+0x24 low byte is not exactly 0x02, NO DMA and NO 0x834 prime.
+Critical: If ep+0x08 is NULL, NO DMA (error -5).
+
+usb_midi_rx_start(ep, num_cables)  @ 0x1BE50
+--------------------------------------------
+  cyg_scheduler_lock();
+  reset midi_pkt_buf counters; store ep in midi_pkt_buf+0x208; set cable count;
+  if ( num_cables != 0 && *(int*)(ep+0x08) == 0 )
+      usb_midi_rx_dispatch();   // only when completion callback is clear
+  cyg_scheduler_unlock();
+
+So a re-arm typically needs complete_fn cleared so dispatch runs. usb_endpoint_submit_transfer
+then sets complete_fn before invoking start_fn — the trace hook sees non-zero +0x08 if dispatch ran.
+
+usb_hw_ep_dma_start_rx(param_1)  @ 0x21930  (param_1 = &ep->qh_ptr, i.e. ep+0x1C)
+---------------------------------------------------------------------------------
+  Clears/patches overlay fields; sets internal state byte at (param_1+2) as uint32_t* math;
+  On main path (state 3): uses param_1[5] (→ ep+0x30 size), param_1[6] (→ ep+0x34),
+  *(ushort*)(param_1+8 words) at ep+0x3C for MPS, puVar5 = *param_1 = QH pointer;
+  Updates QH words 0 and 4 (active + length/mult), then if transfer chunk uVar4 != 0:
+      *(uint32_t*)0x90000834 |= 1 << (shift from ep layout — see disasm, not only decompiler cast).
+
+Disassembly of 0x21930 must be taken from Ghidra listing; decompiler mixes byte vs uint32* for
+(param_1+k) in a few places.
+
+Next debugging candidates (hardware / JTAG)
+-------------------------------------------
+1) Halt + jtag_dump_epv.py --decode @ 0x2A7E8: confirm ep+0x08, ep+0x10, (ep+0x10)&3, (char)(ep+0x24).
+
+2) If +0x08 is zero when start_fn runs, trace why usb_midi_rx_dispatch did not run (cables==0?).
+
+3) If gates pass but bulk still NAKs: breakpoint or single-step from 0x21A6C into 0x21930 and
+   watch 0x90000834 write; verify QH pointer *ep+0x1C and ep+0x3C == 0x200.
+   See "QH bank assignment" below — live dumps show qp=0x90000B60 for EP3 OUT which is the
+   IN bank per dice_usb_regs.h. Prior version of this line said "expect 0x90000B60" — that
+   was recorded from an observed (broken) live value, not a verified correct value.
+
+4) Do NOT call usb_hw_ep_dma_start_rx from the trace hook with extra cyg_scheduler_lock — stack
+   already holds the lock from submit_transfer / RX path (nested lock aborted earlier).
+
+QH bank assignment (2026-04-20 Phase 1 Ghidra pass)
+---------------------------------------------------
+Bank constants in dice_usb_regs.h:
+  TCAT_QH_OUT_BASE = 0x90000900  (host→device, device RX)
+  TCAT_QH_IN_BASE  = 0x90000B00  (device→host, device TX)
+  Per-EP stride 0x20; EP3 OUT = 0x90000960, EP3 IN = 0x90000B60.
+
+Ghidra evidence the header convention is correct:
+
+- usb_hw_ep_read_start (0x2115C):
+  • OUT branch (descriptor bit 7 clear) sets _DAT_9000081c |= 1 << (cVar4 + 0x10)
+    → bit+16 shift = TCAT_COMP_EP_OUT(n). Header ✓.
+  • IN branch (descriptor bit 7 set) sets _DAT_9000081c |= 1 << uVar10
+    → plain bit = TCAT_COMP_EP_IN(n). Header ✓.
+
+- usb_hw_dsr_interrupt_dispatch (0x21E78):
+  • Path (uVar17 & 0x40000): processes low-16-bit completions (IN direction).
+    Per-EP slot access at piVar25 + ep*0x40 + 0x74 (offset 0x74 for IN QH ptr).
+  • Path (uVar17 & 0x80000): processes high-16-bit completions (OUT direction).
+    Per-EP slot access at iVar24 + ep*0x40 + 0x1F4 (offset 0x1F4 for OUT QH ptr).
+  Matches read_start's own +0x1F4 (OUT) and +0x74 (IN) pointer storage.
+
+- usb_hw_ep_dma_start_rx (0x21930) and usb_hw_ep_dma_start (0x20EAC): both
+  dereference ep+0x1C to get the QH pointer and write QH[0]/QH[4] there. The
+  hardware bank the pokes reach is therefore entirely determined by whatever
+  value was stored at ep+0x1C at handle init time.
+
+Conclusion: header bank labels are consistent with the ISR and the per-direction
+enable code. The EP3 OUT ep_handle_t currently has qh_ptr = 0x90000B60 (live
+dump, 2026-04-17), which is the IN bank's EP3 slot. All RX-direction QH pokes
+(QH[0] active bit, QH[4] size) land there, but the TCAT OUT completion path
+(uVar17 & 0x80000) reads from the per-EP slot's +0x1F4 pointer that points at
+the OUT bank's EP3 slot (0x90000960), which stays idle. This matches the
+observed q2=0/cmp=0 symptom exactly.
+
+Residual proof gap (to close before acting):
+- Find where ep_handle_t.qh_ptr (ep+0x1C) gets assigned for EP3 OUT. Candidates
+  walked 2026-04-20: usb_midi_rx_endpoint_register (0x1BEA8) — just a list
+  append; dice_usb_midi_subsystem_init (0x195C0) — alarm/ISR setup, no
+  ep_handle field writes; usb_midi_set_interface_handler (0x19BCC) — looks up
+  already-configured handles via usb_iface_get_rx_endpoint (vtable[0x1C]);
+  usb_endpoint_descriptor_build (0x19A94) — only writes the USB descriptor
+  bytes, not the handle. The actual init site was not reached statically.
+- Dump EP3 IN ep_handle's qh_ptr at runtime (MIDI TX works): if it's
+  0x90000960, then handles are swapped and the bug is a direction confusion at
+  init. If it's 0x90000B60, bank labels might still be in a non-obvious state.
+  (Requires patched fw running — currently stock fw on device.)
+
+Init function at 0x214A8 — ep_table_init (2026-04-20 live fw pass):
+Push {r0-r8, lr}, loads 4 literals, two back-to-back loops over EP1-EP6.
+
+Literal pool at 0x2176C (10 words):
+  0x2176C: 0x90002000        (unidentified per-EP register block base, +0x1000 stride)
+  0x21770: 0x90000920        (bank A EP1 base, stride 0x20)
+  0x21774: 0x00021A6C        (usb_hw_ep_start_transfer_rx — "pokes 0x834" variant)
+  0x21778: 0x00021BA4        (usb_hw_ep_rx_enable)
+  0x2177C: 0x90000B20        (bank B EP1 base, stride 0x20)
+  0x21780: 0x0002140C        (usb_hw_ep_start_transfer — does NOT poke 0x834)
+  0x21784: 0x00021DCC        (usb_hw_ep_tx_enable)
+  0x21788: 0x00000050        (unknown)
+  0x2178C: 0x00800110        (unknown)
+
+LOOP 1 (0x214C0..0x21514): iterates EP1-EP6, stride 0x40, BASE offset 0x58.
+  Writes per-EP at r4 + (ep-1)*0x40 + 0x58:
+    +0x00  = usb_hw_ep_start_transfer_rx (0x21A6C)       — "RX" handler set
+    +0x04  = usb_hw_ep_rx_enable         (0x21BA4)
+    +0x1C  = 0x90000920 + (ep-1)*0x20    (bank A QH ptr)
+    +0x20  = 0x90002000 + (ep-1)*0x1000  (per-EP reg block)
+  These offsets match read_start's IN-direction slot lookup
+  (slot+0x74 where slot = r4 + (ep-1)*0x40 ⇒ r4 + (ep-1)*0x40 + 0x74,
+  equal to r4 + (ep-1)*0x40 + 0x58 + 0x1C). ✓
+
+LOOP 2 (0x21518..0x21564): iterates EP1-EP6, stride 0x40, larger BASE offset.
+  Same field layout but literal bundle B:
+    +0x00  = usb_hw_ep_start_transfer    (0x2140C) — TX variant, NO 0x834 poke
+    +0x04  = usb_hw_ep_tx_enable         (0x21DCC)
+    +0x1C  = 0x90000B20 + (ep-1)*0x20    (bank B QH ptr)
+  Writes hit slot+0x1F4 — read_start's OUT-direction slot lookup.
+
+Implication: direction-to-handler mapping is fixed at init time:
+  • IN-direction slots (read via slot+0x74)  ⇒ 0x21A6C + 0x21BA4 handlers + 0x900 bank
+  • OUT-direction slots (read via slot+0x1F4) ⇒ 0x2140C + 0x21DCC handlers + 0xB00 bank
+
+Two interpretations:
+  (A) If header bank labels are correct (0x900=OUT, 0xB00=IN), init has
+      handlers and banks BOTH swapped vs direction — OUT endpoints get TX
+      handlers pointing at IN bank, IN endpoints get RX handlers pointing
+      at OUT bank. Entirely upside-down — implausible for a working stack.
+  (B) If header bank labels are SWAPPED vs reality (0x900 is IN bank,
+      0xB00 is OUT bank), init is consistent: IN gets RX-variant handlers
+      (calling dma_start_rx, which pokes 0x834 — which is therefore
+      actually the "IN prime" register, not "OUT prime" as header claims)
+      and IN bank ptr; OUT gets TX-variant handlers and OUT bank ptr.
+
+Evidence favoring (B):
+  • MIDI TX (EP2 IN, WORKING) reads slot+0x74 for its QH ptr per read_start.
+    LOOP 1 wrote 0x90000940 there. If 0x900 were OUT bank, working IN
+    endpoint couldn't be there. Since it works, 0x900 is IN bank. ✓
+  • Header labels on dice_usb_regs.h therefore look swapped.
+
+Remaining puzzle under (B):
+  • EP3 OUT (MIDI RX): start_fn is stock 0x2140C (no 0x834 poke). Even if
+    0x834 is "IN prime", OUT direction still needs some priming or
+    activation mechanism — and the active bit (QH[0] bit 26) was NEVER
+    observed set in live EC1. Hardware is clearly not consuming the QH.
+  • Also: ep+0x04 (set_halted_fn) remains 0x21DCC (tx_enable) — handler
+    operates on ep+0x20 byte, not the ep+0x24 byte rx_enable uses. MIDI
+    RX code calling set_halted_fn(ep, 0) to clear halt invokes TX path,
+    which never touches the RX-side halt bit — so q6=0x10 (HALT) stays
+    set forever. Plausible cause of "hardware halts instantly" symptom.
+  • The patch (handlers.c:504-525) fixes start_fn but does NOT fix
+    set_halted_fn. Needs extension: also set ep+0x04 = 0x21BA4.
+
+Full QH bank dump (2026-04-20 patched fw, after handlers.c boot_init ran):
+  Bank A @ 0x90000900 (IN direction under hypothesis B):
+    EP0: q0=0x00008000  q2=0x000020D0  q6=0x10  (EP0 IN — little activity)
+    EP1: q0=0x008D8006  q2=0x00002090  q6=0x80  (MIDI interrupt EP1 IN — active, MPS=6)
+    EP2: q0=0x00CA8200  q2=0x000000C0  q6=0x80  (MIDI TX EP2 IN — active, MPS=0x200)
+    EP3: q0=0x80000000  q2=0x00000080  q6=0x10  (idle — not used as IN)
+    EP4-6: q0=0  q6=0x10  (idle)
+
+  Bank B @ 0x90000B00 (OUT direction under hypothesis B):
+    EP0: q0=0x80028000  q2=0x0000A010  q6=0x80  (EP0 OUT CONTROL — active, works)
+    EP1: q0=0x00020000  q2=0  q6=0x10  (idle)
+    EP2: q0=0x00020000  q2=0  q6=0x10  (idle — EP2 OUT not used)
+    EP3: q0=0x80088200  q2=0  q6=0x10  (MIDI RX EP3 OUT — CONFIGURED but INACTIVE)
+    EP4-6: q0=0x00020000  q2=0  q6=0x10  (idle)
+
+Working endpoints (EP0 OUT, EP1 IN, EP2 IN) share:
+  q6 = 0x80 (TD_STATUS_ACTIVE bit 7 — hardware signal "transfer in progress/armed")
+  q2 non-zero (dTD overlay present)
+  q0 includes various direction/IOC/IOS bits beyond just IN_USE+BULK+MPS
+
+Idle/unused endpoints share:
+  q0 = 0x00020000 (bit 17 only — "disabled" pattern) OR 0x80000000 (IN_USE only)
+  q6 = 0x10 (bit 4 — "idle/inactive" indicator)
+
+EP3 OUT (broken MIDI RX) has the MPS/BULK init done (q0=0x80088200) but did NOT
+transition to "active transfer armed" state. q2=0 and q6=0x10 mean "configured
+but no dTD overlay / not active". For OUT to receive, TCAT engine needs q6=0x80
+and q2 non-zero.
+
+Stock dma_start (0x20EAC) sets QH[0] |= 0x84000000 (IN_USE+ACTIVE bit 26) but
+bit 26 never stays set in EP3 OUT — either hw clears it instantly or dma_start
+didn't actually run post-HS-skip-bypass. Need to instrument whether stock
+dma_start runs for EP3 OUT at HS after our 0x19BE0 patch.
+
+The remaining bug: HS enumeration path fires usb_midi_set_interface_handler
+correctly (our patch bypasses the state check), which calls
+usb_endpoint_descriptor_build(type=3) and usb_midi_rx_start. But whatever
+should transition EP3 OUT QH to the "armed" state (q6=0x80, q2!=0) is not
+happening. Possibly read_start's OUT path (the code that sets QH[0] bits 28,
+15, 27 and clears bit 21 at slot+0x1F4) isn't running at HS for EP3 — maybe
+gated on a non-HS-specific condition we missed.
+
+Full ep_handle array (2026-04-20 patched fw with corrected header labels running):
+At 0x2A5E8 through 0x2A867, 12 ep_handles × 0x40 bytes = 0x300 bytes.
+Stride 0x40. IN handles first, then OUT handles.
+
+  0x2A5E8 EP1 IN  (MIDI interrupt): start_fn=0x21A6C, enable=0x21BA4, qh=0x90000920, state@+0x24=2, size=6 — WORKING (q6=0x80, q2=0x2090)
+  0x2A628 EP2 IN  (MIDI TX bulk):   start_fn=0x21A6C, enable=0x21BA4, qh=0x90000940, state@+0x24=0x102 — WORKING (q6=0x80, q2=0xC0)
+  0x2A668 EP3 IN  (unused):         stock init, qh=0x90000960 — IDLE
+  0x2A6A8 EP4 IN  (unused):         stock init, qh=0x90000980 — IDLE
+  0x2A6E8 EP5 IN  (unused):         stock init, qh=0x900009A0 — IDLE
+  0x2A728 EP6 IN  (unused):         stock init, qh=0x900009C0 — IDLE
+  0x2A768 EP1 OUT (unused):         start_fn=0x2140C, enable=0x21DCC, qh=0x90000B20, state@+0x24=1 — IDLE
+  0x2A7A8 EP2 OUT (unused):         stock init, qh=0x90000B40, state@+0x24=2 — IDLE
+  0x2A7E8 EP3 OUT (MIDI RX):        stock init, qh=0x90000B60, state@+0x20=3 (DMA_ACTIVE), flags=0x203 — BROKEN
+  0x2A828 EP4 OUT (unused):         stock init, qh=0x90000B80, state@+0x24=4 — IDLE
+
+Critical layout difference IN vs OUT handles:
+  IN handle (works with usb_hw_ep_rx_enable at ep+0x24 byte):
+    +0x20: reg block ptr (0x90002000 + (ep-1)*0x1000)
+    +0x24: state byte (direction=IN)
+    +0x28: various dma info
+    +0x30-0x3C: MPS repeated
+  OUT handle (works with usb_hw_ep_tx_enable at ep+0x20 byte):
+    +0x20: state byte (direction=OUT) ← for EP3 this is 3 (DMA_ACTIVE)
+    +0x24: flags low byte (RX gate check); EP3 has 0x203 here
+    +0x28: dma_buf_copy
+    +0x2C: dma_size_copy
+    +0x38: MPS (ushort)
+    +0x3C: regs struct ptr (0x2A590)
+
+Controller context (r4 in init function usb_hw_ep_table_init @ 0x214A8)
+= 0x2A590 confirmed at runtime. Per-EP slot arrays:
+  IN slot at r4 + (ep-1)*0x40 + 0x58  ← written by LOOP 1
+  OUT slot at r4 + (ep-1)*0x40 + 0x1D8 + 0x1C = r4 + 0x1F4 + (ep-1)*0x40  ← written by LOOP 2
+  (The ep_handle IS this per-EP slot; "ep_handle" and "controller context slot"
+  are the same memory region seen from different naming conventions.)
+
+============================================================
+ROOT CAUSE of EP3 OUT not arming (2026-04-20 captured)
+============================================================
+
+Comparing WORKING EP0 OUT QH @ 0x90000B00:
+  q0 = 0x80028000  (IN_USE + bit 17 + bit 15)
+  q2 = 0x0000A010  (dTD overlay PRESENT — hardware populated)
+  q4 = 0x40000040
+  q6 = 0x00000080  (ACTIVE bit 7 set — armed)
+
+Against BROKEN EP3 OUT QH @ 0x90000B60:
+  q0 = 0x80088200  (IN_USE + BULK + bit 15 + MPS=0x200)
+  q2 = 0x00000000  (NO dTD overlay — hardware never populated)
+  q4 = 0x00080200  (size bit + size=0x200)
+  q6 = 0x00000010  (idle bit 4 set — NOT armed)
+
+Hardware never transitions EP3 OUT QH to armed state (q6=0x80, q2 populated).
+Software side did its part: dma_start wrote QH[0] bit 31 (IN_USE) and bit 26
+(ACTIVE, now cleared by hw), wrote QH[4] size. But hw never consumed the
+transfer — q2 stays 0, q6 stays at "idle".
+
+Notable: read_start's OUT branch DOES set q0 bit 19 (BULK) which we see, but
+does NOT fully configure (bits 27, 28 missing). Bits 27/28 are IOC and
+capability flags that read_start SHOULD set — unless they're cleared by a
+later transition. Working EP0 OUT has NEITHER bit 27 nor 28 set, yet works,
+so missing them might not be fatal.
+
+Next-round investigation suggestions:
+  - Check TCAT reg 0x90000830 = 0x0C100020 in live state (not in dice_usb_regs.h
+    yet) — may be direction-specific arming register.
+  - Compare dTD/next-dTD pointer for EP0 OUT vs EP3 OUT — where is the
+    actual transfer buffer fetched from? In ChipIdea, QH+0x18 (word 6) is
+    "next dTD". Our EP0 OUT has q6=0x80 (populated), EP3 OUT has q6=0x10.
+    If q6 holds a dTD pointer, maybe software needs to ALLOCATE a dTD and
+    link it in. Current TCAT driver seems to treat QH as self-contained —
+    might be missing a step.
+  - Walk the FS enumeration path (TCAT FS speed, speed byte=0x02). In FS,
+    stock firmware arms MIDI correctly (pre-patch). Compare live FS EC1
+    state to understand what FS path sets differently.
+  - Disassemble the full call chain that SHOULD arm the OUT endpoint at
+    HS — specifically what happens AFTER usb_midi_rx_start → dispatch →
+    submit_transfer → dma_start that would transition q6 from 0x10 → 0x80.
+
+Live observation recap (2026-04-20, patched fw running):
+  ep_handle @ 0x2A7E8:
+    +0x00 start_fn      0x00032878  (patch trace wrapper — fixed ✓)
+    +0x04 set_halted_fn 0x00021DCC  (tx_enable — NOT fixed ✗)
+    +0x08 complete_fn   0x0001B9E4  (usb_midi_rx_complete)
+    +0x10 buffer        0x00030D64
+    +0x14 size          0x00000200
+    +0x1C qh_ptr        0x90000B60  (bank B EP3 — "correct OUT" under (B))
+    +0x20 state         0x03 (DMA_ACTIVE)
+    +0x24 flags         0x00000203 (low byte 0x03 — RX gate wants 0x02)
+
+Driver reg struct layout (2026-04-20):
+- Located at 0x2A590 (pointed to from device context at 0x2A234):
+    +0x00: 0x90000900  OUT bank base
+    +0x04: 0x90001000  (unidentified USB register)
+    +0x24: 0x90000B00  IN bank base
+  Both bank-base constants appear EXACTLY ONCE in the firmware image (only
+  as values at 0x2A590/0x2A5B4, no literal-load xrefs anywhere) — all
+  bank-derived QH addresses must be computed at runtime by loading these
+  through the device-context pointer at 0x2A230/0x2A234.
+- USB HAL vtable at 0x2A918 (pointed to from device context at 0x2A230):
+    +0x08: usb_hw_ep_read_start  (OUT config path)
+    +0x10: usb_hw_ep_write_start (IN config path)
+    +0x14: usb_hw_ep0_read_start
+    +0x18: usb_hw_ep0_status_phase
+  etc. This is the usb_hw_* function table, not the per-handle start_fn.
+- ep_handle for MIDI RX at 0x2A7E8 (per past runtime dump): BSS in image, all
+  zeros — handle is populated at runtime by code path not yet statically
+  located. Live qp=0x90000B60 is written by that unknown path.

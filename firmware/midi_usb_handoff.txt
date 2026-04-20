@@ -1,0 +1,262 @@
+MIDI USB bulk endpoint (EP3 OUT) — current understanding
+========================================================
+Last updated: 2026-04-20
+Repo: /home/florian/src-misc/helicon-blender
+
+Goal
+----
+Make **USB MIDI host→device bulk OUT** (EP 0x03) work on the patched Blender
+firmware at High Speed. Device→host (MIDI TX / bulk IN) already works. FS
+speed also appears to work in stock firmware.
+
+2026-04-20 direction-label correction (READ THIS FIRST)
+-------------------------------------------------------
+Previous versions of this doc and `dice_usb_regs.h` had the TCAT direction
+labels INVERTED. After decompiling the ISR at `0x21E78` and comparing to
+read_start/init code + live traffic on working endpoints, the correct
+mapping is:
+
+- **Bank A (`USB_BASE + 0x900`)** = IN bank (device TX, USB IN)
+- **Bank B (`USB_BASE + 0xB00`)** = OUT bank (device RX, USB OUT)
+- **`0x90000810`** = TCAT_EP_TX_EN (IN direction enable)
+- **`0x90000814`** = TCAT_EP_RX_EN (OUT direction enable)
+- **`0x90000834`** = IN async prime trigger (NOT OUT as header previously said)
+- `TCAT_COMP_EP_IN(n) = 1<<n` (low 16 bits of 0x818) ← correct, IN is low
+- `TCAT_COMP_EP_OUT(n) = 1<<(n+16)` (high 16 bits) ← correct, OUT is high
+
+Ghidra's function-name suffixes `_rx` / `_tx` are therefore INVERTED from the
+real direction semantics:
+
+- `usb_hw_ep_start_transfer_rx` (`0x21A6C`) → actually the IN submit path
+  (calls `dma_start_rx` which pokes the IN-prime register 0x834).
+- `usb_hw_ep_start_transfer` (`0x2140C`) → actually the OUT submit path
+  (calls `dma_start` which does NOT poke 0x834 — OUT direction has no async
+  prime; hardware arms automatically from QH state).
+- `usb_hw_ep_dma_start_rx` (`0x21930`) → IN dma_start.
+- `usb_hw_ep_dma_start` (`0x20EAC`) → OUT dma_start.
+- `usb_hw_ep_rx_enable` (`0x21BA4`) → IN enable (operates on ep+0x24 byte).
+- `usb_hw_ep_tx_enable` (`0x21DCC`) → OUT enable (operates on ep+0x20 byte).
+
+The corrected labels are now in `firmware/patch/dice_usb_regs.h` and plate
+comments are saved in Ghidra at each of the functions above.
+
+Architecture (what this is NOT)
+-------------------------------
+- SPI / system DMA (`SPI_BASE` `0xCC000000`, `DMA_BASE` `0x80000000`) from
+  `firmware/dice3_hw.h` applies to flash/LED SPI — not USB MIDI.
+- USB bulk OUT goes through the USB device controller at `USB_BASE`
+  `0x90000000` (ChipIdea-based with TCAT extensions).
+
+Stock firmware call chain (addresses from blender_primary_body.bin, image
+base 0x200)
+-----------------------------------------------------------------------
+- `usb_endpoint_submit_transfer` (`0x2077C`) — fills `ep+0x08` (callback),
+  `+0x10` (buf), `+0x14` (size), then calls `ep->start_fn` with no args.
+- **OUT path** (correct for EP3 OUT / MIDI RX):
+  `usb_hw_ep_start_transfer` (`0x2140C`) → `usb_hw_ep_dma_start` (`0x20EAC`).
+  Writes QH[0] |= `0x84000000` (IN_USE + ACTIVE) and QH[4] = size. Does NOT
+  poke 0x834 — OUT direction doesn't need it.
+- **IN path** (for MIDI TX, EP1/EP2 IN):
+  `usb_hw_ep_start_transfer_rx` (`0x21A6C`) → `usb_hw_ep_dma_start_rx`
+  (`0x21930`). Writes QH + pokes `0x834` IN-prime bit.
+- Endpoint configuration: `usb_endpoint_start_if_configured` (`0x1FF34`)
+  dispatches via vtable[2] to `usb_hw_ep_read_start` (`0x2115C`) which
+  handles BOTH directions internally (branches on descriptor bit 7). The
+  "_read_" name is misleading — it's the unified endpoint-start function.
+- Per-EP controller-context array is at the pointer `*(device_ctx + 4)`
+  which resolves to `0x2A590` at runtime. Handles for all 12 endpoints
+  (6 IN + 6 OUT) live at `0x2A5E8–0x2A867`, 0x40 bytes each. ep_handle IS
+  the per-EP controller-slot; they're the same memory region under two
+  naming conventions.
+- MIDI RX flow: `usb_midi_rx_dispatch` (`0x1B7F0`) →
+  `usb_endpoint_submit_transfer` → `ep->start_fn`.
+  `usb_midi_rx_start` (`0x1BE50`) calls dispatch only when `ep+0x08` is
+  clear AND cables != 0 (re-arm semantics).
+- Init function: `usb_hw_ep_table_init` (`0x214A8`) populates all 6 IN
+  handles (LOOP 1 with IN-variant handlers + 0x900 bank pointers) and all
+  6 OUT handles (LOOP 2 with OUT-variant handlers + 0xB00 bank pointers).
+
+Patch framework current state (`firmware/patch/`)
+-------------------------------------------------
+- `boot_init` HS-skip patch at `0x19BE0` = `0xE1530003` (cmp r3,r3 always
+  EQ) bypasses the "only arm MIDI at FS" check so that
+  `usb_midi_set_interface_handler` runs the MIDI endpoint arming code at
+  HS speed. **This is the core patch. It's necessary. It's not sufficient.**
+- `midi_loop` hook at `0x5180` replaces `bl midi_rx_poll` with a trampoline
+  into `midi_loop_hook` in our SRAM patch zone (0x32600–0x33F80). That
+  handler calls `midi_rx_poll` first, then emits periodic EC1/EC2 UART
+  diagnostics.
+- **REMOVED 2026-04-20**: the one-shot `start_fn` override that forced
+  EP3 OUT's `start_fn` to `usb_hw_ep_start_transfer_rx` (0x21A6C). Under
+  the corrected direction convention, 0x21A6C is the IN path; forcing it
+  on an OUT endpoint routes through dma_start_rx which pokes 0x834
+  (IN-prime, no effect on OUT direction) and skips the proper OUT arming
+  mechanism. Stock init's `start_fn = 0x2140C` is correct for OUT.
+- **REMOVED 2026-04-20**: the periodic `TCAT_EP_ASYNC_PRIME |= EP_BIT_RX(3)`
+  reinforcement poke. 0x834 is IN-prime; EP_BIT_RX(3) = bit 3 primes
+  EP3 IN not OUT. Was a no-op for MIDI RX.
+
+Live runtime state (captured 2026-04-20 on patched fw)
+------------------------------------------------------
+EP3 OUT ep_handle @ `0x2A7E8`:
+```
+  +0x00 start_fn     = 0x0002140C   (stock OUT submit — correct)
+  +0x04 set_halted   = 0x00021DCC   (stock OUT enable — correct)
+  +0x08 complete_fn  = 0x0001B9E4   (usb_midi_rx_complete)
+  +0x10 buffer       = 0x00030D64
+  +0x14 size         = 0x00000200
+  +0x1C qh_ptr       = 0x90000B60   (OUT bank EP3 — correct)
+  +0x20 state        = 0x00000003   (DMA_ACTIVE)
+  +0x24 flags        = 0x00000203
+```
+
+OUT bank EP3 QH @ `0x90000B60`:
+```
+  q0 = 0x80088200   (IN_USE + BULK + bit 15 + MPS=0x200)
+  q2 = 0x00000000   (no dTD overlay — hardware never populated it)
+  q4 = 0x00080200   (transfer size valid + size=0x200)
+  q6 = 0x00000010   (idle — NOT armed)
+```
+
+For comparison, WORKING EP0 OUT QH @ `0x90000B00`:
+```
+  q0 = 0x80028000   (IN_USE + bit 17 + bit 15)
+  q2 = 0x0000A010   (dTD overlay populated)
+  q4 = 0x40000040
+  q6 = 0x00000080   (ACTIVE bit 7 — armed)
+```
+
+The critical difference: EP0 OUT has q2 populated and q6 at 0x80 (hardware
+armed). EP3 OUT has q2=0 and q6=0x10 (idle). Software side completed its
+part (dma_start ran, wrote q0 IN_USE and q4 size) but the TCAT hardware
+never transitioned the QH into armed state. Without q6=0x80 and a
+populated dTD overlay, host OUT tokens are NAK'd → pyusb TIMEOUT.
+
+Wire-level symptoms
+-------------------
+- `pyusb` writes to EP 0x03 return TIMEOUT consistently at HS.
+- No `USBERR I/O` (STALL) — the endpoint accepts tokens but NAKs them.
+- Device-side UART (`ptr_midi_streaming_state+0x1c` byte = 0x02 = HS per
+  the speed code; other evidence suggests the "== 2" arm condition was
+  actually the FS condition, and at HS this byte has a different value
+  that bypasses MIDI arming — which is why the 0x19BE0 patch is needed).
+
+Root-cause narrowing (2026-04-20)
+---------------------------------
+Confirmed NOT the bug:
+- qh_ptr bank selection (correctly 0x90000B60 = OUT bank under corrected labels).
+- start_fn routing (correctly 0x2140C = OUT submit).
+- set_halted_fn (correctly 0x21DCC = OUT enable).
+- TCAT_EP_RX_EN bit 3 — correctly set at 0x814 (=0x2F has bit 3).
+- TCAT_EP_COMP_ENABLE bit 19 — correctly set at 0x81C (=0x90007 has bit 19).
+- dma_start bit-26 (ACTIVE) set in QH[0] — at one point, but hw clears
+  it without firing completion.
+
+Confirmed the gap: **hardware does not populate q2 / transition q6 from
+0x10 → 0x80 for EP3 OUT.** Something in the HS-arming path that stock
+firmware skips (hence the 0x19BE0 bypass bug) is incomplete — bypassing
+the check lets later code run, but something else is still missing or
+misconfigured that would transition the OUT QH to hardware-armed state.
+
+Suggested next-round investigation
+----------------------------------
+1. **Decode TCAT reg `0x90000830`** — read as 0x0C100020 live, not in
+   dice_usb_regs.h yet. Possibly an OUT-direction arming register or
+   similar. Check xrefs in Ghidra, see when it's written.
+2. **Walk FS enumeration path vs HS.** FS works pre-patch. Find the
+   divergence: what does FS path do at submit-time that HS doesn't?
+   Specifically, after usb_midi_rx_start → dispatch → submit_transfer →
+   dma_start, what transitions q6 to 0x80?
+3. **Check dTD allocation / next-dTD pointer.** In ChipIdea, QH+0x18 (q6)
+   can hold a next-dTD pointer. EP0 OUT has q6=0x80 (bit 7 — might be
+   ACTIVE or a flag on the pointer). Maybe MIDI OUT needs a dTD to be
+   allocated and linked; stock TCAT driver might be missing this for
+   bulk OUT endpoints at HS.
+4. **Check `slot+0x1F8` byte vs read_start gate.** Live EP3 OUT has byte
+   at (controller-ctx slot +0x1F8) = 0x03 (the state byte). read_start's
+   OUT branch gates on this == 0. So if read_start tried to re-run, it
+   would bail. But initial call should have found 0 and completed. Need
+   to confirm via trace whether read_start's OUT branch fully ran for
+   EP3 OUT at HS.
+5. **Breakpoint trace.** Set a software bp at 0x2140C (start_transfer
+   entry) to confirm it's actually called for EP3 OUT. And at 0x20EAC
+   (dma_start) to confirm IT's called with ep=EP3_OUT handle. And at
+   0x2115C (read_start) to confirm IT ran its OUT branch to completion.
+   Caveat: JTAG halt disrupts DMA — can only breakpoint at idle, and
+   replug device after each halt cycle.
+
+Operational notes
+-----------------
+- Flash: `python3 firmware/jtag_flash_v2.py --mode flash-all --ref
+  firmware/blender_spi_patched.bin`. ~48s. Reported "FAILED ops" are
+  golden-protection-zone refusals and block→sector fallbacks — expected.
+- After flash: **power-cycle the device** (not just JTAG reboot — reboot
+  stub was flaky in this session).
+- JTAG halt corrupts in-flight USB/DMA; read state between host-traffic
+  attempts, not during.
+- Device is self-powered; USB replug doesn't reset SRAM. A real
+  power-cycle (unplug power) does reset SRAM.
+
+References in repo
+------------------
+- `firmware/usb_dma_ep_ghidra.txt` — full ISR decomp, direction-convention
+  reconciliation, ep_handle array map, live QH bank dumps with working vs
+  broken comparison.
+- `firmware/patch/dice_usb_regs.h` — corrected TCAT register addresses
+  and bank labels (2026-04-20).
+- `firmware/patch/handlers.c` — midi_loop_hook, boot_init with HS-skip
+  patch, EC1/EC2 UART diagnostics.
+- `firmware/patch/dice_platform.h` — `USB_EP_TYPE_MIDI_RX`, MIDI EP helpers.
+- `firmware/dice3_hw.h` — SPI/DMA only; header comment clarifies scope
+  vs USB.
+- `firmware/jtag_dump_epv.py` — JTAG-based ep_handle dumper with decode.
+- `firmware/dump_epv.py` — DCP 0x81F handler based ep_handle dumper
+  (needs patched fw running; doesn't halt CPU so safe during traffic).
+- `firmware/usb_midi_bulk_send.py` — pyusb OUT test harness.
+
+Ghidra state
+------------
+Program `blender_primary_body.bin` (image base 0x200) has plate comments
+saved at: 0x20EAC, 0x21104, 0x2140C, 0x214A8 (renamed
+`usb_hw_ep_table_init`), 0x21930, 0x21A6C, 0x21BA4, 0x21DCC, 0x21E78
+(ISR with full analysis). Inline comments at 0x214F0 and 0x21544 for
+the qh_ptr-write sites in LOOP 1 / LOOP 2 of the init function.
+
+Sister firmware: GoXLR / GoXLR Mini (same DICE3 USB stack)
+---------------------------------------------------------
+GoXLR full and Mini ship the **same SDK** as Blender (`troll-dsp/goxlr-dice3`
+vs `goxlrMini-dice3` vs `blender-dice3`); only link placement differs — **do
+not** assume the same VA as `blender_primary_body.bin`.
+
+In Ghidra project `blender-windows`, **`GoXLR_firmware_code.bin`** was
+**byte-matched** to Blender for key USB/MIDI routines, then **renamed and
+saved**. Addresses below are image base **0** for stripped `*_firmware_code.bin`
+images (see `apps/firmware/GOXLR_IMAGE_LAYOUT.txt`).
+
+  Function (Blender name)          Blender      GoXLR full    GoXLR Mini
+  -------------------------------  -----------  ------------  ------------
+  usb_endpoint_submit_transfer     0x0002077C   0x0002AD10    0x00032048
+  usb_hw_ep_dma_start              0x00020EAC   0x0002B5BC    0x000328F4
+  usb_hw_ep_start_transfer         0x0002140C   0x0002BB1C    0x00032E54
+  usb_hw_controller_init           0x000214A8   0x0002BBB8    0x00032EF0
+  usb_hw_ep_read_start             0x0002115C   0x0002B86C    0x00032BA4
+  usb_hw_ep_dma_continue           0x000217DC   0x0002BEEC    0x00033224
+  usb_hw_ep_dma_start_rx           0x00021930   0x0002C040    0x00033378
+  usb_hw_ep_start_transfer_rx      0x00021A6C   0x0002C17C    0x000334B4
+  usb_hw_dsr_interrupt_dispatch    0x00021E78   0x0002C588    0x000338C0
+  usb_midi_streaming_start         0x00019C0C   0x00023CE0    0x0002B018
+  usb_midi_tx_endpoint_start       0x0001BE10   0x00025DA0    0x0002D0D8
+  usb_midi_rx_start                0x0001BE50   0x00025DE0    0x0002D118
+  usb_midi_rx_dispatch             0x0001B7F0   0x00025780    0x0002CAB8
+  usb_midi_rx_complete             0x0001B9E4   0x00025974    0x0002CCAC
+
+**Takeaway:** stock GoXLR firmware uses the **same** `dma_start_rx` /
+`0x90000834` IN-prime path and OUT path split as Blender; useful for diffing
+call graphs and HS vs FS quirks — it does **not** by itself explain EP3 OUT
+NAK (hardware QH arm gap above). After relabeling, review
+`usb_hw_dsr_interrupt_dispatch` boundaries on GoXLR (auto-analysis can span
+too much — trim in Listing if needed).
+
+On **GoXLR Mini**, apply the Mini column names in the UI if MCP rename was
+partial; the **addresses** above are verified by signature search against
+Blender code bytes.
