@@ -52,6 +52,7 @@ TIMING_FIELDS = (
     "erase_poll_interval_us",
     "erase_poll_budget_us",
     "xport_mode",
+    "byte_prog_offset",
 )
 XPORT_DMA = 0
 XPORT_PIO = 1
@@ -69,6 +70,7 @@ TIMING_DEFAULTS = {
     "erase_poll_interval_us":     2000,
     "erase_poll_budget_us":       500000,
     "xport_mode":                 XPORT_DMA,
+    "byte_prog_offset":           0,
 }
 
 MAGIC_CMD = 0x4D324657  # 'M2FW'
@@ -111,6 +113,7 @@ CMD_ERASE_64K = 9
 CMD_FLASH_SECTOR = 10
 CMD_FLASH_BLOCK  = 11
 CMD_BYTE_PATCH   = 12
+CMD_READ_ID      = 13
 
 PHASE_NAMES = {
     0: "INIT", 1: "TEARDOWN", 2: "T0_ENABLE", 3: "IDLE", 4: "BP_CLEAR",
@@ -439,6 +442,22 @@ class FlashClientV2:
                            est_us=est_us,
                            overall_timeout=max(est_us / 1e6 * 2, 5.0))
 
+    def read_id(self, mode="jedec"):
+        """Exercise dma_rx + wait_dma_irq path on short bidir reads.
+        mode='jedec' → cmd 0x9F, 3B response. mode='legacy' → cmd 0xAB, 1B.
+        Returns bytes or None on failure."""
+        flag = 0 if mode == "jedec" else 1
+        print(f"read_id ({mode})...")
+        ok = self._issue(CMD_READ_ID, flash_addr=flag,
+                         buf_addr=DATA_BUF_ADDR, length=0,
+                         est_us=5000, overall_timeout=5.0)
+        if not ok: return None
+        resp_len = 3 if mode == "jedec" else 1
+        self.o.halt()
+        data = self.o.dump_image(DATA_BUF_ADDR, resp_len)
+        self.o.resume()
+        return data
+
     def flash_block(self, spi_addr, data_bytes, load_addr=IMAGE_BASE_ADDR):
         """Autonomous erase+AAI-program+verify for up to 64 KB in one cmd.
         Driver auto-picks SE/BE32/BE64 from addr alignment + length.
@@ -646,22 +665,23 @@ def flash_all(client, args):
         print(f"FAILED ops: {failed}")
         # Keep going — repair step below will catch the dropped bytes.
 
-    # Host-side verify + byte-patch repair. Both on-device verify AND
-    # on-device CMD_READ read through a post-write buffer that hides tail
-    # drops. Use JTAG-driven bidir DMA (skip=12) to see true cell state.
+    # Host-side verify + byte-patch repair. Previously we used
+    # jtag_dma_read (direct host-driven DMA) with READ_RX_SKIP=12
+    # because the on-device CMD_READ had a readback bug that shifted
+    # data by -4. Driver fixed 2026-04-20 (READ_RX_SKIP = 4 now);
+    # on-device CMD_READ is trustworthy, so repair can just use
+    # client.read() — much faster, uses the driver's DMA path.
     if args.repair:
-        import sys as _sys
-        _sys.path.insert(0, str(FIRMWARE_DIR))
-        from debug_flash_harness import jtag_dma_read
-        import debug_flash_harness as h
-        h.READ_RX_SKIP = 12
         print(f"\n=== host-side verify + byte-patch repair ===")
         repair_t0 = time.monotonic()
         repairs = 0
         total_bad = 0
         for op_idx, (kind, addr, span) in enumerate(ops):
             want = ref[addr:addr + span]
-            got = jtag_dma_read(client.o, addr, span)
+            got = client.read(addr, span)
+            if got is None:
+                print(f"  [{op_idx+1}/{len(ops)}] 0x{addr:06x} READ FAILED")
+                continue
             diffs = [i for i in range(span) if got[i] != want[i]]
             if not diffs: continue
             total_bad += len(diffs)
@@ -731,7 +751,8 @@ def main():
                    help="Scratch sector for test mode (default 0x3F000)")
     p.add_argument("--mode", choices=("test", "erase-only", "readback",
                                        "flash-all", "autonomous",
-                                       "block-sector", "block-64k"),
+                                       "block-sector", "block-64k",
+                                       "byte-test", "byte-only", "read-id"),
                    default="test",
                    help="'test' = host-driven erase+program+verify on test sector, "
                         "'autonomous' = single V2_CMD_FLASH_SECTOR (4 KB only), "
@@ -765,6 +786,10 @@ def main():
                         f"Unset fields use the on-device defaults.")
     p.add_argument("--show-timings", action="store_true",
                    help="Print the active on-device timings and exit.")
+    p.add_argument("--byte-addr", type=lambda x: int(x, 0), default=0x3F020,
+                   help="byte-test: target SPI address for the single-byte write")
+    p.add_argument("--byte-val", type=lambda x: int(x, 0), default=0x5A,
+                   help="byte-test: byte value to program")
     p.add_argument("--xport", choices=("dma", "pio"), default=None,
                    help="Select AAI hot-loop transport backend on the "
                         "driver (dma = current; pio = byte-by-byte DATA "
@@ -842,6 +867,62 @@ def main():
             dt = time.monotonic() - t0
             print(f"flash_block(64 KB): {dt:.2f}s wall, "
                   f"{'OK' if ok else 'FAIL'}")
+            return 0 if ok else 1
+        if args.mode == "read-id":
+            jedec = client.read_id(mode="jedec")
+            legacy = client.read_id(mode="legacy")
+            print(f"JEDEC  (0x9F, 3B): {jedec.hex() if jedec else 'FAIL'} "
+                  f"(expect bf 25 41 for SST25VF016B)")
+            print(f"Legacy (0xAB, 1B): {legacy.hex() if legacy else 'FAIL'} "
+                  f"(expect bf)")
+            ok = (jedec == bytes.fromhex("bf2541")
+                  and legacy == bytes.fromhex("bf"))
+            print(f"read-id: {'OK' if ok else 'FAIL'}")
+            return 0 if ok else 1
+        if args.mode == "byte-only":
+            # Minimal: issue ONE BYTE_PRG at --byte-addr with --byte-val.
+            # No bp_clear, no erase, no readback. For logic-analyzer probing.
+            # On the wire you'll see: WREN (0x06) + BYTE_PRG (0x02 + 3B addr
+            # + 1B data) + RDSR poll loop (0x05 + status until !BUSY).
+            if not client.byte_patch(args.byte_addr, bytes([args.byte_val])):
+                raise SystemExit("byte_patch failed")
+            print(f"byte-only: wrote 0x{args.byte_val:02x} @ 0x{args.byte_addr:06x}")
+            print("Wire sequence (each = separate CS cycle):")
+            print(f"  1. WREN   : 06")
+            ah = (args.byte_addr >> 16) & 0xFF
+            am = (args.byte_addr >>  8) & 0xFF
+            al =  args.byte_addr        & 0xFF
+            print(f"  2. BYTE_PRG: 02 {ah:02x} {am:02x} {al:02x} {args.byte_val:02x}")
+            print(f"  3. RDSR    : 05 XX (poll until !BUSY)  [repeats]")
+            return 0
+        if args.mode == "byte-test":
+            # Isolate BYTE_PROGRAM landing offset: erase the containing
+            # sector, write one byte at --byte-addr, read the sector
+            # back, report which offsets ended up non-0xFF. Confirms
+            # whether the off-by-4 symptom survived the IRQ refactor.
+            sector = args.byte_addr & ~0xFFF
+            offset_in_sector = args.byte_addr & 0xFFF
+            if not client.bp_clear():
+                raise SystemExit(1)
+            if not client.erase(sector):
+                raise SystemExit(f"erase 0x{sector:06x} failed")
+            if not client.byte_patch(args.byte_addr, bytes([args.byte_val])):
+                raise SystemExit("byte_patch failed")
+            data = client.read(sector, SECTOR_SIZE)
+            if data is None:
+                raise SystemExit("readback failed")
+            hits = [(i, b) for i, b in enumerate(data) if b != 0xFF]
+            print(f"byte-test: asked addr=0x{args.byte_addr:06x} "
+                  f"(sector 0x{sector:06x} + 0x{offset_in_sector:03x}) "
+                  f"val=0x{args.byte_val:02x}")
+            print(f"byte-test: {len(hits)} non-0xFF byte(s) in sector:")
+            for off, b in hits:
+                delta = off - offset_in_sector
+                print(f"  +0x{off:03x}  = 0x{b:02x}  "
+                      f"(delta {delta:+d} from asked)")
+            expected = [(offset_in_sector, args.byte_val)]
+            ok = hits == expected
+            print(f"byte-test: {'OK' if ok else 'FAIL'}")
             return 0 if ok else 1
         if args.mode == "erase-only":
             ok = client.erase(args.test_sector)

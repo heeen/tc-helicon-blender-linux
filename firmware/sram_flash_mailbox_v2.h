@@ -47,6 +47,12 @@
 #define V2_CMD_BYTE_PATCH   12u   /* BYTE_PROGRAM each byte in buf_addr[0..length-1]
                                    * onto flash[flash_addr..flash_addr+length-1].
                                    * No erase. Used to fix AAI-dropped tail bytes. */
+#define V2_CMD_READ_ID      13u   /* Exercise dma_rx with a multi-byte response.
+                                   * flash_addr: 0=JEDEC(0x9F, 3B), 1=LEGACY(0xAB, 1B)
+                                   * length: ignored; fixed by command variant.
+                                   * Result bytes land at buf_addr (DATA_BUF if host
+                                   * doesn't set it). Diagnostic — confirms the full
+                                   * DMA-RX + IRQ/polling fallback machinery works. */
 
 /* ── Status (DEV) ─────────────────────────────────────────── */
 #define V2_STATUS_READY     0u
@@ -183,8 +189,10 @@ struct v2_timings {
      * flash silicon itself. */
     volatile uint32_t xport_mode;
 
-    /* Reserved for growth. */
-    volatile uint32_t reserved[1];
+    /* Byte-program wire-address offset. Added to the passed spi_addr
+     * before framing the BYTE_PRG command. Default 4 (the empirical
+     * off-by-4 workaround). Set to 0 to observe raw landing behavior. */
+    volatile uint32_t byte_prog_offset;
 };
 
 #define V2_XPORT_DMA 0u
@@ -207,5 +215,6 @@ struct v2_timings {
 #define V2_TIM_DEFAULT_ERASE_POLL_INTERVAL_US    2000u
 #define V2_TIM_DEFAULT_ERASE_POLL_BUDGET_US      500000u
 #define V2_TIM_DEFAULT_XPORT_MODE                V2_XPORT_DMA
+#define V2_TIM_DEFAULT_BYTE_PROG_OFFSET          0u
 
 #endif /* SRAM_FLASH_MAILBOX_V2_H */

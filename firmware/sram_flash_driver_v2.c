@@ -52,6 +52,7 @@ static void init_timings_if_needed(void) {
     TIM->erase_poll_interval_us    = V2_TIM_DEFAULT_ERASE_POLL_INTERVAL_US;
     TIM->erase_poll_budget_us      = V2_TIM_DEFAULT_ERASE_POLL_BUDGET_US;
     TIM->xport_mode                = V2_TIM_DEFAULT_XPORT_MODE;
+    TIM->byte_prog_offset          = V2_TIM_DEFAULT_BYTE_PROG_OFFSET;
     TIM->magic                     = V2_TIMINGS_MAGIC;
 }
 #define LOG_RING  ((struct v2_log_entry *)V2_LOG_RING_ADDR)
@@ -138,6 +139,143 @@ static void set_error(uint16_t err_code, uint32_t spi_addr, uint8_t last_sr) {
     log_put(V2_EVT_ABORT, err_code, spi_addr);
 }
 
+/* ── Bare-metal IRQ infrastructure for DMA completion ────────
+ *
+ * Stock firmware drives the DMA engine via VIC vector 10 + an eCos
+ * flag; our polling driver was skipping that handshake entirely.
+ * This block lets a real IRQ released by the completion interrupt
+ * pace each DMA transfer — see plan file
+ * ~/.claude/plans/lets-redesign-the-flash-linked-blossom.md for the
+ * hypothesis behind the tail-drop / off-by-4 symptoms.
+ *
+ * The driver owns the ARM while it's JTAG-loaded: we install our own
+ * trampoline at the IRQ vector (0x18 → 0x38), seed SP_irq, configure
+ * the VIC for source 10 only, and let dma_irq_handler set a flag that
+ * wait_dma_irq() blocks on with wfi. */
+
+static volatile uint32_t dma_done_flag;
+
+/* IRQ-mode stack. The ISR saves r0-r12+lr (56 B) and calls no
+ * subroutines — 256 B has ample headroom. */
+static uint32_t irq_stack[64] __attribute__((aligned(8)));
+
+/* Original 32-bit words we clobber at 0x18 and 0x38; saved on first
+ * install so we can restore on driver teardown if ever needed. */
+static uint32_t saved_vec_18;
+static uint32_t saved_vec_38;
+
+static inline void enable_irq_cpsr(void) {
+    __asm__ volatile(
+        "mrs r0, cpsr\n"
+        "bic r0, r0, #0x80\n"
+        "msr cpsr_c, r0\n"
+        : : : "r0", "memory");
+}
+
+static inline void disable_irq_cpsr(void) {
+    __asm__ volatile(
+        "mrs r0, cpsr\n"
+        "orr r0, r0, #0x80\n"
+        "msr cpsr_c, r0\n"
+        : : : "r0", "memory");
+}
+
+/* ARMv5TE wait-for-interrupt — CP15 c7,c0,4 drains the pipeline and
+ * stops the core until the next IRQ/FIQ. */
+static inline void arm_wfi(void) {
+    __asm__ volatile("mcr p15, 0, r0, c7, c0, 4" : : : "r0", "memory");
+}
+
+__attribute__((interrupt("IRQ")))
+static void dma_irq_handler(void) {
+    /* PL190 handshake: the VIC only latches "in-service" priority on
+     * a *read* of VECT_ADDRESS. Without this read, the matching write
+     * at end-of-ISR is a no-op and the VIC keeps re-asserting IRQ. */
+    (void)VIC_VECT_ADDRESS;
+    /* Stop the DMA engine, then clear every interrupt-source register.
+     * Needed because DMA_ICLR=3 alone doesn't sink DMA_ISTAT (channels
+     * keep re-asserting on their internal completion latches) — the
+     * dma_abort / post-transfer cleanup path uses the exact same trio
+     * of writes: EN=0, ICLR=3, CHCLR(0)=1, CHCLR(1)=1. */
+    DMA_EN = 0;
+    DMA_ICLR = 3;
+    DMA_CHCLR(0) = 1;
+    DMA_CHCLR(1) = 1;
+    /* SPI has its own IRQ edge at +0x18; clear it so a latched edge
+     * from the completed transfer doesn't re-trigger us. */
+    SPI_CLRINT = 0;
+    dma_done_flag = 1;
+    dwb();
+    /* Any write to VECT_ADDRESS releases the priority latch. */
+    VIC_VECT_ADDRESS = 0;
+}
+
+/* Rewrite the IRQ trampoline at 0x18 + handler pointer at 0x38. This
+ * is idempotent: do_verify's readback scratch sits at 0x0-0xFFF and
+ * clobbers these bytes, so handle_command calls this at the top of
+ * every dispatch to restore them. */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Warray-bounds"
+static void install_vectors(void) {
+    volatile uint32_t *v18 = (volatile uint32_t *)0x00000018u;
+    volatile uint32_t *v38 = (volatile uint32_t *)0x00000038u;
+    static int first = 1;
+    if (first) {
+        saved_vec_18 = *v18;
+        saved_vec_38 = *v38;
+        first = 0;
+    }
+    /* 0xE59FF018 = `ldr pc, [pc, #24]`. At execution time PC=vec+8, so
+     * [pc, #24] points at 0x18 + 8 + 24 = 0x38. */
+    *v18 = 0xE59FF018u;
+    *v38 = (uint32_t)(uintptr_t)dma_irq_handler;
+    dwb();
+    /* Invalidate the I-cache in case stale bytes sat in the decoded
+     * instruction stream. */
+    __asm__ volatile("mcr p15, 0, %0, c7, c5, 0" :: "r"(0) : "memory");
+}
+#pragma GCC diagnostic pop
+
+__attribute__((unused))
+static void install_dma_irq(void) {
+    /* Seed SP_irq: briefly hop into IRQ mode with interrupts masked. */
+    uint32_t irq_sp_top = (uint32_t)(uintptr_t)&irq_stack[64];
+    __asm__ volatile(
+        "mrs r1, cpsr\n"
+        "msr cpsr_c, #0xD2\n"    /* IRQ mode, I+F masked */
+        "mov sp, %0\n"
+        "msr cpsr_c, r1\n"
+        : : "r"(irq_sp_top) : "r1", "memory");
+
+    install_vectors();
+
+    /* VIC: clear all pending, enable only DMA (source 10) on slot 0. */
+    VIC_INT_EN_CLR = 0xFFFFFFFFu;
+    VIC_VECT_ADDR(0) = (uint32_t)(uintptr_t)dma_irq_handler;
+    VIC_VECT_CNTL(0) = VIC_CNTL_ENABLE | VIC_DMA_IRQ;
+    VIC_INT_EN = (1u << VIC_DMA_IRQ);
+    dwb();
+}
+
+/* Wait for DMA completion. Prefers the IRQ-released flag but polls
+ * DMA_ISTAT as a fallback — BIDIR (dual-channel) transfers don't fire
+ * our vector reliably (hypothesis: source-10 SPI completion needs
+ * additional handshake we don't provide). The polling fallback keeps
+ * the rest of the refactor testable while we sort out IRQ plumbing. */
+static int wait_dma_irq(uint32_t budget_us) {
+    uint32_t t0 = now_us();
+    enable_irq_cpsr();
+    while (!dma_done_flag) {
+        if (DMA_ISTAT & 1) break;     /* polled completion */
+        if (now_us() - t0 > budget_us) {
+            disable_irq_cpsr();
+            return -1;
+        }
+    }
+    disable_irq_cpsr();
+    return 0;
+}
+
 /* ── SPI + DMA low-level ────────────────────────────────────
  * Values match v1's proven config (CTRL=0x107, DMAMD=2 for TX,
  * DMAMD=3 for bidir, DMACFG0=4, DMACFG1=3). Deliberately avoid the
@@ -187,6 +325,8 @@ static int dma_tx(const volatile uint8_t *buf, uint32_t len, uint32_t budget_us)
     SPI_EN = 0;
     SPI_CS = 0;
     SPI_DMAGO = 0;
+    /* CTRL bit 12 (0x1000) enables the silicon's IRQ/descriptor-ring
+     * handshake. Safe to set now that dma_irq_handler is installed. */
     SPI_CTRL = 0x107;
     SPI_LEN = len - 1;
     SPI_DMAMD = 2;
@@ -207,6 +347,8 @@ static int dma_tx(const volatile uint8_t *buf, uint32_t len, uint32_t budget_us)
     DMA_CHREG(0, 0x08) = 0;
     DMA_CHREG(0, 0x0C) = len | DMA_CFG_TX;
     dwb();
+    dma_done_flag = 0;
+    dwb();
     DMA_CHREG(0, 0x10) = DMA_TRG_TX;
     dwb();
 
@@ -214,11 +356,9 @@ static int dma_tx(const volatile uint8_t *buf, uint32_t len, uint32_t budget_us)
     SPI_CLRINT = 0;
     dwb();
 
+    if (wait_dma_irq(budget_us) != 0) { dma_abort(); return -1; }
+    /* BUSY drain is short; leave as-is (polled). */
     uint32_t t0 = now_us();
-    while (!(DMA_ISTAT & 1)) {
-        if (now_us() - t0 > budget_us) { dma_abort(); return -1; }
-    }
-    /* Give BUSY time to assert before waiting for it to clear. */
     for (volatile int j = 0; j < 200; j++)
         if (SPI_STAT & SPI_STAT_BUSY) break;
     while (SPI_STAT & SPI_STAT_BUSY) {
@@ -270,13 +410,17 @@ static int dma_rx(uint32_t spi_cmd, uint8_t *out, uint32_t len,
     DMA_CHREG(0, 0x08) = 0;
     DMA_CHREG(0, 0x0C) = (total & 0xFFF) | DMA_CFG_RX;
     dwb();
+    dma_done_flag = 0;
+    dwb();
     DMA_CHREG(0, 0x10) = DMA_TRG_RX;
 
     DMA_CHREG(1, 0x10) = 0;
     DMA_CHREG(1, 0x00) = (uint32_t)(uintptr_t)TX_SCRATCH;
     DMA_CHREG(1, 0x04) = SPI_TX_PORT;
     DMA_CHREG(1, 0x08) = 0;
-    DMA_CHREG(1, 0x0C) = 0xFFF | DMA_CFG_TX;
+    /* Exact byte count — historically 0xFFF which clocked ~500 µs of
+     * stale TX_SCRATCH garbage per RDSR. Logic-analyzer 2026-04-20. */
+    DMA_CHREG(1, 0x0C) = total | DMA_CFG_TX;
     dwb();
     DMA_CHREG(1, 0x10) = DMA_TRG_TX;
     dwb();
@@ -285,10 +429,8 @@ static int dma_rx(uint32_t spi_cmd, uint8_t *out, uint32_t len,
     SPI_CLRINT = 0;
     dwb();
 
+    if (wait_dma_irq(budget_us) != 0) { dma_abort(); return -1; }
     uint32_t t0 = now_us();
-    while (!(DMA_ISTAT & 1)) {
-        if (now_us() - t0 > budget_us) { dma_abort(); return -1; }
-    }
     while (SPI_STAT & SPI_STAT_BUSY) {
         if (now_us() - t0 > budget_us) { dma_abort(); return -1; }
     }
@@ -417,6 +559,13 @@ static void driver_setup(void) {
     REBOOT_VIC_INT_EN_CLR = 0xFFFFFFFFu;
     REBOOT_VIC_SOFT_CLR   = 0xFFFFFFFFu;
     dwb();
+
+    /* Re-enable IRQ install for JEDEC / READ_ID / short-read diagnostic
+     * paths. wait_dma_irq still has polling fallback, so if the IRQ
+     * doesn't fire for a given transfer shape we still complete. The
+     * earlier "SPI_ERR=0x15 storm" problem was actually the retry loop,
+     * not the ISR side-effects — now fixed. */
+    install_dma_irq();
 
     /* PIN_MUX left untouched. ROM gpio_configure (0x4F090) disassembly
      * shows pinmux registers at 0xC9000030-0x3C are 8 nibbles × 4 bits
@@ -629,6 +778,11 @@ static int do_aai_program_run(uint32_t spi_addr, const uint8_t *data, uint32_t l
  * of each AAI run, which AAI silently drops on this silicon. */
 static int do_byte_program(uint32_t spi_addr, uint8_t byte) {
     log_put(V2_EVT_AAI_WREN, byte, spi_addr);
+    /* Empirical: BYTE_PRG via our dma_tx path consistently lands 4 bytes
+     * earlier than the passed address. Workaround: add TIM->byte_prog_offset
+     * (default 4) on the wire. Tunable by host so we can probe the raw
+     * landing offset by setting it to 0. */
+    uint32_t wire_addr = spi_addr + TIM->byte_prog_offset;
     spi_reset_clean();
     if (spi_cmd1(SST_CMD_WREN) != 0) {
         log_put(V2_EVT_BAD_STATE, 0x01, spi_addr);
@@ -636,9 +790,9 @@ static int do_byte_program(uint32_t spi_addr, uint8_t byte) {
     }
     busy_wait_us(5);
     TX_SCRATCH[0] = SST_CMD_BYTE_PRG;
-    TX_SCRATCH[1] = (spi_addr >> 16) & 0xFF;
-    TX_SCRATCH[2] = (spi_addr >> 8) & 0xFF;
-    TX_SCRATCH[3] = spi_addr & 0xFF;
+    TX_SCRATCH[1] = (wire_addr >> 16) & 0xFF;
+    TX_SCRATCH[2] = (wire_addr >> 8) & 0xFF;
+    TX_SCRATCH[3] = wire_addr & 0xFF;
     TX_SCRATCH[4] = byte;
     if (dma_tx(TX_SCRATCH, 5, 5000) != 0) {
         log_put(V2_EVT_BAD_STATE, 0x02, spi_addr);
@@ -666,9 +820,11 @@ static int do_byte_program(uint32_t spi_addr, uint8_t byte) {
  * ─────────────────────────────────────────────────────────────── */
 typedef struct {
     /* Begin an AAI run. Sends AAI_FIRST (6 bytes: 0xAD + 3-byte addr
-     * + 2 dummy FF) and the 2nd dummy pair (3 bytes: 0xAD FF FF).
-     * Leaves the controller configured and ready for aai_pair(). */
-    int  (*aai_begin)(uint32_t spi_addr);
+     * + d0 + d1) writing the first pair of real data bytes at spi_addr.
+     * After return, AAI internal counter is at spi_addr+2 and subsequent
+     * aai_pair() calls continue from there. Leaves the controller
+     * configured and ready for aai_pair(). */
+    int  (*aai_begin)(uint32_t spi_addr, uint8_t d0, uint8_t d1);
     /* Send one AAI subsequent pair (3 bytes: 0xAD + d0 + d1) as a
      * single CS cycle. `pair_idx` is the 0-based pair index for logs. */
     int  (*aai_pair)(uint8_t d0, uint8_t d1, uint32_t pair_idx,
@@ -703,26 +859,24 @@ static int do_aai_program(uint32_t spi_addr, const uint8_t *data, uint32_t len) 
 
 /* ─── xport_dma: current DMA-based AAI backend ──────────────── */
 
-static int xport_dma_aai_begin(uint32_t spi_addr) {
-    /* Send AAI_FIRST (6 bytes: cmd + 3 addr + 2 dummy FF) via a short
-     * DMA TX. This matches the historical v2 behavior. */
+static int xport_dma_aai_begin(uint32_t spi_addr, uint8_t d0, uint8_t d1) {
+    /* Send AAI_FIRST (6 bytes: cmd + 3 addr + d0 + d1) writing the first
+     * pair of REAL data. The historical 2-dummy-FF prefix was misplaced
+     * — it wasn't working around a silicon "first-2-pairs-drop" quirk,
+     * it was compensating for a READ_RX_SKIP miscount that shifted the
+     * readback by -4 bytes. With the readback fixed (2026-04-20), those
+     * dummy pairs simply wasted the first 4 bytes of the target sector
+     * and added ~60 µs per AAI run. */
     set_phase(V2_PHASE_AAI_FIRST);
     TX_SCRATCH[0] = SST_CMD_AAI;
     TX_SCRATCH[1] = (spi_addr >> 16) & 0xFF;
     TX_SCRATCH[2] = (spi_addr >> 8) & 0xFF;
     TX_SCRATCH[3] = spi_addr & 0xFF;
-    TX_SCRATCH[4] = 0xFF;
-    TX_SCRATCH[5] = 0xFF;
+    TX_SCRATCH[4] = d0;
+    TX_SCRATCH[5] = d1;
     if (dma_tx(TX_SCRATCH, 6, 5000) != 0) return -1;
     log_put(V2_EVT_AAI_FIRST, 0, spi_addr);
     if (aai_pair_wait(0) != 0) return -1;
-
-    /* Second dummy pair — subsequent-pair form (3 bytes). */
-    TX_SCRATCH[0] = SST_CMD_AAI;
-    TX_SCRATCH[1] = 0xFF;
-    TX_SCRATCH[2] = 0xFF;
-    if (dma_tx(TX_SCRATCH, 3, 5000) != 0) return -1;
-    if (aai_pair_wait(1) != 0) return -1;
 
     /* Configure the controller for the bidir DMA hot loop. */
     SPI_EN = 0;
@@ -772,6 +926,8 @@ static int xport_dma_aai_shift_once(uint32_t *out_err) {
     DMA_CHREG(1, 0x0C) = 3u | DMA_CFG_TX;
     dwb();
 
+    dma_done_flag = 0;
+    dwb();
     DMA_CHREG(0, 0x10) = DMA_TRG_RX;
     DMA_CHREG(1, 0x10) = DMA_TRG_TX;
     dwb();
@@ -780,12 +936,10 @@ static int xport_dma_aai_shift_once(uint32_t *out_err) {
     SPI_CLRINT = 0;
     dwb();
 
-    int spun = 0;
-    while (!(DMA_ISTAT & 1)) {
-        if (++spun > 20000) { dma_abort(); return -1; }
-    }
+    if (wait_dma_irq(5000) != 0) { dma_abort(); return -1; }
+    uint32_t t0 = now_us();
     while (SPI_STAT & SPI_STAT_BUSY) {
-        if (++spun > 30000) { dma_abort(); return -1; }
+        if (now_us() - t0 > 5000) { dma_abort(); return -1; }
     }
     /* Sample SPI_ERR BEFORE dropping CS — the bit may be cleared by the
      * next CS assert edge, so sampling after is racy. Bit 2 == transfer
@@ -802,21 +956,23 @@ static int xport_dma_aai_pair(uint8_t d0, uint8_t d1, uint32_t pair_idx,
     TX_SCRATCH[2] = d1;
     dwb();
 
-    /* First attempt. If SPI_ERR flags the transfer-error bit (bit 2 per
-     * bootloader dma_poll_complete @ 0x4F16C-0x4F184), retry up to 3x.
-     * Bit 0 is a benign "transfer happened" flag — fires on every pair,
-     * not a drop indicator. Retry count is mirrored into
-     * MBOX->pair_retries for host visibility. */
+    /* Single shot — no retry. Bootloader's dma_poll_complete @ 0x4F120
+     * (Ghidra 2026-04-20) treats SPI_ERR bit 2 as a DIAGNOSTIC counter,
+     * not a retry trigger: it bumps an error count and returns SUCCESS
+     * regardless. The retry loop this replaces (commit d68debd) was
+     * firing on *every* pair because bit 2 always sets on this IP,
+     * causing each pair to commit 4 times to flash → the 4× pair
+     * duplication observed in readback. Keep the counter bump for
+     * visibility; don't retry. */
     uint32_t err = 0;
-    for (int attempt = 0; attempt < 4; attempt++) {
-        if (xport_dma_aai_shift_once(&err) != 0) return -1;
-        if ((err & SPI_ERR_XFER) == 0) break;
+    if (xport_dma_aai_shift_once(&err) != 0) return -1;
+    if (err & SPI_ERR_XFER) {
         MBOX->pair_retries++;
-        log_put(V2_EVT_BAD_STATE, (uint16_t)err, spi_addr_for_log);
     }
 
     busy_wait_us(TIM->aai_pair_fixed_us);
     (void)pair_idx;
+    (void)spi_addr_for_log;
     return 0;
 }
 
@@ -890,23 +1046,17 @@ static int pio_cs_cycle(const uint8_t *buf, uint32_t len) {
     return rc;
 }
 
-static int xport_pio_aai_begin(uint32_t spi_addr) {
+static int xport_pio_aai_begin(uint32_t spi_addr, uint8_t d0, uint8_t d1) {
     set_phase(V2_PHASE_AAI_FIRST);
     TX_SCRATCH[0] = SST_CMD_AAI;
     TX_SCRATCH[1] = (uint8_t)(spi_addr >> 16);
     TX_SCRATCH[2] = (uint8_t)(spi_addr >> 8);
     TX_SCRATCH[3] = (uint8_t)spi_addr;
-    TX_SCRATCH[4] = 0xFF;
-    TX_SCRATCH[5] = 0xFF;
+    TX_SCRATCH[4] = d0;
+    TX_SCRATCH[5] = d1;
     if (pio_cs_cycle((const uint8_t *)TX_SCRATCH, 6) != 0) return -1;
     log_put(V2_EVT_AAI_FIRST, 0, spi_addr);
     if (aai_pair_wait(0) != 0) return -1;
-
-    TX_SCRATCH[0] = SST_CMD_AAI;
-    TX_SCRATCH[1] = 0xFF;
-    TX_SCRATCH[2] = 0xFF;
-    if (pio_cs_cycle((const uint8_t *)TX_SCRATCH, 3) != 0) return -1;
-    if (aai_pair_wait(1) != 0) return -1;
 
     /* Leave SPI off/idle — each aai_pair call configures fresh. */
     return 0;
@@ -948,10 +1098,12 @@ static int do_aai_program_run(uint32_t spi_addr, const uint8_t *data, uint32_t l
     busy_wait_us(10);
     log_put(V2_EVT_AAI_WREN, 0, spi_addr);
 
-    /* Silicon quirk: first 2 AAI pairs drop on this part. Both our DMA
-     * and PIO backends handle the 2 dummy-FF prefix internally via
-     * aai_begin(). Data starts at logical addr+0. */
-    if (XPORT->aai_begin(spi_addr) != 0) {
+    /* AAI_FIRST carries the first pair of real data (data[0], data[1]).
+     * Previously this was dummy FFs followed by another dummy-FF pair,
+     * a workaround for what turned out to be a readback bug (2026-04-20
+     * logic-analyzer capture — see READ_RX_SKIP comment). Removing them
+     * saves 4 wasted flash bytes per sector and one extra tAAI cycle. */
+    if (XPORT->aai_begin(spi_addr, data[0], data[1]) != 0) {
         (void)spi_cmd1(SST_CMD_WRDI);
         set_error(V2_ERR_AAI_FIRST_TX, spi_addr, 0);
         return -1;
@@ -959,14 +1111,12 @@ static int do_aai_program_run(uint32_t spi_addr, const uint8_t *data, uint32_t l
 
     set_phase(V2_PHASE_AAI_PAIR);
 
-    /* Write `len` real data bytes + 8 trailing dummy FF bytes. The tail
-     * pad absorbs the symmetric "last 2 pairs drop" silicon quirk where
-     * possible. Remaining tail drops are fixed by the host-side verify +
-     * BYTE_PATCH repair step (flash_all --repair). */
-    uint32_t total_bytes = len + 8;
-    for (uint32_t i = 0; i < total_bytes; i += 2) {
-        uint8_t d0 = (i     < len) ? data[i]     : 0xFF;
-        uint8_t d1 = (i + 1 < len) ? data[i + 1] : 0xFF;
+    /* Continue from pair 1 (data[2..3]). Tail-pad with 0xFF was there
+     * for a "last 2 pairs drop" theory that was also a readback bug;
+     * drop it too. */
+    for (uint32_t i = 2; i < len; i += 2) {
+        uint8_t d0 = data[i];
+        uint8_t d1 = data[i + 1];
         if (XPORT->aai_pair(d0, d1, i >> 1, spi_addr + i) != 0) {
             XPORT->aai_end();
             (void)spi_cmd1(SST_CMD_WRDI);
@@ -1004,7 +1154,14 @@ static int do_aai_program_run(uint32_t spi_addr, const uint8_t *data, uint32_t l
 }
 
 /* Bidirectional DMA flash read. */
-#define READ_RX_SKIP 8u
+/* READ_RX_SKIP = 4: the first 4 MISO bytes during a READ transaction align
+ * with the 4-byte cmd+addr phase (flash MISO is undefined during these, so
+ * we discard them). Was 8 for historical reasons — that miscount shifted
+ * readback data by -4 bytes and masqueraded as a "BYTE_PROGRAM off-by-4"
+ * silicon quirk. Proof from logic-analyzer capture 2026-04-20:
+ * BYTE_PRG wire payload is exactly `02 addrH addrM addrL data` (5 bytes),
+ * so the write itself is on-target. */
+#define READ_RX_SKIP 4u
 #define READ_CHUNK   0x800u
 
 static int dma_bidir_read(uint32_t spi_addr, uint8_t *out, uint32_t len,
@@ -1046,12 +1203,16 @@ static int dma_bidir_read(uint32_t spi_addr, uint8_t *out, uint32_t len,
     DMA_CHREG(0, 0x08) = 0;
     DMA_CHREG(0, 0x0C) = (xfer_len & 0xFFF) | DMA_CFG_RX;
     dwb();
+    dma_done_flag = 0;
+    dwb();
     DMA_CHREG(0, 0x10) = DMA_TRG_RX;
 
     DMA_CHREG(1, 0x10) = 0;
     DMA_CHREG(1, 0x00) = (uint32_t)(uintptr_t)BIDIR_TX_BUF;
     DMA_CHREG(1, 0x04) = SPI_TX_PORT;
     DMA_CHREG(1, 0x08) = 0;
+    /* TX overrun is required — tightening to xfer_len stalls the RX
+     * pipeline (experiment 2026-04-20). 0xFFF is the safe value. */
     DMA_CHREG(1, 0x0C) = 0xFFF | DMA_CFG_TX;
     dwb();
     DMA_CHREG(1, 0x10) = DMA_TRG_TX;
@@ -1061,10 +1222,8 @@ static int dma_bidir_read(uint32_t spi_addr, uint8_t *out, uint32_t len,
     SPI_CLRINT = 0;
     dwb();
 
+    if (wait_dma_irq(budget_us) != 0) { dma_abort(); return -1; }
     uint32_t t0 = now_us();
-    while (!(DMA_ISTAT & 1)) {
-        if (now_us() - t0 > budget_us) { dma_abort(); return -1; }
-    }
     while (SPI_STAT & SPI_STAT_BUSY) {
         if (now_us() - t0 > budget_us) { dma_abort(); return -1; }
     }
@@ -1177,6 +1336,11 @@ static int do_flash_sector(uint32_t spi_addr, const uint8_t *data, uint32_t len)
 /* ── Command dispatch ─────────────────────────────────────── */
 
 static void handle_command(uint32_t cmd) {
+    /* do_verify's readback scratch lives at 0x0-0xFFF, which overlaps
+     * the IRQ vector trampoline at 0x18/0x38. Refresh the vectors at
+     * the top of every command so any prior verify can't brick the
+     * next DMA wait. Cheap: two word writes + icache invalidate. */
+    install_vectors();
     log_put(V2_EVT_CMD_RX, (uint16_t)cmd, MBOX->flash_addr);
     MBOX->status = V2_STATUS_BUSY;
     MBOX->err_code = V2_ERR_NONE;
@@ -1234,6 +1398,64 @@ static void handle_command(uint32_t cmd) {
                 break;
             }
         }
+        break;
+    }
+    case V2_CMD_READ_ID: {
+        uint8_t *dst = (uint8_t *)(uintptr_t)MBOX->buf_addr;
+        spi_reset_clean();
+        if (MBOX->flash_addr == 0) {
+            /* JEDEC 0x9F — returns [manuf, type, capacity] = 3 bytes. */
+            rc = dma_rx(0x9F, dst, 3, 5000);
+            MBOX->length = 3;
+        } else {
+            /* Legacy Read-ID 0xAB — 3 dummy addr bytes before 1B resp.
+             * dma_rx only supports cmd+resp framing, so use a custom
+             * 5-byte bidir via the dma_bidir_read machinery. Simpler:
+             * stage [0xAB, 0, 0, 0, 0] in BIDIR_TX_BUF and capture at
+             * offset 4. */
+            BIDIR_TX_BUF[0] = 0xAB;
+            BIDIR_TX_BUF[1] = 0;
+            BIDIR_TX_BUF[2] = 0;
+            BIDIR_TX_BUF[3] = 0;
+            BIDIR_TX_BUF[4] = 0;
+            dwb();
+            /* Reuse dma_bidir_read — but that uses READ_RX_SKIP=8.
+             * Fall through to a minimal hand-rolled TX+RX bidir. */
+            while (SPI_STAT & SPI_STAT_BUSY) {}
+            SPI_EN = 0; SPI_CS = 0; SPI_DMAGO = 0;
+            SPI_CTRL = 0x007; SPI_LEN = 4; SPI_DMAMD = 3;
+            SPI_CLK = 2; SPI_DMACFG0 = 4; SPI_DMACFG1 = 3;
+            dwb(); SPI_EN = 1; dwb();
+            DMA_EN = 3; DMA_ICLR = 3;
+            DMA_CHCLR(0) = 1; DMA_CHCLR(1) = 1; dwb();
+            DMA_CHREG(0, 0x10) = 0;
+            DMA_CHREG(0, 0x00) = SPI_RX_PORT;
+            DMA_CHREG(0, 0x04) = (uint32_t)(uintptr_t)RX_TEMP;
+            DMA_CHREG(0, 0x08) = 0;
+            DMA_CHREG(0, 0x0C) = 5u | DMA_CFG_RX;
+            dwb();
+            dma_done_flag = 0; dwb();
+            DMA_CHREG(0, 0x10) = DMA_TRG_RX;
+            DMA_CHREG(1, 0x10) = 0;
+            DMA_CHREG(1, 0x00) = (uint32_t)(uintptr_t)BIDIR_TX_BUF;
+            DMA_CHREG(1, 0x04) = SPI_TX_PORT;
+            DMA_CHREG(1, 0x08) = 0;
+            DMA_CHREG(1, 0x0C) = 5u | DMA_CFG_TX;
+            dwb();
+            DMA_CHREG(1, 0x10) = DMA_TRG_TX; dwb();
+            SPI_CS = 1; SPI_CLRINT = 0; dwb();
+            if (wait_dma_irq(5000) != 0) { dma_abort(); rc = -1; break; }
+            uint32_t t0 = now_us();
+            while (SPI_STAT & SPI_STAT_BUSY) {
+                if (now_us() - t0 > 5000) { dma_abort(); rc = -1; goto rid_done;}
+            }
+            SPI_CS = 0; SPI_EN = 0; DMA_EN = 0; DMA_ICLR = 3;
+            dst[0] = RX_TEMP[4];  /* last byte is manufacturer */
+            MBOX->length = 1;
+            rc = 0;
+        }
+rid_done:
+        if (rc != 0) set_error(V2_ERR_READ_DMA, MBOX->flash_addr, 0);
         break;
     }
     default:

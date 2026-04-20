@@ -284,4 +284,26 @@
 #define SST_SR_AAI        0x40  /* AAI in progress */
 #define SST_SR_BPL        0x80  /* Block Protection Lock */
 
+/* ──────────────────────────────────────────────────────────────
+ * PL190-style VIC @ 0xFFFFF000
+ *
+ * Bootloader `install_vic_handlers` and the stock firmware's
+ * cyg_interrupt_create(n, ...) both treat this as a 32-source PL190:
+ *   +0x00 IRQ_STAT, +0x04 FIQ_STAT, +0x08 RAW_STAT
+ *   +0x10 INT_EN, +0x14 INT_EN_CLR, +0x30 VECT_ADDRESS
+ *   +0x100..+0x17C 16× VECT_ADDR[n], +0x200..+0x27C 16× VECT_CNTL[n]
+ *
+ * DMA-completion is source 10 (stock flash driver calls
+ * cyg_interrupt_create(10, ...) at init time — 0x9594 ISR returns 2
+ * and the DSR at 0x951C clears DMA_ISTAT and signals a cyg flag).
+ * ────────────────────────────────────────────────────────────── */
+#define VIC_BASE            0xFFFFF000u
+#define VIC_INT_EN          (*(volatile uint32_t *)(VIC_BASE + 0x10))
+#define VIC_INT_EN_CLR      (*(volatile uint32_t *)(VIC_BASE + 0x14))
+#define VIC_VECT_ADDRESS    (*(volatile uint32_t *)(VIC_BASE + 0x30))
+#define VIC_VECT_ADDR(n)    (*(volatile uint32_t *)(VIC_BASE + 0x100 + (n)*4))
+#define VIC_VECT_CNTL(n)    (*(volatile uint32_t *)(VIC_BASE + 0x200 + (n)*4))
+#define VIC_CNTL_ENABLE     0x20u
+#define VIC_DMA_IRQ         10u
+
 #endif /* DICE3_HW_H */

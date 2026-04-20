@@ -1,3 +1,6 @@
 timestamp,ref,aai_pair_fixed_us,aai_pair_poll_budget_us,erase_fixed_us,ops,failed_ops,patched_bytes,repair_runs,flash_s,repair_s
 2026-04-18T18:53:33,blender_spi_flash_restored.bin,20,0,60000,5,0,12,3,7.8,5.0
 2026-04-18T22:53:23,blender_spi_flash_restored.bin,20,0,60000,0,18,1,0,48,15,147.7,107.1
+2026-04-18T22:59:32,blender_spi_patched.bin,20,0,60000,0,18,1,0,49,15,147.7,107.1
+2026-04-20T13:39:25,blender_spi_patched.bin,10,100,60000,0,3,0,0,0,0,4.0,1.5
+2026-04-20T13:43:30,blender_spi_patched.bin,10,100,60000,0,18,0,0,0,0,129.9,88.9
