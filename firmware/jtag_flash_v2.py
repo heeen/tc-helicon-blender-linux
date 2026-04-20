@@ -566,38 +566,56 @@ def plan_erase_ops(sectors, policy):
     return ops
 
 
-def plan_flash_ops(sectors, block_threshold_64k=12, block_threshold_32k=6):
-    """Pick flash ops covering `sectors`. Each op is one JTAG round-trip.
+def plan_flash_ops(ref, image_size, block_threshold_64k=12,
+                   block_threshold_32k=6):
+    """Pick flash ops covering every 4 KB sector in [0, image_size).
 
-    Per 64 KB block containing any non-empty sector:
-      - If ≥ block_threshold_64k sectors non-empty → FLASH_BLOCK(64K)
-      - Else split into two 32 KB halves:
-          - Half with ≥ block_threshold_32k sectors → FLASH_BLOCK(32K)
-          - Else per-sector FLASH_SECTOR
-    Returns a list of ("block_64k"|"block_32k"|"sector", addr, span) tuples.
-    The span is 0x10000, 0x8000, or 0x1000 respectively — tells flash_all
-    how many bytes to upload.
+    For each 64 KB block:
+      - If every byte in reference is 0xFF → single ERASE_64K (fastest)
+      - Else if ≥ block_threshold_64k non-FF sectors → FLASH_BLOCK(64K)
+      - Else split into two 32 KB halves; each half similarly classified
+        (all-FF → ERASE_32K; dense → FLASH_BLOCK(32K); sparse → per-sector)
+
+    Per-sector ops likewise split into ("erase", ...) for all-FF sectors
+    and ("sector", ...) for content. Erase ops leave flash at 0xFF, which
+    is the correct state for any reference byte that's 0xFF.
+
+    Returns list of (kind, addr, span) tuples. kind ∈ {block_64k,
+    block_32k, sector, erase_64k, erase_32k, erase}.
     """
-    sectors = sorted(set(sectors))
-    by_64k = {}
-    for s in sectors:
-        by_64k.setdefault(s & ~(BLOCK_64K - 1), []).append(s)
+    def is_ff(lo, hi):
+        return all(b == 0xFF for b in ref[lo:hi])
 
     ops = []
-    for blk_addr, sec_list in sorted(by_64k.items()):
+    for blk_addr in range(0, image_size, BLOCK_64K):
+        blk_hi = blk_addr + BLOCK_64K
+        if is_ff(blk_addr, blk_hi):
+            ops.append(("erase_64k", blk_addr, BLOCK_64K))
+            continue
+        # Count non-empty sectors in this block
+        sec_list = [blk_addr + i*SECTOR_SIZE
+                    for i in range(BLOCK_64K // SECTOR_SIZE)
+                    if not is_ff(blk_addr + i*SECTOR_SIZE,
+                                 blk_addr + (i+1)*SECTOR_SIZE)]
         if len(sec_list) >= block_threshold_64k:
             ops.append(("block_64k", blk_addr, BLOCK_64K))
             continue
-        low  = [s for s in sec_list if s < blk_addr + BLOCK_32K]
-        high = [s for s in sec_list if s >= blk_addr + BLOCK_32K]
-        for half_secs, half_addr in ((low, blk_addr),
-                                     (high, blk_addr + BLOCK_32K)):
-            if not half_secs: continue
+        # Split into two 32 KB halves
+        for half_addr in (blk_addr, blk_addr + BLOCK_32K):
+            half_hi = half_addr + BLOCK_32K
+            if is_ff(half_addr, half_hi):
+                ops.append(("erase_32k", half_addr, BLOCK_32K))
+                continue
+            half_secs = [s for s in sec_list
+                         if half_addr <= s < half_hi]
             if len(half_secs) >= block_threshold_32k:
                 ops.append(("block_32k", half_addr, BLOCK_32K))
             else:
-                for s in half_secs:
-                    ops.append(("sector", s, SECTOR_SIZE))
+                for sec_addr in range(half_addr, half_hi, SECTOR_SIZE):
+                    if is_ff(sec_addr, sec_addr + SECTOR_SIZE):
+                        ops.append(("erase", sec_addr, SECTOR_SIZE))
+                    else:
+                        ops.append(("sector", sec_addr, SECTOR_SIZE))
     return ops
 
 
@@ -611,52 +629,74 @@ def flash_all(client, args):
     print(f"Reference: {args.ref} ({len(ref)} bytes)")
 
     if args.sectors:
+        # Explicit sector list — treat each as a separate op (content or
+        # erase decided per-sector).
         sectors = [int(s.strip(), 0) for s in args.sectors.split(",") if s.strip()]
+        ops = []
+        for addr in sectors:
+            if all(b == 0xFF for b in ref[addr:addr + SECTOR_SIZE]):
+                ops.append(("erase", addr, SECTOR_SIZE))
+            else:
+                ops.append(("sector", addr, SECTOR_SIZE))
     else:
-        sectors = []
-        for addr in range(0, len(ref), SECTOR_SIZE):
-            if any(b != 0xFF for b in ref[addr:addr + SECTOR_SIZE]):
-                sectors.append(addr)
+        # Cover the ENTIRE reference image. All-FF regions get erase-only
+        # ops; content regions get flash-sector/block as before. No more
+        # "skip empties" shortcut that leaves stale bytes behind.
+        ops = plan_flash_ops(ref, len(ref))
     if args.limit > 0:
-        sectors = sectors[:args.limit]
+        ops = ops[:args.limit]
 
-    ops = plan_flash_ops(sectors)
     kinds = {}
     for k, *_ in ops: kinds[k] = kinds.get(k, 0) + 1
     kind_summary = ", ".join(f"{v}×{k}" for k, v in sorted(kinds.items()))
-    total_kb = len(sectors) * SECTOR_SIZE // 1024
-    print(f"  {len(sectors)} non-empty sectors ({total_kb} KB); "
+    non_empty = sum(span for k, _, span in ops if not k.startswith("erase"))
+    print(f"  {non_empty // 1024} KB content, "
           f"plan: {kind_summary} ({len(ops)} commands)")
 
     if not client.bp_clear():
         return 1
 
+    if args.pre_erase_mb > 0:
+        # Erase the first N MB of the chip as 64 KB blocks. Catches stale
+        # garbage in sectors that are "empty" in the reference and would
+        # otherwise be skipped — those leftover bytes break the boot-
+        # loader's whole-region CRC check.
+        erase_end = args.pre_erase_mb * 0x100000
+        pre_t0 = time.monotonic()
+        n_blocks = erase_end // 0x10000
+        print(f"Pre-erasing 0..0x{erase_end:06x} "
+              f"({n_blocks} × 64 KB blocks)...")
+        for addr in range(0, erase_end, 0x10000):
+            if not client.erase_64k(addr):
+                print(f"  pre-erase 0x{addr:06x} FAILED"); return 1
+        print(f"Pre-erase done in {time.monotonic()-pre_t0:.1f}s")
+
     total_t0 = time.monotonic()
     failed = []
     total_retries = 0
     for op_idx, (kind, addr, span) in enumerate(ops):
-        # Pull the block data from ref.
-        data = ref[addr:addr + span]
         op_t0 = time.monotonic()
-        if kind == "sector":
-            ok = client.flash_sector(addr, data)
-        else:
-            ok = client.flash_block(addr, data)
+        if kind == "erase":
+            ok = client.erase(addr)
+        elif kind == "erase_32k":
+            ok = client.erase_32k(addr)
+        elif kind == "erase_64k":
+            ok = client.erase_64k(addr)
+        elif kind == "sector":
+            ok = client.flash_sector(addr, ref[addr:addr+span])
+        else:   # block_32k, block_64k
+            ok = client.flash_block(addr, ref[addr:addr+span])
         dt = time.monotonic() - op_t0
         # Driver resets pair_retries per command, so snapshot after each op.
         try: op_retries = client.o.mdw(MBOX_ADDR + O_PAIR_RETRIES)
         except Exception: op_retries = 0
         total_retries += op_retries
-        label = kind if kind != "sector" else "sector"
         status = "OK" if ok else "FAIL"
         retry_note = f" retries={op_retries}" if op_retries else ""
-        print(f"  [{op_idx+1}/{len(ops)}] {label} 0x{addr:06x} "
+        print(f"  [{op_idx+1}/{len(ops)}] {kind} 0x{addr:06x} "
               f"len={span} {status} {dt:.2f}s{retry_note}")
         if not ok:
-            # Mark all sectors covered by this op as failed.
-            for s in sectors:
-                if addr <= s < addr + span:
-                    failed.append((kind, s))
+            failed.append((kind, addr))
 
     total = time.monotonic() - total_t0
     print(f"\n=== flash-all done in {total:.1f}s, "
@@ -763,10 +803,18 @@ def main():
                         "'flash-all' = write every non-empty sector from --ref")
     p.add_argument("--limit", type=int, default=0,
                    help="flash-all: stop after N sectors (0 = all)")
-    p.add_argument("--repair", action=argparse.BooleanOptionalAction, default=True,
+    p.add_argument("--pre-erase-mb", type=int, default=0,
+                   help="flash-all: 64 KB-block-erase the first N MB before "
+                        "programming. Use 1 for primary region (catches "
+                        "stale bytes in sectors that are empty in --ref but "
+                        "non-erased on chip). 0 = no pre-erase (default).")
+    p.add_argument("--repair", action=argparse.BooleanOptionalAction, default=False,
                    help="flash-all: after flashing, host-side-verify every op via "
-                        "CMD_READ and byte-program any mismatched bytes (default on). "
-                        "Counters the on-device verify's tendency to miss tail drops.")
+                        "CMD_READ and byte-program any mismatched bytes. Default "
+                        "OFF — flash ops already include on-device verify via "
+                        "do_verify (same dma_bidir_read path), so repair is "
+                        "redundant when all flash ops report OK. Re-enable with "
+                        "--repair if you distrust on-device verify.")
     p.add_argument("--skip-verify", action="store_true",
                    help="flash-all: skip per-sector verify (faster, riskier)")
     p.add_argument("--sectors", type=str, default="",

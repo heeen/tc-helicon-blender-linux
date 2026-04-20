@@ -560,12 +560,10 @@ static void driver_setup(void) {
     REBOOT_VIC_SOFT_CLR   = 0xFFFFFFFFu;
     dwb();
 
-    /* Re-enable IRQ install for JEDEC / READ_ID / short-read diagnostic
-     * paths. wait_dma_irq still has polling fallback, so if the IRQ
-     * doesn't fire for a given transfer shape we still complete. The
-     * earlier "SPI_ERR=0x15 storm" problem was actually the retry loop,
-     * not the ISR side-effects — now fixed. */
-    install_dma_irq();
+    /* IRQ install disabled after observing ISR-loop stuck-state right
+     * after a fresh TCAT-BOOT power-up (2026-04-20). Polling fallback
+     * in wait_dma_irq handles all paths correctly. */
+    /* install_dma_irq(); */
 
     /* PIN_MUX left untouched. ROM gpio_configure (0x4F090) disassembly
      * shows pinmux registers at 0xC9000030-0x3C are 8 nibbles × 4 bits

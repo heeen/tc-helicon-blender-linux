@@ -4,3 +4,5 @@ timestamp,ref,aai_pair_fixed_us,aai_pair_poll_budget_us,erase_fixed_us,ops,faile
 2026-04-18T22:59:32,blender_spi_patched.bin,20,0,60000,0,18,1,0,49,15,147.7,107.1
 2026-04-20T13:39:25,blender_spi_patched.bin,10,100,60000,0,3,0,0,0,0,4.0,1.5
 2026-04-20T13:43:30,blender_spi_patched.bin,10,100,60000,0,18,0,0,0,0,129.9,88.9
+2026-04-20T13:55:15,blender_spi_patched.bin,10,100,60000,0,5,0,0,0,0,6.6,2.3
+2026-04-20T13:59:23,blender_spi_patched.bin,10,100,60000,0,18,0,0,0,0,127.0,88.6
