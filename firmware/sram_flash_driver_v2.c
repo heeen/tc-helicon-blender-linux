@@ -524,24 +524,24 @@ static void spi_ip_quiesce(volatile uint32_t *s) {
 }
 
 static void dma_engine_reset(void) {
-    /* The DMA engine has 8 channels (probed 2026-04-22). Stock eCos
-     * init writes DMA_ICLR=0xFF and actively uses CH4/CH5 for LED SPI
-     * DMA. Zeroing CH4..7 descriptors outright desyncs eCos-state runs
-     * (verified 2026-04-22: 17 deterministic failures), so we clear
-     * IRQ flags for all 8 channels but only zero the data regs of the
-     * channels our driver actually uses (CH0+CH1). */
+    /* 8-channel engine (see dice3_dma.h / StockDmaAndSpi.md). Stock
+     * eCos dma_irq_init writes EN=0xFF, ICLR=0xFF, master_en=1. We
+     * disable the master, clear all 8 channel IRQs, then zero the
+     * descriptors of only the channels we'll use (CH0+CH1). Zeroing
+     * CH4..7 descriptors desyncs eCos's LED-SPI DMA state machine
+     * and produces 17 deterministic failures — stay away. */
     volatile uint32_t *dma = (volatile uint32_t *)0x80000000u;
-    dma[0x08 / 4] = 0;          /* DMA_EN = 0 (master off) */
-    dma[0x10 / 4] = 0xFFu;      /* DMA_ICLR all 8 channels (stock uses 0xFF) */
+    dma[0x08 / 4] = 0;          /* DMA_EN = 0 */
+    dma[0x10 / 4] = 0xFFu;      /* DMA_ICLR = 0xFF (8 channels) */
     for (unsigned ch = 0; ch < 4; ch++)
-        dma[0x30 / 4 + ch] = 1;
+        dma[0x30 / 4 + ch] = 1; /* per-channel abort (+0x30..+0x3C) */
     for (unsigned ch = 0; ch < 4; ch++) {
         volatile uint32_t *b = (volatile uint32_t *)(0x80000100u + ch * 0x20u);
-        b[0x10 / 4] = 0;
-        b[0x0C / 4] = 0;
-        b[0x08 / 4] = 0;
-        b[0x00 / 4] = 0;
-        b[0x04 / 4] = 0;
+        b[0x10 / 4] = 0;        /* GO */
+        b[0x0C / 4] = 0;        /* CFG */
+        b[0x08 / 4] = 0;        /* NEXT */
+        b[0x00 / 4] = 0;        /* SRC */
+        b[0x04 / 4] = 0;        /* DST */
     }
     dwb();
 }

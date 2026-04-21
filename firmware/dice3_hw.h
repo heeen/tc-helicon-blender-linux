@@ -172,35 +172,30 @@
 /* ──────────────────────────────────────────────────────────────
  * DMA engine @ 0x80000000
  *
- * Channel 0 is used for flash TX + RX. Channel 1 co-operates with ch0
- * for bidirectional DMA (DMAMD=3). Register layout derived from Ghidra
- * FUN_000091f0 (per-channel arm/trigger) + FUN_0000f384 (transfer start).
+ * Full annotated register map in firmware/dice3_dma.h — use the
+ * `DMA->...` struct accessors there for new code. Macros below are
+ * kept for the v2 flash driver's hot paths and eventually should be
+ * migrated. See also firmware/StockDmaAndSpi.md for the Ghidra
+ * decompile that motivated the struct.
  * ────────────────────────────────────────────────────────────── */
-#define DMA_BASE        0x80000000u
-/* +0x08 EN  — engine enable mask (bit 0 = ch0, bit 1 = ch1). */
-#define DMA_EN          (*(volatile uint32_t *)(DMA_BASE + 0x08))
+#include "dice3_dma.h"
+
+/* +0x08 EN  — per-channel enable bitmap (bit N = CH N). */
+#define DMA_EN          (DMA->en)
 /* +0x10 ICLR — write-1-to-clear per-channel interrupt. */
-#define DMA_ICLR        (*(volatile uint32_t *)(DMA_BASE + 0x10))
-/* +0x14 ISTAT — interrupt status (bit 0 = ch0 complete). */
-#define DMA_ISTAT       (*(volatile uint32_t *)(DMA_BASE + 0x14))
+#define DMA_ICLR        (DMA->iclr)
+/* +0x14 — labelled ISTAT historically; stock never reads it. Reads as
+ * a latched "ever-done" history (0x0F after a flash-all). Our driver's
+ * wait_dma_irq polls this, and empirically bit N fires when CH N done. */
+#define DMA_ISTAT       (DMA->_14)
 
-/* Per-channel registers (base = 0x80000100 + ch*0x20):
- *   +0x00 SRC  — source address (RAM for TX, SPI_RX_PORT for RX)
- *   +0x04 DST  — dest address   (SPI_TX_PORT for TX, RAM for RX)
- *   +0x08 NXT  — next descriptor (unused; keep 0)
- *   +0x0C CFG  — low 12 bits = byte count, upper bits = mode flags
- *   +0x10 TRG  — trigger word: 0xD005 = TX arm, 0xD007 = RX arm
- * Channel clears live at +0x30 + ch*4 (write 1 to clear). */
+/* Per-channel registers; prefer DMA->chans[ch].src etc. in new code. */
 #define DMA_CHREG(ch, off) (*(volatile uint32_t *)(DMA_BASE + 0x100 + (ch)*0x20 + (off)))
+/* +0x30..+0x4C historical "CHCLR" — actually only +0x30 is meaningful
+ * to stock (written to 1 once at dma_irq_init). Our writes here are
+ * mostly no-ops; see dice3_dma.h for the gory details. */
 #define DMA_CHCLR(ch)      (*(volatile uint32_t *)(DMA_BASE + 0x30 + (ch)*4))
-
-/* CFG high-bits magic: copied verbatim from firmware flash driver (Ghidra).
- *   TX  = (byte_count & 0xFFF) | DMA_CFG_TX  → 0xF4009xxx
- *   RX  = (byte_count & 0xFFF) | DMA_CFG_RX  → 0x88009xxx */
-#define DMA_CFG_TX      0xF4009000u
-#define DMA_CFG_RX      0x88009000u
-#define DMA_TRG_TX      0xD005u
-#define DMA_TRG_RX      0xD007u
+/* DMA_CFG_TX/RX and DMA_TRG_TX/RX are now in dice3_dma.h. */
 
 /* ──────────────────────────────────────────────────────────────
  * Timer0 @ 0xC2000000
