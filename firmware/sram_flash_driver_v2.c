@@ -272,16 +272,19 @@ static void install_dma_irq(void) {
     dwb();
 }
 
-/* Wait for DMA completion. Prefers the IRQ-released flag but polls
- * DMA_ISTAT as a fallback — BIDIR (dual-channel) transfers don't fire
- * our vector reliably (hypothesis: source-10 SPI completion needs
- * additional handshake we don't provide). The polling fallback keeps
- * the rest of the refactor testable while we sort out IRQ plumbing. */
-static int wait_dma_irq(uint32_t budget_us) {
+/* Wait for DMA completion on the channels encoded in `ch_mask` (one
+ * bit per channel, bit N = CH N done). Prefers the IRQ-released flag
+ * but polls DMA_ISTAT as a fallback — BIDIR (dual-channel) transfers
+ * don't fire our vector reliably (hypothesis: source-10 SPI completion
+ * needs additional handshake we don't provide). The polling fallback
+ * keeps the rest of the refactor testable while we sort out IRQ
+ * plumbing. Pass 0x1 for CH0-only transfers (dma_tx/dma_rx),
+ * 0x4 for CH2 (bidir RX), etc. */
+static int wait_dma_irq_mask(uint32_t budget_us, uint32_t ch_mask) {
     uint32_t t0 = now_us();
     enable_irq_cpsr();
     while (!dma_done_flag) {
-        if (DMA_ISTAT & 1) break;     /* polled completion */
+        if (DMA_ISTAT & ch_mask) break;  /* polled completion */
         if (now_us() - t0 > budget_us) {
             disable_irq_cpsr();
             return -1;
@@ -290,6 +293,12 @@ static int wait_dma_irq(uint32_t budget_us) {
     disable_irq_cpsr();
     return 0;
 }
+
+static int wait_dma_irq(uint32_t budget_us) {
+    return wait_dma_irq_mask(budget_us, 1u);
+}
+
+static void spi_ip_drain_rx(volatile uint32_t *s);
 
 /* ── SPI + DMA low-level ────────────────────────────────────
  * Values match v1's proven config (CTRL=0x107, DMAMD=2 for TX,
@@ -1295,7 +1304,10 @@ static int dma_bidir_read(uint32_t spi_addr, uint8_t *out, uint32_t len,
     DMA_CHREG(1, 0x04) = SPI_TX_PORT;
     DMA_CHREG(1, 0x08) = 0;
     /* TX overrun is required — tightening to xfer_len stalls the RX
-     * pipeline (experiment 2026-04-20). 0xFFF is the safe value. */
+     * pipeline (experiment 2026-04-20). Historical 0xFFF puts 2 KB+ of
+     * extra bytes through the wire, and occasionally loses 2 RX bytes
+     * — likely a FIFO overflow. Try xfer_len + modest pad so RX has
+     * enough slack but we don't blast 4095 bytes past it. */
     DMA_CHREG(1, 0x0C) = 0xFFF | DMA_CFG_TX;
     dwb();
     DMA_CHREG(1, 0x10) = DMA_TRG_TX;
