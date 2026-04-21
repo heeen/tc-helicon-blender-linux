@@ -77,6 +77,21 @@ static inline void dwb(void) {
 #define TIMER_RELOAD_V2  500000u
 #define TIMER_TICKS_PER_US 18u   /* empirical, documented in memory */
 
+/* SPI clock config.
+ *   CLK_DIV_SPI = 0x0000 → crystal fallback (~12 MHz to SPI IP, halved
+ *                          internally to ~6 MHz)
+ *   SPI_CLK     = 2      → /2 → ~3 MHz on the wire
+ *
+ * Attempted 2026-04-21: adopt eCos's (0x8000, 0x32) = 400 MHz PLL / 50
+ * = 8 MHz. AAI pairs immediately failed (AAI_PAIR_TX timeouts on the
+ * very first pair after AAI_FIRST) — the SPI IP likely can't latch at
+ * 400 MHz input even though eCos's idle snapshot shows this config. To
+ * go faster safely we'd need to keep the SPI IP clocked by something
+ * closer to its rated input — probe further. See Registers.md and
+ * firmware/flash_stats.csv. */
+#define DRV_CLK_DIV_SPI_RAW  0x0000u
+#define DRV_SPI_CLK_DIV      2u
+
 static uint32_t s_us_accum;
 static uint32_t s_last_raw;
 
@@ -198,7 +213,7 @@ static void dma_irq_handler(void) {
      * dma_abort / post-transfer cleanup path uses the exact same trio
      * of writes: EN=0, ICLR=3, CHCLR(0)=1, CHCLR(1)=1. */
     DMA_EN = 0;
-    DMA_ICLR = 3;
+    DMA_ICLR = 0xF;
     DMA_CHCLR(0) = 1;
     DMA_CHCLR(1) = 1;
     /* SPI has its own IRQ edge at +0x18; clear it so a latched edge
@@ -290,12 +305,12 @@ static void spi_reset_clean(void) {
     SPI_CTRL = 0x107;
     SPI_LEN = 0;
     SPI_DATA = 0;
-    SPI_CLK = 2;
+    SPI_CLK = DRV_SPI_CLK_DIV;
     SPI_CLRINT = 0;
     SPI_DMACFG0 = 0;
     SPI_DMACFG1 = 0;
     DMA_EN = 0;
-    DMA_ICLR = 3;
+    DMA_ICLR = 0xF;
     DMA_CHCLR(0) = 1;
     DMA_CHCLR(1) = 1;
     DMA_CHREG(0, 0x0C) = 0;
@@ -310,7 +325,7 @@ static void spi_reset_clean(void) {
 static void dma_abort(void) {
     SPI_DMAGO = 0;
     DMA_EN = 0;
-    DMA_ICLR = 3;
+    DMA_ICLR = 0xF;
     DMA_CHCLR(0) = 1;
     DMA_CHCLR(1) = 1;
     SPI_CS = 0;
@@ -330,7 +345,7 @@ static int dma_tx(const volatile uint8_t *buf, uint32_t len, uint32_t budget_us)
     SPI_CTRL = 0x107;
     SPI_LEN = len - 1;
     SPI_DMAMD = 2;
-    SPI_CLK = 2;
+    SPI_CLK = DRV_SPI_CLK_DIV;
     SPI_DMACFG0 = 4;
     SPI_DMACFG1 = 3;
     dwb();
@@ -367,7 +382,7 @@ static int dma_tx(const volatile uint8_t *buf, uint32_t len, uint32_t budget_us)
     SPI_CS = 0;
     SPI_EN = 0;
     DMA_EN = 0;
-    DMA_ICLR = 3;
+    DMA_ICLR = 0xF;
     return 0;
 }
 
@@ -391,7 +406,7 @@ static int dma_rx(uint32_t spi_cmd, uint8_t *out, uint32_t len,
     SPI_CTRL = 0x007;
     SPI_LEN = total - 1;
     SPI_DMAMD = 3;
-    SPI_CLK = 2;
+    SPI_CLK = DRV_SPI_CLK_DIV;
     SPI_DMACFG0 = 4;
     SPI_DMACFG1 = 3;
     dwb();
@@ -399,7 +414,7 @@ static int dma_rx(uint32_t spi_cmd, uint8_t *out, uint32_t len,
     dwb();
 
     DMA_EN = 3;
-    DMA_ICLR = 3;
+    DMA_ICLR = 0xF;
     DMA_CHCLR(0) = 1;
     DMA_CHCLR(1) = 1;
     dwb();
@@ -437,7 +452,7 @@ static int dma_rx(uint32_t spi_cmd, uint8_t *out, uint32_t len,
     SPI_CS = 0;
     SPI_EN = 0;
     DMA_EN = 0;
-    DMA_ICLR = 3;
+    DMA_ICLR = 0xF;
     for (uint32_t j = 0; j < len; j++)
         out[j] = ((volatile uint8_t *)RX_SCRATCH)[1 + j];
     return 0;
@@ -570,17 +585,16 @@ static void spi_ip_drain_rx(volatile uint32_t *s) {
  * in-tree so v2 driver still builds as a single .c for bench iter.
  *
  * Touches ONE field in the 0xC9 clock block: CLK_DIV_SPI (+0x14). We
- * force it to 0 (disabled = SPI runs off crystal fallback ~3 MHz).
- * eCos / stage-2 set it to 0x8000 (passthrough from 400 MHz PLL)
- * which would give 200 MHz on the wire with our SPI_CLK=2 divider —
- * way over the SST25VF016B's 50 MHz spec, causing WRSR to never
- * clock (observed 2026-04-21: BP_CLEAR TIMEOUT after nRESET). All
- * 0xC9 writes need the 0xABCD upper-16 key. */
+ * force it to DRV_CLK_DIV_SPI_RAW (currently 0 — crystal fallback).
+ * The eCos value 0x8000 (400 MHz PLL passthrough) was attempted
+ * 2026-04-21 with SPI_CLK=0x32 for 8 MHz wire but immediately broke
+ * AAI pair TX — see the DRV_* comment near the top. All 0xC9 writes
+ * need the 0xABCD upper-16 key. */
 static void peripheral_full_teardown(void) {
-    /* Drop SPI block back to fallback crystal clock BEFORE touching
-     * any SPI peripheral regs below — otherwise the quiesce polls on
-     * SPI_STAT miscount at 200 MHz. */
-    *(volatile uint32_t *)0xC9000014u = 0xABCD0000u;
+    /* Force SPI clock to our known-good source BEFORE touching any SPI
+     * peripheral regs — subsequent STAT polls measure wire behaviour
+     * at this rate. */
+    *(volatile uint32_t *)0xC9000014u = 0xABCD0000u | DRV_CLK_DIV_SPI_RAW;
     dwb();
 
     usb_hw_reset();
@@ -954,7 +968,7 @@ static int xport_dma_aai_begin(uint32_t spi_addr, uint8_t d0, uint8_t d1) {
     SPI_CTRL = 0x007;
     SPI_LEN = 2;
     SPI_DMAMD = 3;
-    SPI_CLK = 2;
+    SPI_CLK = DRV_SPI_CLK_DIV;
     SPI_DMACFG0 = 4;
     SPI_DMACFG1 = 3;
     dwb();
@@ -979,7 +993,7 @@ static int xport_dma_aai_begin(uint32_t spi_addr, uint8_t d0, uint8_t d1) {
  * value latched right after the DMA/SPI busy drain; 0 == clean.
  * Returns -1 on spin timeout. */
 static int xport_dma_aai_shift_once(uint32_t *out_err) {
-    DMA_ICLR = 3;
+    DMA_ICLR = 0xF;
     DMA_CHCLR(0) = 1;
     DMA_CHCLR(1) = 1;
 
@@ -1049,7 +1063,7 @@ static void xport_dma_aai_end(void) {
     SPI_CS = 0;
     SPI_EN = 0;
     DMA_EN = 0;
-    DMA_ICLR = 3;
+    DMA_ICLR = 0xF;
     dwb();
 }
 
@@ -1100,7 +1114,7 @@ static int pio_cs_cycle(const uint8_t *buf, uint32_t len) {
     SPI_DMAMD = 0;
     SPI_CTRL = 0x207;            /* PIO TX (v1 validated value) */
     SPI_LEN = len - 1;
-    SPI_CLK = 2;
+    SPI_CLK = DRV_SPI_CLK_DIV;
     dwb();
     SPI_EN = 1;
     SPI_CS = 1;
@@ -1253,7 +1267,7 @@ static int dma_bidir_read(uint32_t spi_addr, uint8_t *out, uint32_t len,
     SPI_CTRL = 0x007;
     SPI_LEN = xfer_len - 1;
     SPI_DMAMD = 3;
-    SPI_CLK = 2;
+    SPI_CLK = DRV_SPI_CLK_DIV;
     SPI_DMACFG0 = 4;
     SPI_DMACFG1 = 3;
     dwb();
@@ -1261,7 +1275,7 @@ static int dma_bidir_read(uint32_t spi_addr, uint8_t *out, uint32_t len,
     dwb();
 
     DMA_EN = 3;
-    DMA_ICLR = 3;
+    DMA_ICLR = 0xF;
     DMA_CHCLR(0) = 1;
     DMA_CHCLR(1) = 1;
     dwb();
@@ -1299,7 +1313,7 @@ static int dma_bidir_read(uint32_t spi_addr, uint8_t *out, uint32_t len,
     SPI_CS = 0;
     SPI_EN = 0;
     DMA_EN = 0;
-    DMA_ICLR = 3;
+    DMA_ICLR = 0xF;
     for (uint32_t i = 0; i < len; i++) out[i] = RX_TEMP[READ_RX_SKIP + i];
     return 0;
 }
@@ -1327,18 +1341,35 @@ static int do_verify(uint32_t spi_addr, const uint8_t *expected, uint32_t len) {
     uint8_t *readback = (uint8_t *)0x00000000u;
     uint32_t remaining = len;
     uint32_t off = 0;
+    uint32_t chunks_done = 0;
     while (remaining) {
         uint32_t chunk = remaining > V2_SECTOR_SIZE ? V2_SECTOR_SIZE : remaining;
         if (do_read(spi_addr + off, readback, chunk) != 0)
             return -1;
+        chunks_done++;
         for (uint32_t i = 0; i < chunk; i++) {
             if (readback[i] != expected[off + i]) {
-                uint8_t exp_b = expected[off + i];
-                uint8_t got_b = readback[i];
-                log_put(V2_EVT_VERIFY_MISS, (uint16_t)(off + i),
-                        spi_addr + off + i);
-                MBOX->last_sr = ((uint32_t)exp_b << 8) | got_b;
-                set_error(V2_ERR_VERIFY_MISMATCH, spi_addr + off + i, got_b);
+                /* Capture miss state BEFORE any extra writes that could
+                 * perturb it. 4-byte windows are clamped at the end of
+                 * the chunk / expected buffer. */
+                uint32_t abs_off = off + i;
+                uint32_t got_w = 0, exp_w = 0;
+                uint32_t n = chunk - i; if (n > 4) n = 4;
+                for (uint32_t k = 0; k < n; k++) {
+                    got_w |= (uint32_t)readback[i + k] << (k * 8);
+                    exp_w |= (uint32_t)expected[off + i + k] << (k * 8);
+                }
+                MBOX->miss_offset     = abs_off;
+                MBOX->miss_got        = got_w;
+                MBOX->miss_expected   = exp_w;
+                MBOX->miss_spi_stat   = SPI_STAT;
+                MBOX->miss_dma_istat  = DMA_ISTAT;
+                MBOX->miss_reads_done = chunks_done;
+                dwb();
+                log_put(V2_EVT_VERIFY_MISS, (uint16_t)abs_off,
+                        spi_addr + abs_off);
+                MBOX->last_sr = ((uint32_t)expected[abs_off] << 8) | readback[i];
+                set_error(V2_ERR_VERIFY_MISMATCH, spi_addr + abs_off, readback[i]);
                 return -1;
             }
         }
@@ -1505,7 +1536,7 @@ static void handle_command(uint32_t cmd) {
             while (SPI_STAT & SPI_STAT_BUSY) {}
             SPI_EN = 0; SPI_CS = 0; SPI_DMAGO = 0;
             SPI_CTRL = 0x007; SPI_LEN = 4; SPI_DMAMD = 3;
-            SPI_CLK = 2; SPI_DMACFG0 = 4; SPI_DMACFG1 = 3;
+            SPI_CLK = DRV_SPI_CLK_DIV; SPI_DMACFG0 = 4; SPI_DMACFG1 = 3;
             dwb(); SPI_EN = 1; dwb();
             DMA_EN = 3; DMA_ICLR = 3;
             DMA_CHCLR(0) = 1; DMA_CHCLR(1) = 1; dwb();

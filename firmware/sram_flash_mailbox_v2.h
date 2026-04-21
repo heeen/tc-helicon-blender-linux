@@ -145,6 +145,15 @@ struct v2_mailbox {
     volatile uint32_t pair_retries;   /* +0x3C — AAI pair SPI_ERR retries,
                                        * reset per command */
     volatile uint32_t build_tag;      /* +0x40 */
+
+    /* Verify-miss capture — DEV writes these when VERIFY_MISS fires,
+     * before setting err_code. Host reads them alongside the error. */
+    volatile uint32_t miss_offset;    /* +0x44 — byte index inside verify window */
+    volatile uint32_t miss_got;       /* +0x48 — 4 bytes @ miss_offset (LE, zero-pad at tail) */
+    volatile uint32_t miss_expected;  /* +0x4C — 4 bytes @ miss_offset from expected buf */
+    volatile uint32_t miss_spi_stat;  /* +0x50 — SPI_STAT at moment of miss */
+    volatile uint32_t miss_dma_istat; /* +0x54 — DMA_ISTAT at moment of miss */
+    volatile uint32_t miss_reads_done;/* +0x58 — #dma_bidir_read chunks issued before miss */
 };
 
 /* ── Log ring entry (12 bytes) ────────────────────────────── */

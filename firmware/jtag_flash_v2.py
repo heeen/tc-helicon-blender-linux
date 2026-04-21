@@ -96,6 +96,12 @@ O_LOG_HEAD     = 0x34
 O_LOG_TAIL     = 0x38
 O_PAIR_RETRIES = 0x3C
 O_BUILD_TAG    = 0x40
+O_MISS_OFFSET  = 0x44
+O_MISS_GOT     = 0x48
+O_MISS_EXP     = 0x4C
+O_MISS_SPI_ST  = 0x50
+O_MISS_DMA_IST = 0x54
+O_MISS_READS   = 0x58
 
 STATUS_READY = 0
 STATUS_BUSY  = 1
@@ -330,6 +336,13 @@ class FlashClientV2:
         phase     = self.o.mdw(MBOX_ADDR + O_PHASE)
         log_head  = self.o.mdw(MBOX_ADDR + O_LOG_HEAD)
         elapsed   = self.o.mdw(MBOX_ADDR + O_ELAPSED_US)
+        # Verify-miss capture (zeroed unless err_code == V2_ERR_VERIFY_MISMATCH).
+        miss_off     = self.o.mdw(MBOX_ADDR + O_MISS_OFFSET)
+        miss_got     = self.o.mdw(MBOX_ADDR + O_MISS_GOT)
+        miss_exp     = self.o.mdw(MBOX_ADDR + O_MISS_EXP)
+        miss_spi_st  = self.o.mdw(MBOX_ADDR + O_MISS_SPI_ST)
+        miss_dma_ist = self.o.mdw(MBOX_ADDR + O_MISS_DMA_IST)
+        miss_reads   = self.o.mdw(MBOX_ADDR + O_MISS_READS)
         ring      = self.o.dump_image(LOG_RING_ADDR,
                                       LOG_ENTRY_SIZE * LOG_RING_ENTRIES)
         self.o.resume()
@@ -346,6 +359,27 @@ class FlashClientV2:
             f.write(f"phase = {phase} ({PHASE_NAMES.get(phase, '?')})\n")
             f.write(f"elapsed_us = {elapsed}\n")
             f.write(f"log_head = {log_head}\n")
+            if err_code == 0x0401:  # V2_ERR_VERIFY_MISMATCH
+                got4 = miss_got.to_bytes(4, "little")
+                exp4 = miss_exp.to_bytes(4, "little")
+                shift_hint = ""
+                # Attempt to classify the shift: does got[0] match exp[1],
+                # exp[2], exp[3]? If so it's a +1/+2/+3 shift.
+                for s in (1, 2, 3):
+                    if got4[0] == exp4[s]:
+                        shift_hint = f"  (got[0]==exp[{s}]  → +{s}-byte shift)"
+                        break
+                f.write("# verify miss capture:\n")
+                f.write(f"miss_offset      = {miss_off} (0x{miss_off:x})\n")
+                f.write(f"miss_got         = {' '.join(f'{b:02x}' for b in got4)}\n")
+                f.write(f"miss_expected    = {' '.join(f'{b:02x}' for b in exp4)}"
+                        f"{shift_hint}\n")
+                f.write(f"miss_spi_stat    = 0x{miss_spi_st:08x}\n")
+                f.write(f"miss_dma_istat   = 0x{miss_dma_ist:08x}\n")
+                f.write(f"miss_reads_done  = {miss_reads}\n")
+                print(f"  miss@+{miss_off}  got={got4.hex()} exp={exp4.hex()}"
+                      f"  spi_stat=0x{miss_spi_st:x} dma_istat=0x{miss_dma_ist:x}"
+                      f"  reads={miss_reads}{shift_hint}")
             f.write("#\n")
             f.write(f"{'t_us':>10} {'evt':<16} {'phase':<12} "
                     f"{'detail':>6} {'spi_addr':>10}\n")
