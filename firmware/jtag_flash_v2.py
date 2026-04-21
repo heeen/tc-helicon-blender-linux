@@ -9,6 +9,7 @@ Speaks the mailbox protocol defined in sram_flash_mailbox_v2.h:
 CLI:
     python3 firmware/jtag_flash_v2.py --ref firmware/blender_spi_patched.bin \\
         --speed 1000 --test-sector 0x3f000
+    python3 firmware/jtag_flash_v2.py --mode flash-all --nreset
 """
 from __future__ import annotations
 
@@ -25,6 +26,8 @@ from pathlib import Path
 FIRMWARE_DIR = Path(__file__).resolve().parent
 ROOT = FIRMWARE_DIR.parent
 OPENOCD_CFG = ROOT / "jtag" / "miolink-dice3-openocd.cfg"
+# Hardware nRST enabled — required for `reset halt` to pulse the target.
+OPENOCD_CFG_SRST = ROOT / "jtag" / "miolink-dice3-openocd-srst.cfg"
 DRIVER_BIN = FIRMWARE_DIR / "sram_flash_driver_v2.bin"
 
 # Keep in sync with sram_flash_mailbox_v2.h.
@@ -142,17 +145,37 @@ LOG_ENTRY_SIZE = 12  # bytes
 
 class OpenOCD:
     """Thin wrapper over openocd's TCL socket — reused conventions from v1."""
-    def __init__(self, speed=1000):
+    def __init__(self, speed=1000, openocd_cfg=None):
+        cfg = Path(openocd_cfg) if openocd_cfg else OPENOCD_CFG
         subprocess.run(["pkill", "-x", "openocd"], capture_output=True)
         time.sleep(1)
         self.proc = subprocess.Popen(
-            ["openocd", "-f", str(OPENOCD_CFG)],
+            ["openocd", "-f", str(cfg)],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         time.sleep(3)
         self.sock = socket.create_connection(("localhost", 6666), timeout=30)
         self.sock.settimeout(30)
         self.cmd(f"adapter speed {speed}")
+
+    def reset_halt(self, run_ms=1500):
+        """Hardware reset (needs SRST in OpenOCD cfg). We do `reset run`
+        and let the ROM bootloader execute for `run_ms` milliseconds
+        before halting — long enough to initialize PLL + peripheral
+        clocks per the TCAT header, short enough to catch the device
+        before it hands off to primary firmware. Halting at the reset
+        vector (`reset halt`) leaves PLL off and breaks SPI ops that
+        need a working clock; observed 2026-04-21: BP_CLEAR TIMEOUT at
+        first WRSR poll because SPI wasn't clocking.
+
+        Our v2 driver's peripheral_full_teardown then handles whatever
+        state the ROM/stage-2/primary left behind. ~300 ms is plenty —
+        ROM PLL config is done in the first few ms, and at 300 ms the
+        device is typically mid-stage-2 or just starting primary —
+        before USB enumerates so host won't see a brief enumeration."""
+        self.cmd("reset run", timeout=30)
+        time.sleep(run_ms / 1000.0)
+        return self.cmd("halt", timeout=30)
 
     def cmd(self, c, timeout=30):
         self.sock.settimeout(timeout)
@@ -671,30 +694,40 @@ def flash_all(client, args):
                 print(f"  pre-erase 0x{addr:06x} FAILED"); return 1
         print(f"Pre-erase done in {time.monotonic()-pre_t0:.1f}s")
 
+    def run_op(kind, addr, span):
+        if kind == "erase":       return client.erase(addr)
+        if kind == "erase_32k":   return client.erase_32k(addr)
+        if kind == "erase_64k":   return client.erase_64k(addr)
+        if kind == "sector":      return client.flash_sector(addr, ref[addr:addr+span])
+        # block_32k / block_64k
+        return client.flash_block(addr, ref[addr:addr+span])
+
     total_t0 = time.monotonic()
     failed = []
     total_retries = 0
+    # Intermittent block-op failures from the READ-exhaustion driver bug
+    # in do_verify (mid-block verify reads return stale bytes after ~8+
+    # chunks). A simple retry almost always succeeds because the DMA
+    # pipeline resets between our CMD_FLASH_BLOCK invocations.
+    MAX_RETRIES = 2
     for op_idx, (kind, addr, span) in enumerate(ops):
         op_t0 = time.monotonic()
-        if kind == "erase":
-            ok = client.erase(addr)
-        elif kind == "erase_32k":
-            ok = client.erase_32k(addr)
-        elif kind == "erase_64k":
-            ok = client.erase_64k(addr)
-        elif kind == "sector":
-            ok = client.flash_sector(addr, ref[addr:addr+span])
-        else:   # block_32k, block_64k
-            ok = client.flash_block(addr, ref[addr:addr+span])
+        ok = run_op(kind, addr, span)
+        attempt = 1
+        while not ok and attempt <= MAX_RETRIES:
+            print(f"  [{op_idx+1}/{len(ops)}] {kind} 0x{addr:06x} "
+                  f"attempt {attempt}/{MAX_RETRIES+1} failed — retrying")
+            ok = run_op(kind, addr, span)
+            attempt += 1
         dt = time.monotonic() - op_t0
-        # Driver resets pair_retries per command, so snapshot after each op.
         try: op_retries = client.o.mdw(MBOX_ADDR + O_PAIR_RETRIES)
         except Exception: op_retries = 0
         total_retries += op_retries
         status = "OK" if ok else "FAIL"
         retry_note = f" retries={op_retries}" if op_retries else ""
+        attempt_note = f" (attempt {attempt})" if attempt > 1 else ""
         print(f"  [{op_idx+1}/{len(ops)}] {kind} 0x{addr:06x} "
-              f"len={span} {status} {dt:.2f}s{retry_note}")
+              f"len={span} {status} {dt:.2f}s{retry_note}{attempt_note}")
         if not ok:
             failed.append((kind, addr))
 
@@ -843,6 +876,14 @@ def main():
                         "driver (dma = current; pio = byte-by-byte DATA "
                         "register writes). Diagnostic lever for isolating "
                         "DMA-engine drops from silicon-level drops.")
+    p.add_argument("--nreset", action="store_true",
+                   help="Pulse hardware nRESET (reset halt) after OpenOCD "
+                        "connects, before loading the SRAM driver. Uses "
+                        f"{OPENOCD_CFG_SRST.name} (SRST enabled); use when "
+                        "the TAP is wedged or the driver never reaches READY.")
+    p.add_argument("--openocd-cfg", type=str, default="",
+                   help="OpenOCD config file (default: miolink-dice3-openocd.cfg, "
+                        "or -srst variant when --nreset is set)")
     args = p.parse_args()
 
     if not DRIVER_BIN.exists():
@@ -862,8 +903,30 @@ def main():
     if args.xport is not None:
         timing_overrides["xport_mode"] = XPORT_PIO if args.xport == "pio" else XPORT_DMA
 
-    ocd = OpenOCD(speed=args.speed)
+    if args.openocd_cfg:
+        ocd_cfg = Path(args.openocd_cfg)
+    elif args.nreset:
+        if not OPENOCD_CFG_SRST.exists():
+            raise SystemExit(
+                f"ERROR: --nreset needs {OPENOCD_CFG_SRST} (missing). "
+                "Copy from miolink-dice3-openocd.cfg or pass --openocd-cfg."
+            )
+        ocd_cfg = OPENOCD_CFG_SRST
+    else:
+        ocd_cfg = OPENOCD_CFG
+
+    ocd = OpenOCD(speed=args.speed, openocd_cfg=ocd_cfg)
     try:
+        if args.nreset:
+            print("nRESET: reset halt (target should stop at reset vector)...")
+            try:
+                ocd.reset_halt()
+            except Exception as ex:
+                raise SystemExit(
+                    f"nRESET/reset halt failed ({ex}). "
+                    "Check MioLink nRST wiring to DICE3; try without --nreset."
+                ) from ex
+            time.sleep(0.15)
         client = FlashClientV2(ocd)
         client.load_driver()
         if timing_overrides:

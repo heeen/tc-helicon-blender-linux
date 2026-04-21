@@ -536,6 +536,78 @@ static void usb_hw_reset(void) {
     dwb();
 }
 
+/* Timer0/Timer1 disable @ 0xC2000000. eCos drives Timer0 for its alarm
+ * thread — leaving it running spews IRQs we don't service. Mirror of
+ * reboot_common.c:timer_blocks_disable(). */
+static void timer_blocks_disable(void) {
+    *(volatile uint32_t *)0xC2000008 = 0;  /* Timer0 CTRL */
+    *(volatile uint32_t *)0xC200002C = 0;  /* Timer1 CTRL */
+}
+
+/* TCAT audio mixer / crossbar @ 0xC4000000. Zero the first 64 bytes
+ * of its register window — observed non-destructive in both TCAT-BOOT
+ * (already quiet) and eCos (silences stream, chip stays alive).
+ * Mirror of reboot_common.c:mixer_block_quiesce(). */
+static void mixer_block_quiesce(void) {
+    volatile uint32_t *mx = (volatile uint32_t *)0xC4000000u;
+    for (unsigned i = 0; i < 16; i++) mx[i] = 0;
+    dwb();
+}
+
+/* Drain SPI RX FIFO (STAT bit 3 = RX_RDY; DATA read clears). Mirror of
+ * reboot_common.c:spi_ip_drain_rx(). */
+static void spi_ip_drain_rx(volatile uint32_t *s) {
+    for (int i = 0; i < 32; i++) {
+        if (!(s[0x28 / 4] & 0x08u)) break;
+        (void)s[0x60 / 4];
+    }
+}
+
+/* Bundled teardown — safe in both TCAT-BOOT and eCos states. Order
+ * matters: USB first (has DMA clients), then SPIs, then DMA engine,
+ * then VIC (so no IRQs fire while we write the rest), then timer +
+ * mixer. Mirror of reboot_common.c:peripheral_full_teardown(); kept
+ * in-tree so v2 driver still builds as a single .c for bench iter.
+ *
+ * Touches ONE field in the 0xC9 clock block: CLK_DIV_SPI (+0x14). We
+ * force it to 0 (disabled = SPI runs off crystal fallback ~3 MHz).
+ * eCos / stage-2 set it to 0x8000 (passthrough from 400 MHz PLL)
+ * which would give 200 MHz on the wire with our SPI_CLK=2 divider —
+ * way over the SST25VF016B's 50 MHz spec, causing WRSR to never
+ * clock (observed 2026-04-21: BP_CLEAR TIMEOUT after nRESET). All
+ * 0xC9 writes need the 0xABCD upper-16 key. */
+static void peripheral_full_teardown(void) {
+    /* Drop SPI block back to fallback crystal clock BEFORE touching
+     * any SPI peripheral regs below — otherwise the quiesce polls on
+     * SPI_STAT miscount at 200 MHz. */
+    *(volatile uint32_t *)0xC9000014u = 0xABCD0000u;
+    dwb();
+
+    usb_hw_reset();
+
+    spi_ip_quiesce(REBOOT_LED_SPI);
+    spi_ip_drain_rx(REBOOT_LED_SPI);
+    REBOOT_LED_GPIO = 0;
+    REBOOT_LED_SPI[0x14 / 4] = 0xFF;
+
+    spi_ip_quiesce(REBOOT_FLASH_SPI);
+    spi_ip_drain_rx(REBOOT_FLASH_SPI);
+
+    dma_engine_reset();
+
+    REBOOT_VIC_INT_EN_CLR = 0xFFFFFFFFu;
+    REBOOT_VIC_SOFT_CLR   = 0xFFFFFFFFu;
+    /* Clear vectored-IRQ slot controls so any stale handler binding
+     * from firmware doesn't route a later pending IRQ anywhere. */
+    for (unsigned i = 0; i < 16; i++)
+        *(volatile uint32_t *)(0xFFFFF200u + i * 4) = 0;
+
+    timer_blocks_disable();
+    mixer_block_quiesce();
+
+    dwb();
+}
+
 static void driver_setup(void) {
     /* Timer0 must be running before log_put() is called (it timestamps). */
     timer_enable();
@@ -546,19 +618,18 @@ static void driver_setup(void) {
     __asm__ volatile("mov r0, #0xD3 \n msr cpsr_c, r0 \n" ::: "r0", "memory");
 
     set_phase(V2_PHASE_TEARDOWN);
-    usb_hw_reset();
+    /* Full hardware quiesce — USB, both SPIs, DMA (ch0-3), VIC, timers,
+     * mixer. Lets us flash reliably from both TCAT-BOOT and eCos
+     * contexts (eCos needed timer+mixer+extended-VIC to stop; observed
+     * 60% reliability without them, 2026-04-20). */
+    peripheral_full_teardown();
 
-    spi_ip_quiesce(REBOOT_LED_SPI);
-    REBOOT_LED_GPIO = 0;
-    REBOOT_LED_SPI[0x14 / 4] = 0xFF;
-    dwb();
-    spi_ip_quiesce(REBOOT_FLASH_SPI);
-
-    dma_engine_reset();
-
-    REBOOT_VIC_INT_EN_CLR = 0xFFFFFFFFu;
-    REBOOT_VIC_SOFT_CLR   = 0xFFFFFFFFu;
-    dwb();
+    /* Re-enable Timer0 — teardown turned it off (eCos was driving it).
+     * busy_wait_us / now_us depend on it; observed 2026-04-21: skipping
+     * this hangs the first busy_wait in BP_CLEAR because TIMER_COUNT
+     * stays frozen and now_us() deadline never reaches. */
+    timer_enable();
+    time_reset();
 
     /* IRQ install disabled after observing ISR-loop stuck-state right
      * after a fresh TCAT-BOOT power-up (2026-04-20). Polling fallback
@@ -1309,6 +1380,14 @@ static int do_flash_block(uint32_t spi_addr, const uint8_t *data, uint32_t len) 
     }
     if (do_erase_any(spi_addr, erase_op) != 0) return -1;
     if (do_aai_program(spi_addr, data, len) != 0) return -1;
+    /* Post-AAI quiesce before verify: AAI hot-loop cycles DMA state so
+     * aggressively that residual channel state leaks into the very next
+     * dma_bidir_read, causing +2 byte readback shift and false verify
+     * mismatch. See do_verify which also takes dma_engine_reset per
+     * chunk now. */
+    spi_reset_clean();
+    dma_engine_reset();
+    busy_wait_us(200);
     if (do_verify(spi_addr, data, len) != 0) return -1;
     return 0;
 }
@@ -1327,6 +1406,10 @@ static int do_flash_sector(uint32_t spi_addr, const uint8_t *data, uint32_t len)
     }
     if (do_erase(spi_addr) != 0) return -1;
     if (do_aai_program(spi_addr, data, len) != 0) return -1;
+    /* Post-AAI quiesce — see do_flash_block for rationale. */
+    dma_abort();
+    spi_reset_clean();
+    busy_wait_us(50);
     if (do_verify(spi_addr, data, len) != 0) return -1;
     return 0;
 }

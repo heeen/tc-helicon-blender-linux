@@ -351,6 +351,37 @@ static void uart_hex32(uint32_t v) {
     for (int i = 28; i >= 0; i -= 4) uart_putc(hex[(v >> i) & 0xF]);
 }
 
+static void uart_hex8(uint8_t v) {
+    static const char hex[] = "0123456789ABCDEF";
+    uart_putc(hex[(v >> 4) & 0xF]);
+    uart_putc(hex[v & 0xF]);
+}
+
+/* usb_hw_ep_read_start OUT path: slot = (*(usb_midi_conn+4)) + (ep_num-1)*0x40;
+ * qh/dTD ptr @ slot+0x1F4, gate byte @ +0x1F8 (must be 0 to enter), +0x1FC scratch.
+ * See firmware/midi_usb_handoff.txt — do not confuse with ep_handle+0x20. */
+static void uart_log_ep3_slot_and_dma(void) {
+    uint32_t tbl = *(volatile uint32_t *)((uint8_t *)usb_midi_conn + 4);
+    if (tbl < 0x10000u || tbl >= 0x80000u)
+        return;
+    uint8_t *slot = (uint8_t *)(uintptr_t)(tbl + 2u * 0x40u); /* EP3 → index 2 */
+    uint8_t g1f8 = *(volatile uint8_t *)(slot + 0x1f8);
+    uint8_t g1fc = *(volatile uint8_t *)(slot + 0x1fc);
+    uint32_t qh_slot = *(volatile uint32_t *)(slot + 0x1f4);
+    uart_putc(' ');
+    uart_putc('s');
+    uart_putc('l');
+    uart_putc('=');
+    uart_hex8(g1f8);
+    uart_putc('>');
+    uart_hex8(g1fc);
+    uart_putc(' ');
+    uart_putc('s');
+    uart_putc('q');
+    uart_putc('=');
+    uart_hex32(qh_slot);
+}
+
 /* Gates + call order: firmware/usb_dma_ep_ghidra.txt (Ghidra: usb_endpoint_submit_transfer
  * sets ep+0x08 then calls start_fn; usb_hw_ep_start_transfer_rx needs (char)ep+0x24==0x02 and
  * ep+0x08!=0, buffer aligned — else completion_cb runs with -5/-16 and no 0x834 prime). */
@@ -418,6 +449,10 @@ static void init_audio_clock(void) {
     uart_print_string("[clock] 48kHz\r\n");
 }
 
+/* hooks.py patches firmware_entry's `bl rtos_app_init` at 0x344 to call
+ * boot_init instead; no C code references this symbol, so the linker's
+ * --gc-sections would otherwise strip it. `used` prevents that. */
+__attribute__((used))
 void boot_init(void) {
     /* Full LED SPI quiesce — EN/CS-only was insufficient; animation could
      * resume from stale CTRL/DMA path. Match spi_ip_block_quiesce order. */
@@ -500,6 +535,18 @@ void midi_loop_hook(void) {
             uint8_t st = *(volatile uint8_t *)(ep_h + 0x20);
             uart_print_string(" st=");
             uart_putc('0' + st);
+            uart_print_string(" f=");
+            uart_hex32(*(volatile uint32_t *)(ep_h + 0x00));
+            uart_print_string(" cb=");
+            uart_hex32(*(volatile uint32_t *)(ep_h + 0x08));
+            uart_print_string(" b=");
+            uart_hex32(*(volatile uint32_t *)(ep_h + 0x10));
+            uart_print_string(" n=");
+            uart_hex32(*(volatile uint32_t *)(ep_h + 0x14));
+            uart_print_string(" fl=");
+            uart_hex32(*(volatile uint32_t *)(ep_h + 0x24));
+            uart_print_string(" m=");
+            uart_hex32((uint32_t)*(volatile uint16_t *)(ep_h + 0x3C));
             /* 2026-04-20: After ISR decomp, EP3 OUT stock init is correct —
              * no runtime ep_handle mutation needed here. See
              * firmware/usb_dma_ep_ghidra.txt. The HS-skip bypass in boot_init
@@ -507,6 +554,11 @@ void midi_loop_hook(void) {
              * QH[0] ACTIVE bit (26) / QH[6] state (0x80 vs 0x10) don't
              * transition correctly — needs deeper investigation. */
             uart_putc('\r'); uart_putc('\n');
+            if (!ep3_rx_primed) {
+                *(volatile uint32_t *)(ep_h + 0x00) = (uint32_t)(void *)usb_hw_ep_start_transfer_rx_trace;
+                uart_print_string("[midi] ep3 start_fn->trace\r\n");
+                ep3_rx_primed = 1;
+            }
             ep3_rx_enabled = 1;
         }
     }
@@ -626,6 +678,12 @@ void midi_loop_hook(void) {
         uart_putc(' ');
         uart_putc('i'); uart_putc('0'); uart_putc('=');
         uart_hex32(q0i);
+        uart_putc(' ');
+        uart_putc('d'); uart_putc('m'); uart_putc('=');
+        uart_hex32(TCAT_DMA_CFG);
+        uart_putc(' ');
+        uart_putc('z'); uart_putc('6'); uart_putc('=');
+        uart_hex32(TCAT_QH_OUT(0)[6]);
         uart_putc('\r'); uart_putc('\n');
 
         /* EC2 — one flash cycle: stack "next step" fields that EC1 omits:
@@ -655,6 +713,7 @@ void midi_loop_hook(void) {
             int32_t bufsz = *(volatile int32_t *)((uint8_t *)ep_handle + ECOS_EP_BUFFER_SIZE);
             uint32_t halted_w = *(volatile uint32_t *)((uint8_t *)ep_handle + ECOS_EP_HALTED);
             uint32_t epflags = *(volatile uint32_t *)((uint8_t *)ep_handle + 0x24);
+            uint16_t mps = *(volatile uint16_t *)((uint8_t *)ep_handle + 0x3C);
             uart_putc(' ');
             uart_putc('b'); uart_putc('p'); uart_putc('=');
             uart_hex32(bufp);
@@ -667,6 +726,10 @@ void midi_loop_hook(void) {
             uart_putc(' ');
             uart_putc('F'); uart_putc('=');
             uart_hex32(epflags);
+            uart_putc(' ');
+            uart_putc('m'); uart_putc('p'); uart_putc('s'); uart_putc('=');
+            uart_hex32((uint32_t)mps);
+            uart_log_ep3_slot_and_dma();
         }
         uart_putc(' ');
         uart_putc('e'); uart_putc('0'); uart_putc('=');

@@ -35,29 +35,31 @@ PATCHED_SPI = FIRMWARE_DIR / 'blender_spi_patched.bin'
 # DCP registration still needs JTAG inject (main loop blocked in cyg_flag_wait).
 
 PATCH_ZONE_SRAM = 0x32600
-PATCH_ZONE_SIZE = 0xC00  # 3072 bytes (gap: 0x32600-0x331FF)
+PATCH_ZONE_SIZE = 0x1C00  # 7168 bytes — reboot_common.c + handler (grown
+                          # 2026-04-21 from 0x1980 to fit boot_init's new
+                          # usb_hw_reset / SPI quiesce transitive deps)
 
 # Heap base literal in code section (patched for persistent mode)
 HEAP_LITERAL_SRAM = 0xC570     # mempool_var_init loads heap_start from here
 HEAP_BASE_ORIG    = 0x325F8    # original heap_start = BSS_end
-HEAP_BASE_NEW     = 0x33400    # new heap_start (after handler zone)
+HEAP_BASE_NEW     = 0x34200    # new heap_start (= PATCH_ZONE_SRAM + PATCH_ZONE_SIZE)
 
 # Firmware identity
 IDENTITY_ADDR = 0x8968
 IDENTITY_WORD = 0xe92d4ff0
 
-# Hook site
-HOOK_TARGET = 0x4FAC
+# Hook sites
+HOOK_MIDI_LOOP = 0x5180  # bl midi_rx_poll in midi_engine_thread main loop
 
 
 # ── Hook definition ────────────────────────────────────────────────────────
 
 hooks = [
     Hook(
-        name="dcp_flash",
-        target=HOOK_TARGET,
-        handler="flash_handler_init",
-        mode="before",
+        name="midi_loop",
+        target=HOOK_MIDI_LOOP,
+        handler="midi_loop_hook",
+        mode="replace",
     ),
 ]
 
@@ -144,11 +146,11 @@ def cmd_patch():
     if not stub_addr:
         # Fall back to the start of the patch zone (stubs are placed first)
         stub_addr = PATCH_ZONE_SRAM
-    hook_off = sram_to_file(HOOK_TARGET)
+    hook_off = sram_to_file(HOOK_MIDI_LOOP)
     old_hook = struct.unpack_from('<I', content, hook_off)[0]
-    new_hook = encode_arm_bl(HOOK_TARGET, stub_addr)
+    new_hook = encode_arm_bl(HOOK_MIDI_LOOP, stub_addr)
     struct.pack_into('<I', content, hook_off, new_hook)
-    print(f"  Hook: 0x{HOOK_TARGET:05X} bl 0x{stub_addr:05X} ({new_hook:#010x}, was {old_hook:#010x})")
+    print(f"  Hook: 0x{HOOK_MIDI_LOOP:05X} bl 0x{stub_addr:05X} ({new_hook:#010x}, was {old_hook:#010x})")
 
     # ── Patch 4: Move heap_start past handler zone ──
     # mempool_var_init loads heap_start from literal at 0xC570
@@ -178,6 +180,10 @@ def cmd_patch():
 
     PATCHED_SPI.write_bytes(spi)
     print(f"\nWrote: {PATCHED_SPI}")
+
+    body_bin = PATCH_DIR / "patched_body.bin"
+    body_bin.write_bytes(new_body)
+    print(f"Wrote: {body_bin}")
 
     # Show changed sectors
     original = SPI_IMAGE.read_bytes()
