@@ -848,6 +848,170 @@ def _append_run_stats(args, client, flash_s, repair_s, ops, failed_ops,
     print(f"  stats appended → {stats_path}")
 
 
+def _shift_repro(client, args):
+    """Minimal +2-byte shift reproduction harness.
+
+    Two modes, chosen by --repro-mode:
+
+      read-only: tight-loop V2_CMD_READ of a fixed flash region and
+                 compare host-side. Exercises ONLY do_read →
+                 dma_bidir_read. Does not write to flash. The post-AAI
+                 shift typically does NOT reproduce here (reads by
+                 themselves are clean) — use this mode to confirm pure
+                 reads are good, or to collect long LA captures.
+
+      sector-loop (default): loops V2_CMD_FLASH_SECTOR on a scratch
+                 sector (--test-sector), which runs
+                 erase → AAI-program → on-device verify exactly like
+                 flash-all. This reliably triggers the shift. The
+                 on-device VERIFY_MISS capture is read back per-iter.
+
+    Trigger suggestion for an LA: scope the 4 flash-SPI signals
+    (CS, CLK, MOSI, MISO) at 0xCC000000. In sector-loop mode each
+    iter is ~1.5–2 s of wire activity (erase, then AAI pairs ≈ 8 ms
+    at 3 MHz + spi_reset_clean, then verify reads). Trigger on
+    MISO-data-transition during the verify phase to catch the shift.
+
+    Per-miss output includes the offset, the 4-byte got/expected
+    window, and the shift magnitude inferred from got[0]==exp[N].
+    """
+    import time
+
+    ref = Path(args.ref).read_bytes()
+    spi_addr = args.repro_addr
+    length   = args.repro_length
+    n_iters  = args.repro_iters
+    mode     = args.repro_mode
+
+    if mode == "read-only":
+        if spi_addr + length > len(ref):
+            raise SystemExit(
+                f"--repro-addr 0x{spi_addr:x} + --repro-length {length} "
+                f"exceeds reference image ({len(ref)} bytes)")
+        expected = ref[spi_addr : spi_addr + length]
+        print(f"=== shift-repro read-only: addr=0x{spi_addr:06x} "
+              f"len={length} iters={n_iters} ===")
+    elif mode == "sector-loop":
+        sector = args.test_sector & ~0xFFF
+        length = 4096
+        pattern = bytes([0xFF] * 1022 + [0x00] * 1024
+                        + [(i * 37) & 0xFF for i in range(2050)])[:4096]
+        expected = pattern
+        print(f"=== shift-repro sector-loop: sector=0x{sector:06x} "
+              f"iters={n_iters} (will erase+program+verify each iter) ===")
+    else:
+        # block-loop: 64 KB FLASH_BLOCK per iter, 64 KB-aligned address.
+        # Take the test sector's 64 KB-aligned base; if it falls inside
+        # the golden-copy-protected 0x10000-0x3FFFF range, use 0x1F0000
+        # (last 64 KB — always safe).
+        block = args.test_sector & ~0xFFFF
+        if 0x10000 <= block <= 0x3F0000 and block < 0x40000:
+            block = 0x1F0000
+        length = 0x10000
+        # Synthetic pattern rich in 0xFF → 0x00 transitions — that's the
+        # data-shape where the +2-byte shift is observable (got prepends
+        # 0x00 0x00 before an expected 0xFF 0xFF). 256 B repeating
+        # structure: 2 × FF, 2 × 00, 252 bytes of varying. Every
+        # 256-byte boundary has a transition that the verify reads
+        # against. Also pull a chunk of real firmware data from 0x40000
+        # at offset 0x2000 (mid-pattern) so if the shift IS data-
+        # dependent we've got both varieties in one buffer.
+        fw_slab = ref[0x40000:0x40000 + 0x1000] if len(ref) >= 0x41000 \
+                  else bytes(range(256)) * 16
+        parts = []
+        for chunk_i in range(length // 256):
+            if chunk_i % 16 == 0:
+                parts.append(fw_slab[(chunk_i // 16) * 256 :
+                                      (chunk_i // 16) * 256 + 256])
+            else:
+                parts.append(bytes([0xFF, 0xFF, 0x00, 0x00] +
+                                   [(chunk_i * 37 + j) & 0xFF
+                                    for j in range(252)]))
+        pattern = b"".join(parts)[:length]
+        expected = pattern
+        print(f"=== shift-repro block-loop: block=0x{block:06x} "
+              f"len=0x{length:x} iters={n_iters} ===")
+        print(f"    (each iter: erase+AAI-program+on-device-verify; "
+              f"~1.5-2 s/iter)")
+        print(f"    pattern: synthetic FF-FF-00-00 transitions every "
+              f"256 B + firmware slab every 16th bucket")
+
+    misses = []
+    t0 = time.monotonic()
+    for i in range(n_iters):
+        if mode == "read-only":
+            data = client.read(spi_addr, length)
+            if data is None:
+                print(f"  iter {i}: READ FAILED")
+                continue
+        else:
+            if mode == "block-loop":
+                ok = client.flash_block(block, pattern)
+                target = block
+            else:
+                ok = client.flash_sector(sector, pattern)
+                target = sector
+            if ok:
+                # Host-side re-read to confirm flash actually has the pattern.
+                data = client.read(target, length)
+                if data is None:
+                    print(f"  iter {i}: readback failed")
+                    continue
+            else:
+                # On-device verify already caught the miss — mailbox has
+                # miss_* fields populated. Read them and synthesize a
+                # "data" string that produces the same miss.
+                client.o.halt()
+                miss_off = client.o.mdw(MBOX_ADDR + O_MISS_OFFSET)
+                miss_got = client.o.mdw(MBOX_ADDR + O_MISS_GOT)
+                miss_exp = client.o.mdw(MBOX_ADDR + O_MISS_EXP)
+                client.o.resume()
+                got4 = miss_got.to_bytes(4, "little")
+                exp4 = miss_exp.to_bytes(4, "little")
+                shift_hint = ""
+                for s in (1, 2, 3, 4):
+                    if got4[0] == exp4[s] if s < 4 else False:
+                        shift_hint = f" +{s}B shift"
+                        break
+                print(f"  iter {i}: DEVICE VERIFY_MISS @0x{miss_off:x}"
+                      f"  got={got4.hex(' ')} exp={exp4.hex(' ')}"
+                      f"{shift_hint}")
+                misses.append((i, miss_off, got4, exp4, shift_hint))
+                continue
+
+        if data == expected:
+            continue
+        first = next(idx for idx in range(length) if data[idx] != expected[idx])
+        got4 = data[first:first+4].ljust(4, b'\x00')
+        exp4 = expected[first:first+4].ljust(4, b'\x00')
+        shift_hint = ""
+        for s in (1, 2, 3, 4):
+            if first + s < length and got4[0] == expected[first + s]:
+                shift_hint = f" +{s}B shift"
+                break
+        print(f"  iter {i}: MISS @0x{first:04x} (dec {first})"
+              f"  got={got4.hex(' ')} exp={exp4.hex(' ')}{shift_hint}")
+        misses.append((i, first, bytes(got4), bytes(exp4), shift_hint))
+
+    dt = time.monotonic() - t0
+    print()
+    print(f"=== summary: {len(misses)}/{n_iters} misses in {dt:.1f}s"
+          f" ({n_iters / dt:.2f} iter/s) ===")
+    if misses:
+        import collections
+        offsets = sorted({m[1] for m in misses})
+        print(f"Miss offsets ({len(offsets)} unique): "
+              f"{', '.join(f'0x{o:x}' for o in offsets[:16])}"
+              f"{'...' if len(offsets) > 16 else ''}")
+        cnt = collections.Counter(o & ~0xFF for o in (m[1] for m in misses))
+        top = cnt.most_common(5)
+        print(f"Top miss regions (256 B buckets): "
+              f"{', '.join(f'0x{o:x}×{c}' for o, c in top)}")
+        shifts = collections.Counter(m[4].strip() for m in misses)
+        print(f"Shift classifications: {dict(shifts)}")
+    return 0 if not misses else 2
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--ref", default=str(FIRMWARE_DIR / "blender_spi_patched.bin"),
@@ -859,7 +1023,8 @@ def main():
     p.add_argument("--mode", choices=("test", "erase-only", "readback",
                                        "flash-all", "autonomous",
                                        "block-sector", "block-64k",
-                                       "byte-test", "byte-only", "read-id"),
+                                       "byte-test", "byte-only", "read-id",
+                                       "shift-repro"),
                    default="test",
                    help="'test' = host-driven erase+program+verify on test sector, "
                         "'autonomous' = single V2_CMD_FLASH_SECTOR (4 KB only), "
@@ -901,6 +1066,27 @@ def main():
                         f"Unset fields use the on-device defaults.")
     p.add_argument("--show-timings", action="store_true",
                    help="Print the active on-device timings and exit.")
+    p.add_argument("--repro-mode",
+                   choices=("read-only", "sector-loop", "block-loop"),
+                   default="block-loop",
+                   help="shift-repro backend. 'block-loop' (default) drives "
+                        "erase+AAI+verify on a 64 KB block (64 KB → many more "
+                        "AAI pairs + verify chunks per iter than sector-loop, "
+                        "matches the actual flash-all pattern that reproduces "
+                        "the shift). 'sector-loop' runs a 4 KB FLASH_SECTOR per "
+                        "iter on --test-sector. 'read-only' tight-loops "
+                        "CMD_READ of --repro-addr for LA captures of pure "
+                        "reads (pure reads do NOT reproduce the shift).")
+    p.add_argument("--repro-addr", type=lambda x: int(x, 0), default=0x070000,
+                   help="shift-repro: SPI address to read in a tight loop. "
+                        "Default 0x70000 is an empirically failure-prone block "
+                        "on the patched image (2026-04-22).")
+    p.add_argument("--repro-length", type=int, default=4096,
+                   help="shift-repro: bytes per read (default 4096 = one sector). "
+                        "The v2 driver reads in READ_CHUNK (2 KB) sub-chunks, so "
+                        "4096 exercises 2 back-to-back dma_bidir_reads per iter.")
+    p.add_argument("--repro-iters", type=int, default=200,
+                   help="shift-repro: number of read iterations (default 200)")
     p.add_argument("--byte-addr", type=lambda x: int(x, 0), default=0x3F020,
                    help="byte-test: target SPI address for the single-byte write")
     p.add_argument("--byte-val", type=lambda x: int(x, 0), default=0x5A,
@@ -1069,6 +1255,8 @@ def main():
             ok = hits == expected
             print(f"byte-test: {'OK' if ok else 'FAIL'}")
             return 0 if ok else 1
+        if args.mode == "shift-repro":
+            return _shift_repro(client, args)
         if args.mode == "erase-only":
             ok = client.erase(args.test_sector)
         elif args.mode == "readback":
