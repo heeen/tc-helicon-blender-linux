@@ -1309,11 +1309,10 @@ static int dma_bidir_read(uint32_t spi_addr, uint8_t *out, uint32_t len,
     DMA_CHREG(1, 0x00) = (uint32_t)(uintptr_t)BIDIR_TX_BUF;
     DMA_CHREG(1, 0x04) = SPI_TX_PORT;
     DMA_CHREG(1, 0x08) = 0;
-    /* TX overrun is required — tightening to xfer_len stalls the RX
-     * pipeline (experiment 2026-04-20). Historical 0xFFF puts 2 KB+ of
-     * extra bytes through the wire, and occasionally loses 2 RX bytes
-     * — likely a FIFO overflow. Try xfer_len + modest pad so RX has
-     * enough slack but we don't blast 4095 bytes past it. */
+    /* TX overrun is required — tightening to xfer_len produces
+     * V2_ERR_READ_DMA (wait_dma_irq timeout). Re-confirmed 2026-04-22
+     * with current driver state, including DMA_ICLR=0xFF. 0xFFF is
+     * the safe value. */
     DMA_CHREG(1, 0x0C) = 0xFFF | DMA_CFG_TX;
     dwb();
     DMA_CHREG(1, 0x10) = DMA_TRG_TX;
