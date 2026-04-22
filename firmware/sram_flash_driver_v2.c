@@ -1309,11 +1309,18 @@ static int dma_bidir_read(uint32_t spi_addr, uint8_t *out, uint32_t len,
     DMA_CHREG(1, 0x00) = (uint32_t)(uintptr_t)BIDIR_TX_BUF;
     DMA_CHREG(1, 0x04) = SPI_TX_PORT;
     DMA_CHREG(1, 0x08) = 0;
-    /* TX overrun is required — tightening to xfer_len produces
-     * V2_ERR_READ_DMA (wait_dma_irq timeout). Re-confirmed 2026-04-22
-     * with current driver state, including DMA_ICLR=0xFF. 0xFFF is
-     * the safe value. */
-    DMA_CHREG(1, 0x0C) = 0xFFF | DMA_CFG_TX;
+    /* TX count tuning notes (2026-04-22):
+     *  - xfer_len (no overrun): wait_dma_irq timeouts (V2_ERR_READ_DMA)
+     *  - 0xFFF (historical): works but intermittent +2-byte RX shift
+     *    (Arasan SPI FIFO is 32-bit × 32-deep word-oriented; 0xFFF
+     *    leaves the internal byte→word packer mid-word — 3 bytes mod 4
+     *    — so the next transaction's packer starts 1 byte past a
+     *    word boundary and emits [00 00 b0 b1] as its first FIFO
+     *    word, shifting RX_TEMP by +2).
+     *  - 0xFFC (4092): word-aligned. Exercises the hypothesis that
+     *    ending TX on a 4-byte boundary lets the packer reset cleanly
+     *    for the next arm. */
+    DMA_CHREG(1, 0x0C) = 0xFFC | DMA_CFG_TX;
     dwb();
     DMA_CHREG(1, 0x10) = DMA_TRG_TX;
     dwb();

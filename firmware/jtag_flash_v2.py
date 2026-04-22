@@ -961,11 +961,13 @@ def _shift_repro(client, args):
                 ok = client.flash_sector(sector, pattern)
                 target = sector
             if ok:
-                # Host-side re-read to confirm flash actually has the pattern.
-                data = client.read(target, length)
-                if data is None:
-                    print(f"  iter {i}: readback failed")
-                    continue
+                # On-device verify already ran (CMD_FLASH_BLOCK does
+                # erase+program+verify atomically). Trust it — a host
+                # readback of 64 KB into DATA_BUF_ADDR would overflow
+                # the 4 KB DATA_BUF and clobber driver code at 0x2C000+.
+                # If belt-and-suspenders host readback is desired,
+                # split into 4 KB chunks against a scratch buf.
+                continue
             else:
                 # On-device verify already caught the miss — mailbox has
                 # miss_* fields populated. Read them and synthesize a
