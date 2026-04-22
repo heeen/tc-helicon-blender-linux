@@ -318,3 +318,79 @@ Open question for the residual +2-byte shift: the miss pattern
 bit 3 set` suggests our single-chunk bidir read is losing 2 RX
 bytes in the FIFO. Single-chained-4KB-descriptor would obviate
 this. Tracked as task #32.
+
+---
+
+## 8. Follow-up experiments (2026-04-22)
+
+After extensive Ghidra labelling, more experiments tried and (mostly)
+ruled out:
+
+### DMA_CFG bit pattern — partially fixed
+Stock's `spi_engine_queue_and_arm` WRITES `0x70009000 | 0x04000000`
+(TX inc) or `0x70009000 | 0x08000000` (RX inc) + EOC bit to the
+descriptor cfg at build time. Live probe of eCos at idle shows the
+channel's cfg READBACK as `0xF4009xxx` (TX) or `0x88009xxx` (RX). TX
+matches; **RX readback is missing bits 28/29/30** that the stock code
+wrote.
+
+Theory: bits 28/29/30 encode "transfer active" or burst-state flags
+that hardware clears once the transfer completes. Stock WRITES them
+as part of the base pattern; hardware CLEARS them after running.
+
+Tested: set our `DMA_CFG_RX` from `0x88009000` to `0xF8009000` (match
+stock's write-time value). Result: **regressed** from ~1 miss/20 to
+7/20 shift-repro iters. Confirms these bits are "don't write" for a
+fresh DMA setup; the observed 0x88009000 IS the correct write value.
+Revert kept.
+
+### Chained-descriptor attempt — mechanism unclear
+Built a chain of N descriptors (2–8) for a single bidir read with one
+CS cycle. Result: `V2_ERR_READ_DMA` timeouts on every attempt — DMA
+engine never signaled completion. Root cause likely the trigger word:
+stock writes `wrapper[0] | 0x8001` to the GO reg, where `wrapper[0]`
+is some pre-initialized value we haven't decoded (observed live eCos
+CH0 GO = 0xD006, CH1 GO = 0xD004; our `DMA_TRG_TX = 0xD005`,
+`DMA_TRG_RX = 0xD007` don't match stock's exact bits but do work for
+single-descriptor transfers). Without the Arasan datasheet explaining
+how GO register bits encode chain-mode vs single-shot, this can't be
+implemented blindly.
+
+### RX FIFO drain between transactions — regresses reliably
+Tried adding `spi_ip_drain_rx` (read SPI_DATA until STAT.RX_RDY
+clears) at various points:
+* inside `spi_reset_clean` (start of each read chunk)
+* at `xport_dma_aai_end` (after AAI, before first verify read)
+* inside `dma_bidir_read` after DMA completes (before CS deassert)
+
+All three variants regress to 10–17 deterministic failures. Reading
+`SPI_DATA` with `SPI_EN=0` evidently has a side effect that
+corrupts state. Without Arasan-documented drain semantics, "drain
+the FIFO" isn't safely implementable.
+
+### What the residual bug IS (as of 2026-04-22)
+
+A SoC-internal half-word DMA capture glitch. Confirmed:
+* **Wire level clean** — LA capture shows MISO byte-perfect.
+* **SRAM has +2-byte shift at miss_offset** — half-word aligned
+  (`miss_offset % 2 == 0 && miss_offset % 4 ∈ {0, 2}`).
+* **Data-dependent, not burst-size-dependent** — same failure rate at
+  `READ_CHUNK = 0x800`, `0x100`, `0x40`; same blocks fail deterministically.
+* **DMA_ISTAT = 0x03** (bits 0+1 only) at miss — clean, bit 3 no
+  longer latched thanks to `DMA_ICLR = 0xFF` widening.
+
+Mitigated, not fixed:
+* TX count word-aligned (`0xFFF` → `0xFFC`)
+* `DMA_ICLR = 0xFF` in teardown (all 8 channels)
+* In-driver `do_verify` retry × 4 per chunk
+* Host `flash_block` retry × 3 at the per-op level
+
+End-state failure rate: 0–2 per 64-op flash-all from eCos state,
+~60–90 s runtime. Stubborn blocks (specific data patterns, specific
+addresses) fail all retries occasionally and surface as `FAILED ops`
+in the host-side summary. Re-running usually clears them.
+
+The Arasan datasheet would be the unlock. Without it, further
+micro-investigations have diminishing returns — the silicon likely
+has a known workaround published somewhere or requires a specific
+reset sequence we haven't found.

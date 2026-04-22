@@ -104,10 +104,21 @@ struct dma_controller {
 #define DMA_CFG_RX_DIR    0x08000000u
 #define DMA_CFG_BASE      0x00009000u    /* stock's "base" in 0x70009000 */
 
-/* Our historical constants — produce the full CFG word for a transfer
- * of `n` bytes in each direction. Values observed to work. */
-#define DMA_CFG_TX        0xF4009000u    /* n|0xF4009000 — bit31|bits28..24|... */
-#define DMA_CFG_RX        0x88009000u    /* n|0x88009000 */
+/* CFG word for a transfer of `n` bytes.
+ *
+ * Stock eCos's spi_engine_queue_and_arm writes `0x70009000` into the
+ * descriptor's cfg initially, then ORs in 0x04000000 (TX inc) or
+ * 0x08000000 (RX inc), then 0x80000000 (end-of-chain) on the last
+ * descriptor. That gives 0xF4009xxx for TX, 0xF8009xxx for RX at
+ * write-time. But LIVE PROBE of a running eCos showed the post-run
+ * channel cfg as 0xF4009xxx for TX (matches) and 0x88009xxx for RX
+ * (bits 28/29/30 CLEARED). We tried 0xF8009xxx to match the stock
+ * pre-write value — regressed from ~1 miss/20 to 7/20 shift_repro
+ * iters. Bits 28/29/30 evidently mark "transfer in progress" or
+ * similar runtime flags the hardware manages; they must NOT be set
+ * in our RX descriptor cfg. Keep the post-run observed values. */
+#define DMA_CFG_TX        0xF4009000u    /* bit 31 | 30 | 29 | 28 | 26 | 15 | 12 */
+#define DMA_CFG_RX        0x88009000u    /* bit 31 | 27 | 15 | 12 (NOT 28/29/30) */
 
 /* Per-channel trigger words our driver currently uses. Stock uses
  * cfg|0x8001; our DMA_TRG_* add extra bits (14, 12, 2) that may encode
