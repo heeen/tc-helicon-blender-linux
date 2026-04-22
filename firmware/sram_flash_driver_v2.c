@@ -1080,6 +1080,12 @@ static void xport_dma_aai_end(void) {
     DMA_EN = 0;
     DMA_ICLR = 0xF;
     dwb();
+    /* NOTE: we do NOT drain the RX FIFO here — tried it 2026-04-22 and
+     * it regresses flash-all to 17 deterministic failures. Reading
+     * SPI_DATA while SPI_EN=0 apparently has a side effect (clocks
+     * another byte?) that corrupts state. Whatever half-word alignment
+     * the FIFO packer is in after AAI is handled elsewhere or reset
+     * by the next CS-deassert edge. */
 }
 
 static const spi_xport_t xport_dma = {
@@ -1357,6 +1363,9 @@ static int do_read(uint32_t spi_addr, uint8_t *dest, uint32_t len) {
     return 0;
 }
 
+/* In-driver verify-retry counter. Host reads for diagnostics. */
+#define V2_VERIFY_RETRY_MAX 4u
+
 static int do_verify(uint32_t spi_addr, const uint8_t *expected, uint32_t len) {
     set_phase(V2_PHASE_VERIFY);
     /* 4 KB scratch buffer at the start of SRAM — reused across the driver
@@ -1368,34 +1377,56 @@ static int do_verify(uint32_t spi_addr, const uint8_t *expected, uint32_t len) {
     uint32_t chunks_done = 0;
     while (remaining) {
         uint32_t chunk = remaining > V2_SECTOR_SIZE ? V2_SECTOR_SIZE : remaining;
-        if (do_read(spi_addr + off, readback, chunk) != 0)
-            return -1;
-        chunks_done++;
-        for (uint32_t i = 0; i < chunk; i++) {
-            if (readback[i] != expected[off + i]) {
-                /* Capture miss state BEFORE any extra writes that could
-                 * perturb it. 4-byte windows are clamped at the end of
-                 * the chunk / expected buffer. */
-                uint32_t abs_off = off + i;
-                uint32_t got_w = 0, exp_w = 0;
-                uint32_t n = chunk - i; if (n > 4) n = 4;
-                for (uint32_t k = 0; k < n; k++) {
-                    got_w |= (uint32_t)readback[i + k] << (k * 8);
-                    exp_w |= (uint32_t)expected[off + i + k] << (k * 8);
-                }
-                MBOX->miss_offset     = abs_off;
-                MBOX->miss_got        = got_w;
-                MBOX->miss_expected   = exp_w;
-                MBOX->miss_spi_stat   = SPI_STAT;
-                MBOX->miss_dma_istat  = DMA_ISTAT;
-                MBOX->miss_reads_done = chunks_done;
-                dwb();
-                log_put(V2_EVT_VERIFY_MISS, (uint16_t)abs_off,
-                        spi_addr + abs_off);
-                MBOX->last_sr = ((uint32_t)expected[abs_off] << 8) | readback[i];
-                set_error(V2_ERR_VERIFY_MISMATCH, spi_addr + abs_off, readback[i]);
+
+        /* In-driver retry for the SoC-internal half-word DMA-capture
+         * bug: if the first read miscompares, re-issue the read up to
+         * MAX times. The flash content is almost certainly correct
+         * (silicon-bug causes ~+2 SRAM offset in the captured bytes,
+         * not miswritten flash). Retrying gives the buggy capture a
+         * fresh roll of the dice. See firmware/StockDmaAndSpi.md and
+         * task #32 for the full story. */
+        uint32_t first_bad = chunk;  /* sentinel for "all matched" */
+        uint8_t  first_got = 0, first_exp = 0;
+
+        for (uint32_t attempt = 0; attempt < V2_VERIFY_RETRY_MAX; attempt++) {
+            if (do_read(spi_addr + off, readback, chunk) != 0)
                 return -1;
+            /* Scan for first mismatch. */
+            first_bad = chunk;
+            for (uint32_t i = 0; i < chunk; i++) {
+                if (readback[i] != expected[off + i]) {
+                    first_bad = i;
+                    first_got = readback[i];
+                    first_exp = expected[off + i];
+                    break;
+                }
             }
+            if (first_bad == chunk) break;   /* clean */
+            MBOX->verify_retries++;
+        }
+        chunks_done++;
+
+        if (first_bad != chunk) {
+            /* Still bad after retries — report miss. Capture state. */
+            uint32_t abs_off = off + first_bad;
+            uint32_t got_w = 0, exp_w = 0;
+            uint32_t n = chunk - first_bad; if (n > 4) n = 4;
+            for (uint32_t k = 0; k < n; k++) {
+                got_w |= (uint32_t)readback[first_bad + k] << (k * 8);
+                exp_w |= (uint32_t)expected[off + first_bad + k] << (k * 8);
+            }
+            MBOX->miss_offset     = abs_off;
+            MBOX->miss_got        = got_w;
+            MBOX->miss_expected   = exp_w;
+            MBOX->miss_spi_stat   = SPI_STAT;
+            MBOX->miss_dma_istat  = DMA_ISTAT;
+            MBOX->miss_reads_done = chunks_done;
+            dwb();
+            log_put(V2_EVT_VERIFY_MISS, (uint16_t)abs_off,
+                    spi_addr + abs_off);
+            MBOX->last_sr = ((uint32_t)first_exp << 8) | first_got;
+            set_error(V2_ERR_VERIFY_MISMATCH, spi_addr + abs_off, first_got);
+            return -1;
         }
         off       += chunk;
         remaining -= chunk;

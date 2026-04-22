@@ -154,6 +154,11 @@ struct v2_mailbox {
     volatile uint32_t miss_spi_stat;  /* +0x50 — SPI_STAT at moment of miss */
     volatile uint32_t miss_dma_istat; /* +0x54 — DMA_ISTAT at moment of miss */
     volatile uint32_t miss_reads_done;/* +0x58 — #dma_bidir_read chunks issued before miss */
+    volatile uint32_t verify_retries; /* +0x5C — per-cmd count of do_verify
+                                       *         chunk re-reads triggered by
+                                       *         the half-word DMA glitch.
+                                       *         Normally 0; bumped when a
+                                       *         read misses & retries match */
 };
 
 /* ── Log ring entry (12 bytes) ────────────────────────────── */
