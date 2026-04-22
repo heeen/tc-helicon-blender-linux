@@ -935,6 +935,15 @@ def _shift_repro(client, args):
               f"~1.5-2 s/iter)")
         print(f"    pattern: synthetic FF-FF-00-00 transitions every "
               f"256 B + firmware slab every 16th bucket")
+        if args.repro_dump_pattern:
+            p = Path(args.repro_dump_pattern)
+            # Lay pattern out at the same block offset so parse_la_log.py
+            # can pass it as --ref and address-resolve naturally.
+            buf = bytearray(b"\xFF" * (block + length))
+            buf[block:block + length] = pattern
+            p.write_bytes(bytes(buf))
+            print(f"    wrote pattern ref to {p} "
+                  f"({block + length} bytes, pattern @0x{block:06x})")
 
     misses = []
     t0 = time.monotonic()
@@ -1066,6 +1075,12 @@ def main():
                         f"Unset fields use the on-device defaults.")
     p.add_argument("--show-timings", action="store_true",
                    help="Print the active on-device timings and exit.")
+    p.add_argument("--repro-dump-pattern", type=str, default="",
+                   metavar="FILE",
+                   help="shift-repro: also write the synthetic block-loop "
+                        "pattern to FILE (at byte offset = --test-sector). "
+                        "Useful as the --ref for parse_la_log.py when "
+                        "decoding logic-analyzer captures of the repro.")
     p.add_argument("--repro-mode",
                    choices=("read-only", "sector-loop", "block-loop"),
                    default="block-loop",
