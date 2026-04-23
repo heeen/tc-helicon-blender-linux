@@ -120,11 +120,23 @@ struct dma_controller {
 #define DMA_CFG_TX        0xF4009000u    /* bit 31 | 30 | 29 | 28 | 26 | 15 | 12 */
 #define DMA_CFG_RX        0x88009000u    /* bit 31 | 27 | 15 | 12 (NOT 28/29/30) */
 
-/* Per-channel trigger words our driver currently uses. Stock uses
- * cfg|0x8001; our DMA_TRG_* add extra bits (14, 12, 2) that may encode
- * direction / auto-increment differently. Keep as-is until we have a
- * reason to touch them. */
-#define DMA_TRG_TX        0xD005u
+/* Per-channel trigger words. Decoded via PL080 TRM (ARM DDI 0196C)
+ * Configuration register (§3.4.20):
+ *   [15] ITC mask  [14] IE mask  [13:11] FlowCntrl
+ *   [9:6] DestPeripheral  [4:1] SrcPeripheral  [0] E
+ *
+ * RX (0xD007): ITC=1, IE=1, FlowCntrl=010 (P2M), SrcPeripheral=3, E=1.
+ *   Matches live eCos CH2 probe (0xD006 idle → 0xD007 armed). Good.
+ *
+ * TX: was 0xD005 = FlowCntrl=010 (P2M, wrong!) + SrcPeripheral=2 —
+ *   told the DMA "peripheral-to-memory from peripheral 2", opposite
+ *   of what we want. Control register SI=1/DI=0 pointed the data
+ *   flow the right way, but BREQ/SREQ handshaking keyed off the
+ *   wrong peripheral line. Leading hypothesis for the residual +2B
+ *   read-verify shift.
+ * TX (0x8881): ITC=1, FlowCntrl=001 (M2P), DestPeripheral=2, E=1.
+ *   Matches live eCos CH3 probe (0x8880 idle → 0x8881 armed). */
+#define DMA_TRG_TX        0x8881u
 #define DMA_TRG_RX        0xD007u
 
 #endif /* DICE3_DMA_H */
