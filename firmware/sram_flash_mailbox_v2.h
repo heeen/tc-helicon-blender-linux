@@ -159,6 +159,54 @@ struct v2_mailbox {
                                        *         the half-word DMA glitch.
                                        *         Normally 0; bumped when a
                                        *         read misses & retries match */
+
+    /* Per-chunk DMA/SPI snapshot — sampled at end of every dma_bidir_read,
+     * right after TC fires but before any teardown writes. The same
+     * registers are also copied into `miss_*` slots below when VERIFY_MISS
+     * fires, so host can diff "state when chunk was good" vs "state when
+     * chunk produced shifted data". */
+    volatile uint32_t last_spi_err;        /* +0x60 — SPI_ERR (+0x34)      */
+    volatile uint32_t last_spi_pending;    /* +0x64 — SPI+0x10 ("pending") */
+    volatile uint32_t last_dma_stat;       /* +0x68 — DMA+0x04 (STATUS)    */
+    volatile uint32_t last_ch0_ctrl;       /* +0x6C — CH0 Control (+0x0C)  */
+    volatile uint32_t last_ch0_cfg;        /* +0x70 — CH0 Config (+0x10):
+                                            *         bit17=A, bit18=H, bit0=E */
+    volatile uint32_t last_ch1_ctrl;       /* +0x74 — CH1 Control          */
+    volatile uint32_t last_ch1_cfg;        /* +0x78 — CH1 Config           */
+    volatile uint32_t last_dma_en;         /* +0x7C — DMA_EN readback      */
+
+    /* Sampled snapshot of `last_*` at VERIFY_MISS time — host reads
+     * these to see the state of the failing chunk; compares vs
+     * `last_*` (which then keeps getting overwritten by subsequent OK
+     * chunks) for diff analysis. */
+    volatile uint32_t miss_spi_err;        /* +0x80 */
+    volatile uint32_t miss_spi_pending;    /* +0x84 */
+    volatile uint32_t miss_dma_stat;       /* +0x88 */
+    volatile uint32_t miss_ch0_ctrl;       /* +0x8C */
+    volatile uint32_t miss_ch0_cfg;        /* +0x90 */
+    volatile uint32_t miss_ch1_ctrl;       /* +0x94 */
+    volatile uint32_t miss_ch1_cfg;        /* +0x98 */
+    volatile uint32_t miss_dma_en;         /* +0x9C */
+
+    /* Pre-arm SPI state — sampled at the top of dma_bidir_read, right
+     * after spi_reset_clean and BEFORE we write CTRL/LEN/DMAMD. Tests
+     * whether the SPI IP has stale FIFO bytes from a previous op that
+     * would clock out first and shift subsequent reads. */
+    volatile uint32_t last_pre_stat;       /* +0xA0 — SPI_STAT pre-arm */
+    volatile uint32_t last_pre_err;        /* +0xA4 — SPI_ERR pre-arm  */
+    volatile uint32_t miss_pre_stat;       /* +0xA8 */
+    volatile uint32_t miss_pre_err;        /* +0xAC */
+
+    /* First 8 bytes of RX_TEMP — i.e. what the RX DMA actually captured
+     * BEFORE our READ_RX_SKIP=4 offset is applied. If TX is properly
+     * aligned, these should be [dummy, dummy, dummy, dummy, flash[0],
+     * flash[1], flash[2], flash[3]] where dummies are whatever MISO
+     * was during our cmd+addr TX. A +2B shift of flash data into the
+     * skip region would be visible here directly. */
+    volatile uint32_t last_rx_head0;       /* +0xB0 — RX_TEMP[0..3]  */
+    volatile uint32_t last_rx_head1;       /* +0xB4 — RX_TEMP[4..7]  */
+    volatile uint32_t miss_rx_head0;       /* +0xB8 */
+    volatile uint32_t miss_rx_head1;       /* +0xBC */
 };
 
 /* ── Log ring entry (12 bytes) ────────────────────────────── */

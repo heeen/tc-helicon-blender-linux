@@ -102,6 +102,35 @@ O_MISS_EXP     = 0x4C
 O_MISS_SPI_ST  = 0x50
 O_MISS_DMA_IST = 0x54
 O_MISS_READS   = 0x58
+O_VERIFY_RTRY  = 0x5C
+
+# Last-chunk DMA/SPI snapshot (updated at end of every dma_bidir_read).
+O_LAST_SPI_ERR = 0x60
+O_LAST_SPI_PND = 0x64
+O_LAST_DMA_ST  = 0x68
+O_LAST_CH0_CTL = 0x6C
+O_LAST_CH0_CFG = 0x70
+O_LAST_CH1_CTL = 0x74
+O_LAST_CH1_CFG = 0x78
+O_LAST_DMA_EN  = 0x7C
+
+# VERIFY_MISS snapshot of the same (preserved for post-mortem).
+O_MISS_SPI_ERR = 0x80
+O_MISS_SPI_PND = 0x84
+O_MISS_DMA_ST  = 0x88
+O_MISS_CH0_CTL = 0x8C
+O_MISS_CH0_CFG = 0x90
+O_MISS_CH1_CTL = 0x94
+O_MISS_CH1_CFG = 0x98
+O_MISS_DMA_EN  = 0x9C
+O_LAST_PRE_ST  = 0xA0
+O_LAST_PRE_ERR = 0xA4
+O_MISS_PRE_ST  = 0xA8
+O_MISS_PRE_ERR = 0xAC
+O_LAST_RX_H0   = 0xB0
+O_LAST_RX_H1   = 0xB4
+O_MISS_RX_H0   = 0xB8
+O_MISS_RX_H1   = 0xBC
 
 STATUS_READY = 0
 STATUS_BUSY  = 1
@@ -343,6 +372,33 @@ class FlashClientV2:
         miss_spi_st  = self.o.mdw(MBOX_ADDR + O_MISS_SPI_ST)
         miss_dma_ist = self.o.mdw(MBOX_ADDR + O_MISS_DMA_IST)
         miss_reads   = self.o.mdw(MBOX_ADDR + O_MISS_READS)
+        # Extended diagnostic snapshot (also captured at VERIFY_MISS).
+        miss_spi_err = self.o.mdw(MBOX_ADDR + O_MISS_SPI_ERR)
+        miss_spi_pnd = self.o.mdw(MBOX_ADDR + O_MISS_SPI_PND)
+        miss_dma_st  = self.o.mdw(MBOX_ADDR + O_MISS_DMA_ST)
+        miss_ch0_ctl = self.o.mdw(MBOX_ADDR + O_MISS_CH0_CTL)
+        miss_ch0_cfg = self.o.mdw(MBOX_ADDR + O_MISS_CH0_CFG)
+        miss_ch1_ctl = self.o.mdw(MBOX_ADDR + O_MISS_CH1_CTL)
+        miss_ch1_cfg = self.o.mdw(MBOX_ADDR + O_MISS_CH1_CFG)
+        miss_dma_en  = self.o.mdw(MBOX_ADDR + O_MISS_DMA_EN)
+        miss_pre_st  = self.o.mdw(MBOX_ADDR + O_MISS_PRE_ST)
+        miss_pre_err = self.o.mdw(MBOX_ADDR + O_MISS_PRE_ERR)
+        miss_rx_h0   = self.o.mdw(MBOX_ADDR + O_MISS_RX_H0)
+        miss_rx_h1   = self.o.mdw(MBOX_ADDR + O_MISS_RX_H1)
+        # Last-chunk snapshot — on VERIFY_OK this shows the state of the
+        # last successful chunk, which we can diff against the miss case.
+        last_spi_err = self.o.mdw(MBOX_ADDR + O_LAST_SPI_ERR)
+        last_spi_pnd = self.o.mdw(MBOX_ADDR + O_LAST_SPI_PND)
+        last_dma_st  = self.o.mdw(MBOX_ADDR + O_LAST_DMA_ST)
+        last_ch0_ctl = self.o.mdw(MBOX_ADDR + O_LAST_CH0_CTL)
+        last_ch0_cfg = self.o.mdw(MBOX_ADDR + O_LAST_CH0_CFG)
+        last_ch1_ctl = self.o.mdw(MBOX_ADDR + O_LAST_CH1_CTL)
+        last_ch1_cfg = self.o.mdw(MBOX_ADDR + O_LAST_CH1_CFG)
+        last_dma_en  = self.o.mdw(MBOX_ADDR + O_LAST_DMA_EN)
+        last_pre_st  = self.o.mdw(MBOX_ADDR + O_LAST_PRE_ST)
+        last_pre_err = self.o.mdw(MBOX_ADDR + O_LAST_PRE_ERR)
+        last_rx_h0   = self.o.mdw(MBOX_ADDR + O_LAST_RX_H0)
+        last_rx_h1   = self.o.mdw(MBOX_ADDR + O_LAST_RX_H1)
         ring      = self.o.dump_image(LOG_RING_ADDR,
                                       LOG_ENTRY_SIZE * LOG_RING_ENTRIES)
         self.o.resume()
@@ -377,9 +433,85 @@ class FlashClientV2:
                 f.write(f"miss_spi_stat    = 0x{miss_spi_st:08x}\n")
                 f.write(f"miss_dma_istat   = 0x{miss_dma_ist:08x}\n")
                 f.write(f"miss_reads_done  = {miss_reads}\n")
+                # Extended diagnostic snapshot.
+                def _decode_cfg(v):
+                    return (f"E={v&1} FlowCntrl={(v>>11)&7} "
+                            f"DestPeri={(v>>6)&0xF} SrcPeri={(v>>1)&0xF} "
+                            f"L={(v>>16)&1} A={(v>>17)&1} H={(v>>18)&1}")
+                def _decode_ctl(v):
+                    return (f"count={v&0xFFF} SBSize={(v>>12)&7} "
+                            f"DBSize={(v>>15)&7} SWidth={(v>>18)&7} "
+                            f"DWidth={(v>>21)&7} SI={(v>>26)&1} "
+                            f"DI={(v>>27)&1} Prot={(v>>28)&7} I={(v>>31)&1}")
+                f.write("# ── DMA/SPI snapshot (miss vs last-OK) ──\n")
+                def _decode_sstat(v):
+                    bits = []
+                    if v & 0x01: bits.append("BUSY")
+                    if v & 0x02: bits.append("TX_RDY")
+                    if v & 0x08: bits.append("RX_RDY")
+                    return ",".join(bits) if bits else "-"
+                def _hexbytes(w):
+                    return " ".join(f"{(w>>(8*i))&0xFF:02x}" for i in range(4))
+                miss_head = f"{_hexbytes(miss_rx_h0)} | {_hexbytes(miss_rx_h1)}"
+                last_head = f"{_hexbytes(last_rx_h0)} | {_hexbytes(last_rx_h1)}"
+                f.write(f"miss_rx_head     = {miss_head}\n")
+                f.write(f"last_rx_head     = {last_head}\n")
+                # Expected: first 4 bytes dummy (cmd+addr echo), next 4 = flash data.
+                # RX_TEMP[4] should == exp[0]. Any deviation localizes the shift.
+                f.write(f"miss_pre_stat    = 0x{miss_pre_st:08x}   "
+                        f"({_decode_sstat(miss_pre_st)})   "
+                        f"last=0x{last_pre_st:08x}\n")
+                f.write(f"miss_pre_err     = 0x{miss_pre_err:08x}   "
+                        f"last=0x{last_pre_err:08x}\n")
+                f.write(f"miss_spi_err     = 0x{miss_spi_err:08x}   "
+                        f"last=0x{last_spi_err:08x}\n")
+                f.write(f"miss_spi_pending = 0x{miss_spi_pnd:08x}   "
+                        f"last=0x{last_spi_pnd:08x}\n")
+                f.write(f"miss_dma_stat    = 0x{miss_dma_st:08x}   "
+                        f"last=0x{last_dma_st:08x}\n")
+                f.write(f"miss_dma_en      = 0x{miss_dma_en:08x}   "
+                        f"last=0x{last_dma_en:08x}\n")
+                f.write(f"miss_ch0_ctrl    = 0x{miss_ch0_ctl:08x}   "
+                        f"({_decode_ctl(miss_ch0_ctl)})\n")
+                f.write(f"     last_ch0    = 0x{last_ch0_ctl:08x}   "
+                        f"({_decode_ctl(last_ch0_ctl)})\n")
+                f.write(f"miss_ch0_cfg     = 0x{miss_ch0_cfg:08x}   "
+                        f"({_decode_cfg(miss_ch0_cfg)})\n")
+                f.write(f"     last_ch0    = 0x{last_ch0_cfg:08x}   "
+                        f"({_decode_cfg(last_ch0_cfg)})\n")
+                f.write(f"miss_ch1_ctrl    = 0x{miss_ch1_ctl:08x}   "
+                        f"({_decode_ctl(miss_ch1_ctl)})\n")
+                f.write(f"     last_ch1    = 0x{last_ch1_ctl:08x}   "
+                        f"({_decode_ctl(last_ch1_ctl)})\n")
+                f.write(f"miss_ch1_cfg     = 0x{miss_ch1_cfg:08x}   "
+                        f"({_decode_cfg(miss_ch1_cfg)})\n")
+                f.write(f"     last_ch1    = 0x{last_ch1_cfg:08x}   "
+                        f"({_decode_cfg(last_ch1_cfg)})\n")
                 print(f"  miss@+{miss_off}  got={got4.hex()} exp={exp4.hex()}"
                       f"  spi_stat=0x{miss_spi_st:x} dma_istat=0x{miss_dma_ist:x}"
                       f"  reads={miss_reads}{shift_hint}")
+                # Compact single-line diff on stdout.
+                diffs = []
+                for name, m, l in [
+                    ("pre_stat", miss_pre_st,  last_pre_st),
+                    ("pre_err",  miss_pre_err, last_pre_err),
+                    ("spi_err",  miss_spi_err, last_spi_err),
+                    ("spi_pnd",  miss_spi_pnd, last_spi_pnd),
+                    ("dma_st",   miss_dma_st,  last_dma_st),
+                    ("ch0_ctl",  miss_ch0_ctl, last_ch0_ctl),
+                    ("ch0_cfg",  miss_ch0_cfg, last_ch0_cfg),
+                    ("ch1_ctl",  miss_ch1_ctl, last_ch1_ctl),
+                    ("ch1_cfg",  miss_ch1_cfg, last_ch1_cfg),
+                ]:
+                    if m != l:
+                        diffs.append(f"{name}: 0x{m:x}≠0x{l:x}")
+                if diffs:
+                    print("    miss-vs-lastOK diffs:  " + "  ".join(diffs))
+                print(f"    ch0 cfg A={(miss_ch0_cfg>>17)&1} "
+                      f"H={(miss_ch0_cfg>>18)&1} E={miss_ch0_cfg&1}  "
+                      f"ch1 cfg A={(miss_ch1_cfg>>17)&1} "
+                      f"H={(miss_ch1_cfg>>18)&1} E={miss_ch1_cfg&1}  "
+                      f"spi_err=0x{miss_spi_err:x}")
             f.write("#\n")
             f.write(f"{'t_us':>10} {'evt':<16} {'phase':<12} "
                     f"{'detail':>6} {'spi_addr':>10}\n")

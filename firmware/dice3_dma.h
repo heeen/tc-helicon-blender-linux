@@ -117,8 +117,16 @@ struct dma_controller {
  * iters. Bits 28/29/30 evidently mark "transfer in progress" or
  * similar runtime flags the hardware manages; they must NOT be set
  * in our RX descriptor cfg. Keep the post-run observed values. */
-#define DMA_CFG_TX        0xF4009000u    /* bit 31 | 30 | 29 | 28 | 26 | 15 | 12 */
-#define DMA_CFG_RX        0x88009000u    /* bit 31 | 27 | 15 | 12 (NOT 28/29/30) */
+/* PL080 Control register burst-size fields (§3.4.19):
+ *   [17:15] DBSize,  [14:12] SBSize,  Table 3-20:
+ *     0b001 = 4 transfers/burst.
+ * Stock primary + bootloader both use 001 (4-burst). Tested 0, 8, 16 on
+ * 2026-04-23 — all broke deterministically (20/20 fails, not shifts but
+ * total data corruption). Arasan SPI IP signals BREQ/SREQ on a fixed
+ * 4-byte cadence; burst size is effectively hard-coded at 4 by the
+ * peripheral. Keep 4-burst. */
+#define DMA_CFG_TX        0xF4009000u    /* bits 31/30/29/28/26 | SBSize=001 | DBSize=001 (4-burst) */
+#define DMA_CFG_RX        0x88009000u    /* bits 31/27 | SBSize=001 | DBSize=001 (4-burst) */
 
 /* Per-channel trigger words. Decoded via PL080 TRM (ARM DDI 0196C)
  * Configuration register (§3.4.20):

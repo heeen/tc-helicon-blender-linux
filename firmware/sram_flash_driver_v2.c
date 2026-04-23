@@ -1282,6 +1282,12 @@ static int dma_bidir_read(uint32_t spi_addr, uint8_t *out, uint32_t len,
     dwb();
 
     while (SPI_STAT & SPI_STAT_BUSY) {}
+    /* Pre-arm state — sampled AFTER spi_reset_clean but BEFORE any
+     * SPI register writes. Smoking-gun test: RX_RDY (bit 3) or BUSY
+     * (bit 0) set here = stale FIFO content that will corrupt the
+     * next transfer. */
+    MBOX->last_pre_stat = SPI_STAT;
+    MBOX->last_pre_err  = SPI_ERR;
     SPI_EN = 0;
     SPI_CS = 0;
     SPI_DMAGO = 0;
@@ -1340,6 +1346,22 @@ static int dma_bidir_read(uint32_t spi_addr, uint8_t *out, uint32_t len,
     while (SPI_STAT & SPI_STAT_BUSY) {
         if (now_us() - t0 > budget_us) { dma_abort(); return -1; }
     }
+    /* Post-TC snapshot — sample BEFORE any teardown. Overwritten every
+     * chunk; VERIFY_MISS copies these into miss_* for post-mortem. */
+    MBOX->last_spi_err     = SPI_ERR;
+    MBOX->last_spi_pending = *(volatile uint32_t *)(SPI_BASE + 0x10);
+    MBOX->last_dma_stat    = *(volatile uint32_t *)(DMA_BASE + 0x04);
+    MBOX->last_ch0_ctrl    = DMA_CHREG(0, 0x0C);
+    MBOX->last_ch0_cfg     = DMA_CHREG(0, 0x10);
+    MBOX->last_ch1_ctrl    = DMA_CHREG(1, 0x0C);
+    MBOX->last_ch1_cfg     = DMA_CHREG(1, 0x10);
+    MBOX->last_dma_en      = DMA_EN;
+    /* Capture the first 8 RX_TEMP bytes (including the READ_RX_SKIP=4
+     * region we'd normally discard). Lets us see whether the shift is
+     * on the TX-alignment side (real flash data leaks into skip region)
+     * or on the RX-alignment side (dummies leak into our data).  */
+    MBOX->last_rx_head0 = *(uint32_t *)(uintptr_t)RX_TEMP;
+    MBOX->last_rx_head1 = *(uint32_t *)((uintptr_t)RX_TEMP + 4);
     SPI_CS = 0;
     SPI_EN = 0;
     DMA_EN = 0;
@@ -1421,6 +1443,21 @@ static int do_verify(uint32_t spi_addr, const uint8_t *expected, uint32_t len) {
             MBOX->miss_spi_stat   = SPI_STAT;
             MBOX->miss_dma_istat  = DMA_ISTAT;
             MBOX->miss_reads_done = chunks_done;
+            /* Snapshot the last-chunk diagnostic set (sampled in
+             * dma_bidir_read post-TC) so it's preserved even if
+             * subsequent chunks run and overwrite last_*. */
+            MBOX->miss_spi_err     = MBOX->last_spi_err;
+            MBOX->miss_spi_pending = MBOX->last_spi_pending;
+            MBOX->miss_dma_stat    = MBOX->last_dma_stat;
+            MBOX->miss_ch0_ctrl    = MBOX->last_ch0_ctrl;
+            MBOX->miss_ch0_cfg     = MBOX->last_ch0_cfg;
+            MBOX->miss_ch1_ctrl    = MBOX->last_ch1_ctrl;
+            MBOX->miss_ch1_cfg     = MBOX->last_ch1_cfg;
+            MBOX->miss_dma_en      = MBOX->last_dma_en;
+            MBOX->miss_pre_stat    = MBOX->last_pre_stat;
+            MBOX->miss_pre_err     = MBOX->last_pre_err;
+            MBOX->miss_rx_head0    = MBOX->last_rx_head0;
+            MBOX->miss_rx_head1    = MBOX->last_rx_head1;
             dwb();
             log_put(V2_EVT_VERIFY_MISS, (uint16_t)abs_off,
                     spi_addr + abs_off);
