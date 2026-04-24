@@ -207,6 +207,25 @@ struct v2_mailbox {
     volatile uint32_t last_rx_head1;       /* +0xB4 — RX_TEMP[4..7]  */
     volatile uint32_t miss_rx_head0;       /* +0xB8 */
     volatile uint32_t miss_rx_head1;       /* +0xBC */
+
+    /* Pre-arm sample of CH2..CH7 Configuration registers — AHB bus
+     * contention detector. If E=1 or A=1 on any of these when we're
+     * about to arm CH0/CH1 for a flash read, there's another DMA
+     * master already moving data and fighting us for bus cycles. LED
+     * SPI uses CH4/CH5 in stock eCos. CH2/CH3 are stock's flash
+     * channels (should be idle from TCAT-BOOT). */
+    volatile uint32_t last_ch2_cfg;        /* +0xC0 */
+    volatile uint32_t last_ch3_cfg;        /* +0xC4 */
+    volatile uint32_t last_ch4_cfg;        /* +0xC8 */
+    volatile uint32_t last_ch5_cfg;        /* +0xCC */
+    volatile uint32_t last_ch6_cfg;        /* +0xD0 */
+    volatile uint32_t last_ch7_cfg;        /* +0xD4 */
+    volatile uint32_t miss_ch2_cfg;        /* +0xD8 */
+    volatile uint32_t miss_ch3_cfg;        /* +0xDC */
+    volatile uint32_t miss_ch4_cfg;        /* +0xE0 */
+    volatile uint32_t miss_ch5_cfg;        /* +0xE4 */
+    volatile uint32_t miss_ch6_cfg;        /* +0xE8 */
+    volatile uint32_t miss_ch7_cfg;        /* +0xEC */
 };
 
 /* ── Log ring entry (12 bytes) ────────────────────────────── */

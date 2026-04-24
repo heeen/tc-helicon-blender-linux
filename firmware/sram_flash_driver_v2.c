@@ -1288,6 +1288,14 @@ static int dma_bidir_read(uint32_t spi_addr, uint8_t *out, uint32_t len,
      * next transfer. */
     MBOX->last_pre_stat = SPI_STAT;
     MBOX->last_pre_err  = SPI_ERR;
+    /* AHB contention check — any channel with E=1 or A=1 here is
+     * actively moving data and will steal bus cycles from our CH0/1. */
+    MBOX->last_ch2_cfg = DMA_CHREG(2, 0x10);
+    MBOX->last_ch3_cfg = DMA_CHREG(3, 0x10);
+    MBOX->last_ch4_cfg = DMA_CHREG(4, 0x10);
+    MBOX->last_ch5_cfg = DMA_CHREG(5, 0x10);
+    MBOX->last_ch6_cfg = DMA_CHREG(6, 0x10);
+    MBOX->last_ch7_cfg = DMA_CHREG(7, 0x10);
     SPI_EN = 0;
     SPI_CS = 0;
     SPI_DMAGO = 0;
@@ -1458,6 +1466,12 @@ static int do_verify(uint32_t spi_addr, const uint8_t *expected, uint32_t len) {
             MBOX->miss_pre_err     = MBOX->last_pre_err;
             MBOX->miss_rx_head0    = MBOX->last_rx_head0;
             MBOX->miss_rx_head1    = MBOX->last_rx_head1;
+            MBOX->miss_ch2_cfg     = MBOX->last_ch2_cfg;
+            MBOX->miss_ch3_cfg     = MBOX->last_ch3_cfg;
+            MBOX->miss_ch4_cfg     = MBOX->last_ch4_cfg;
+            MBOX->miss_ch5_cfg     = MBOX->last_ch5_cfg;
+            MBOX->miss_ch6_cfg     = MBOX->last_ch6_cfg;
+            MBOX->miss_ch7_cfg     = MBOX->last_ch7_cfg;
             dwb();
             log_put(V2_EVT_VERIFY_MISS, (uint16_t)abs_off,
                     spi_addr + abs_off);

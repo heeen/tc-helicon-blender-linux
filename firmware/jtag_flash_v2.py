@@ -131,6 +131,18 @@ O_LAST_RX_H0   = 0xB0
 O_LAST_RX_H1   = 0xB4
 O_MISS_RX_H0   = 0xB8
 O_MISS_RX_H1   = 0xBC
+O_LAST_CH2_CFG = 0xC0
+O_LAST_CH3_CFG = 0xC4
+O_LAST_CH4_CFG = 0xC8
+O_LAST_CH5_CFG = 0xCC
+O_LAST_CH6_CFG = 0xD0
+O_LAST_CH7_CFG = 0xD4
+O_MISS_CH2_CFG = 0xD8
+O_MISS_CH3_CFG = 0xDC
+O_MISS_CH4_CFG = 0xE0
+O_MISS_CH5_CFG = 0xE4
+O_MISS_CH6_CFG = 0xE8
+O_MISS_CH7_CFG = 0xEC
 
 STATUS_READY = 0
 STATUS_BUSY  = 1
@@ -385,6 +397,12 @@ class FlashClientV2:
         miss_pre_err = self.o.mdw(MBOX_ADDR + O_MISS_PRE_ERR)
         miss_rx_h0   = self.o.mdw(MBOX_ADDR + O_MISS_RX_H0)
         miss_rx_h1   = self.o.mdw(MBOX_ADDR + O_MISS_RX_H1)
+        miss_chX_cfg = [self.o.mdw(MBOX_ADDR + off) for off in
+                        (O_MISS_CH2_CFG, O_MISS_CH3_CFG, O_MISS_CH4_CFG,
+                         O_MISS_CH5_CFG, O_MISS_CH6_CFG, O_MISS_CH7_CFG)]
+        last_chX_cfg = [self.o.mdw(MBOX_ADDR + off) for off in
+                        (O_LAST_CH2_CFG, O_LAST_CH3_CFG, O_LAST_CH4_CFG,
+                         O_LAST_CH5_CFG, O_LAST_CH6_CFG, O_LAST_CH7_CFG)]
         # Last-chunk snapshot — on VERIFY_OK this shows the state of the
         # last successful chunk, which we can diff against the miss case.
         last_spi_err = self.o.mdw(MBOX_ADDR + O_LAST_SPI_ERR)
@@ -456,6 +474,21 @@ class FlashClientV2:
                 last_head = f"{_hexbytes(last_rx_h0)} | {_hexbytes(last_rx_h1)}"
                 f.write(f"miss_rx_head     = {miss_head}\n")
                 f.write(f"last_rx_head     = {last_head}\n")
+                # CH2..CH7 Configuration sampled at pre-arm time (AHB
+                # contention detector). Active means another master is
+                # moving data while we try to arm.
+                f.write("# ── CH2..CH7 Configuration @ pre-arm (AHB contention) ──\n")
+                for i, (m, l) in enumerate(zip(miss_chX_cfg, last_chX_cfg), 2):
+                    m_active = "ACTIVE!" if (m & 0x20001) else "idle"
+                    l_active = "ACTIVE!" if (l & 0x20001) else "idle"
+                    f.write(f"  CH{i} miss=0x{m:08x} ({m_active})   "
+                            f"last=0x{l:08x} ({l_active})\n")
+                # Dump any active channel prominently on stdout.
+                active = [(i+2, v) for i, v in enumerate(miss_chX_cfg)
+                          if v & 0x20001]
+                if active:
+                    print("    ⚠ contending channels @ miss arm-time: " +
+                          ", ".join(f"CH{ch}=0x{v:x}" for ch, v in active))
                 # Expected: first 4 bytes dummy (cmd+addr echo), next 4 = flash data.
                 # RX_TEMP[4] should == exp[0]. Any deviation localizes the shift.
                 f.write(f"miss_pre_stat    = 0x{miss_pre_st:08x}   "
