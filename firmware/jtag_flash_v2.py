@@ -143,6 +143,20 @@ O_MISS_CH4_CFG = 0xE0
 O_MISS_CH5_CFG = 0xE4
 O_MISS_CH6_CFG = 0xE8
 O_MISS_CH7_CFG = 0xEC
+O_LAST_RDSR_AF = 0xF0
+O_MISS_RDSR_AF = 0xF4
+O_MISS_RDSR_BF = 0xF8
+O_FIRST_RDSR   = 0xFC
+O_LAST_DMA_CMB = 0x100
+O_LAST_DMA_ERR = 0x104
+O_LAST_DMA_RAW = 0x108
+O_LAST_DMA_ENB = 0x10C
+O_LAST_SPI_40  = 0x110
+O_MISS_DMA_CMB = 0x114
+O_MISS_DMA_ERR = 0x118
+O_MISS_DMA_RAW = 0x11C
+O_MISS_DMA_ENB = 0x120
+O_MISS_SPI_40  = 0x124
 
 STATUS_READY = 0
 STATUS_BUSY  = 1
@@ -179,7 +193,7 @@ EVT_NAMES = {
     0x20: "ERASE_WREN", 0x21: "ERASE_CMD", 0x22: "ERASE_DONE",
     0x30: "AAI_WREN", 0x31: "AAI_FIRST", 0x32: "AAI_PAIR",
     0x33: "AAI_BUSY_FAST", 0x34: "AAI_BUSY_POLL", 0x35: "AAI_WRDI",
-    0x40: "VERIFY_OK", 0x41: "VERIFY_MISS",
+    0x40: "VERIFY_OK", 0x41: "VERIFY_MISS", 0x42: "READ_CHUNK_SR",
     0x50: "REPAIR_HIT",
     0x60: "DMA_TX_DONE", 0x61: "DMA_RX_DONE",
     0xF0: "TIMEOUT", 0xF1: "ABORT", 0xF2: "BAD_STATE",
@@ -400,6 +414,10 @@ class FlashClientV2:
         miss_chX_cfg = [self.o.mdw(MBOX_ADDR + off) for off in
                         (O_MISS_CH2_CFG, O_MISS_CH3_CFG, O_MISS_CH4_CFG,
                          O_MISS_CH5_CFG, O_MISS_CH6_CFG, O_MISS_CH7_CFG)]
+        miss_rdsr_af = self.o.mdw(MBOX_ADDR + O_MISS_RDSR_AF)
+        miss_rdsr_bf = self.o.mdw(MBOX_ADDR + O_MISS_RDSR_BF)
+        first_rdsr   = self.o.mdw(MBOX_ADDR + O_FIRST_RDSR)
+        last_rdsr_af = self.o.mdw(MBOX_ADDR + O_LAST_RDSR_AF)
         last_chX_cfg = [self.o.mdw(MBOX_ADDR + off) for off in
                         (O_LAST_CH2_CFG, O_LAST_CH3_CFG, O_LAST_CH4_CFG,
                          O_LAST_CH5_CFG, O_LAST_CH6_CFG, O_LAST_CH7_CFG)]
@@ -474,6 +492,31 @@ class FlashClientV2:
                 last_head = f"{_hexbytes(last_rx_h0)} | {_hexbytes(last_rx_h1)}"
                 f.write(f"miss_rx_head     = {miss_head}\n")
                 f.write(f"last_rx_head     = {last_head}\n")
+                def _decode_sr(v):
+                    b = v & 0xFF
+                    bits = []
+                    if b & 0x01: bits.append("BUSY")
+                    if b & 0x02: bits.append("WEL")
+                    bp = (b >> 2) & 0xF
+                    if bp:       bits.append(f"BP={bp:x}")
+                    if b & 0x40: bits.append("AAI")
+                    if b & 0x80: bits.append("BPL")
+                    return ",".join(bits) if bits else "clean"
+                f.write(f"first_rdsr       = 0x{first_rdsr&0xFF:02x}  "
+                        f"({_decode_sr(first_rdsr)})\n")
+                f.write(f"miss_rdsr_before = 0x{miss_rdsr_bf&0xFF:02x} "
+                        f"(ch{(miss_rdsr_bf>>8)&0xFFFFFF}  "
+                        f"{_decode_sr(miss_rdsr_bf)})\n")
+                f.write(f"miss_rdsr_after  = 0x{miss_rdsr_af&0xFF:02x} "
+                        f"(ch{(miss_rdsr_af>>8)&0xFFFFFF}  "
+                        f"{_decode_sr(miss_rdsr_af)})\n")
+                f.write(f"last_rdsr_after  = 0x{last_rdsr_af&0xFF:02x} "
+                        f"(ch{(last_rdsr_af>>8)&0xFFFFFF}  "
+                        f"{_decode_sr(last_rdsr_af)})\n")
+                print(f"    first_rdsr=0x{first_rdsr&0xFF:02x}  "
+                      f"before_miss(ch{(miss_rdsr_bf>>8)&0xFFFFFF})="
+                      f"0x{miss_rdsr_bf&0xFF:02x}  "
+                      f"after_miss=0x{miss_rdsr_af&0xFF:02x}")
                 # CH2..CH7 Configuration sampled at pre-arm time (AHB
                 # contention detector). Active means another master is
                 # moving data while we try to arm.
@@ -558,8 +601,11 @@ class FlashClientV2:
                     "<IBBHI", ring, off)
                 ename = EVT_NAMES.get(evt, f"0x{evt:02x}")
                 pname = PHASE_NAMES.get(ph, f"0x{ph:02x}")
+                detail_str = f"{detail:>6}"
+                if evt == 0x42:  # READ_CHUNK_SR — decode the detail field.
+                    detail_str = f"ch{(detail>>8)&0xFF:>3} sr=0x{detail&0xFF:02x}"
                 f.write(f"{t_us:>10} {ename:<16} {pname:<12} "
-                        f"{detail:>6} 0x{spi:08x}\n")
+                        f"{detail_str:<15} 0x{spi:08x}\n")
         print(f"  error log → {path}")
 
     # ── High-level ops ────────────────────────────────────────

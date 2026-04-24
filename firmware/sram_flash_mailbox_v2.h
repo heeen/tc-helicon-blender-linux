@@ -96,6 +96,10 @@
 #define V2_EVT_AAI_WRDI      0x35
 #define V2_EVT_VERIFY_OK     0x40
 #define V2_EVT_VERIFY_MISS   0x41
+#define V2_EVT_READ_CHUNK_SR 0x42   /* per-chunk RDSR snapshot for
+                                     * post-mortem of +2B verify shifts.
+                                     * detail = (chunk_idx<<8)|sr,
+                                     * spi_addr = chunk start addr. */
 #define V2_EVT_REPAIR_HIT    0x50   /* head-of-sector repair triggered */
 #define V2_EVT_DMA_TX_DONE   0x60
 #define V2_EVT_DMA_RX_DONE   0x61
@@ -226,6 +230,28 @@ struct v2_mailbox {
     volatile uint32_t miss_ch5_cfg;        /* +0xE4 */
     volatile uint32_t miss_ch6_cfg;        /* +0xE8 */
     volatile uint32_t miss_ch7_cfg;        /* +0xEC */
+
+    /* RDSR captured after each dma_bidir_read chunk. Value in low 8
+     * bits; upper bits = chunk index within the read so we can see
+     * exactly which chunk produced an unusual SR. SR bits (SST25VF016B
+     * §4.1): [0] BUSY, [1] WEL, [2-5] BP0-BP3, [6] AAI, [7] BPL. */
+    volatile uint32_t last_rdsr_after;     /* +0xF0 — (chunk_idx<<8)|sr */
+    volatile uint32_t miss_rdsr_after;     /* +0xF4 */
+    /* RDSR values before chunk 0 and before the chunk that missed. */
+    volatile uint32_t miss_rdsr_before;    /* +0xF8 — (chunk_idx<<8)|sr  */
+    volatile uint32_t first_rdsr;          /* +0xFC — SR at start of read */
+
+    /* Extra DMA/SPI status registers unexplored until 2026-04-24. */
+    volatile uint32_t last_dma_comb;       /* +0x100 — DMA+0x00 DMACIntStatus */
+    volatile uint32_t last_dma_errst;      /* +0x104 — DMA+0x0C DMACIntErrorStatus */
+    volatile uint32_t last_dma_rawerr;     /* +0x108 — DMA+0x18 DMACRawIntErrorStatus */
+    volatile uint32_t last_dma_enbldch;    /* +0x10C — DMA+0x1C DMACEnbldChns */
+    volatile uint32_t last_spi_40;         /* +0x110 — SPI+0x40 unknown */
+    volatile uint32_t miss_dma_comb;       /* +0x114 */
+    volatile uint32_t miss_dma_errst;      /* +0x118 */
+    volatile uint32_t miss_dma_rawerr;     /* +0x11C */
+    volatile uint32_t miss_dma_enbldch;    /* +0x120 */
+    volatile uint32_t miss_spi_40;         /* +0x124 */
 };
 
 /* ── Log ring entry (12 bytes) ────────────────────────────── */

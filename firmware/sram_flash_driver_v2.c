@@ -1266,7 +1266,12 @@ static int do_aai_program_run(uint32_t spi_addr, const uint8_t *data, uint32_t l
  * BYTE_PRG wire payload is exactly `02 addrH addrM addrL data` (5 bytes),
  * so the write itself is on-target. */
 #define READ_RX_SKIP 4u
-#define READ_CHUNK   0x800u
+/* 2026-04-24: 128 B chunks + RDSR between. 128 B is below the 224+
+ * corruption threshold, and the inter-chunk RDSR (a) forces a short
+ * bidir transfer to reset SPI-IP state and (b) gives us a chunk-by-
+ * chunk SR readout so we can see what the flash/IP thinks is going on
+ * when shifts occur. */
+#define READ_CHUNK   0x80u
 
 static int dma_bidir_read(uint32_t spi_addr, uint8_t *out, uint32_t len,
                           uint32_t budget_us)
@@ -1288,14 +1293,6 @@ static int dma_bidir_read(uint32_t spi_addr, uint8_t *out, uint32_t len,
      * next transfer. */
     MBOX->last_pre_stat = SPI_STAT;
     MBOX->last_pre_err  = SPI_ERR;
-    /* AHB contention check — any channel with E=1 or A=1 here is
-     * actively moving data and will steal bus cycles from our CH0/1. */
-    MBOX->last_ch2_cfg = DMA_CHREG(2, 0x10);
-    MBOX->last_ch3_cfg = DMA_CHREG(3, 0x10);
-    MBOX->last_ch4_cfg = DMA_CHREG(4, 0x10);
-    MBOX->last_ch5_cfg = DMA_CHREG(5, 0x10);
-    MBOX->last_ch6_cfg = DMA_CHREG(6, 0x10);
-    MBOX->last_ch7_cfg = DMA_CHREG(7, 0x10);
     SPI_EN = 0;
     SPI_CS = 0;
     SPI_DMAGO = 0;
@@ -1364,6 +1361,11 @@ static int dma_bidir_read(uint32_t spi_addr, uint8_t *out, uint32_t len,
     MBOX->last_ch1_ctrl    = DMA_CHREG(1, 0x0C);
     MBOX->last_ch1_cfg     = DMA_CHREG(1, 0x10);
     MBOX->last_dma_en      = DMA_EN;
+    MBOX->last_dma_comb    = *(volatile uint32_t *)(DMA_BASE + 0x00);
+    MBOX->last_dma_errst   = *(volatile uint32_t *)(DMA_BASE + 0x0C);
+    MBOX->last_dma_rawerr  = *(volatile uint32_t *)(DMA_BASE + 0x18);
+    MBOX->last_dma_enbldch = *(volatile uint32_t *)(DMA_BASE + 0x1C);
+    MBOX->last_spi_40      = *(volatile uint32_t *)(SPI_BASE + 0x40);
     /* Capture the first 8 RX_TEMP bytes (including the READ_RX_SKIP=4
      * region we'd normally discard). Lets us see whether the shift is
      * on the TX-alignment side (real flash data leaks into skip region)
@@ -1380,14 +1382,32 @@ static int dma_bidir_read(uint32_t spi_addr, uint8_t *out, uint32_t len,
 
 static int do_read(uint32_t spi_addr, uint8_t *dest, uint32_t len) {
     set_phase(V2_PHASE_READ);
-    for (uint32_t off = 0; off < len; off += READ_CHUNK) {
+    /* Capture SR at the start — establishes the "clean" baseline value
+     * for comparing against per-chunk readings. */
+    MBOX->first_rdsr = rdsr();
+    uint32_t chunk_idx = 0;
+    uint32_t prev_rdsr_after = MBOX->first_rdsr;
+    for (uint32_t off = 0; off < len; off += READ_CHUNK, chunk_idx++) {
         uint32_t chunk = len - off;
         if (chunk > READ_CHUNK) chunk = READ_CHUNK;
         spi_reset_clean();   /* clean state per chunk */
+        /* Stash the pre-chunk SR in miss_rdsr_before so that if the NEXT
+         * chunk's verify fails we see what SR said right before it. */
+        MBOX->miss_rdsr_before = (chunk_idx << 8) | (prev_rdsr_after & 0xFF);
         if (dma_bidir_read(spi_addr + off, dest + off, chunk, 100000) != 0) {
             set_error(V2_ERR_READ_DMA, spi_addr + off, (uint8_t)MBOX->last_sr);
             return -1;
         }
+        /* Short bidir transfer (RDSR, 2 B) between chunks. Records the
+         * SR value so host can see per-chunk variation correlated with
+         * whatever chunk missed. */
+        uint8_t sr = rdsr();
+        MBOX->last_rdsr_after = (chunk_idx << 8) | sr;
+        /* Push to log ring so host can reconstruct per-chunk SR
+         * trajectory across the whole read, not just the latest. */
+        log_put(V2_EVT_READ_CHUNK_SR, (uint16_t)((chunk_idx << 8) | sr),
+                spi_addr + off);
+        prev_rdsr_after = sr;
         MBOX->phase_detail = off + chunk;
     }
     return 0;
@@ -1466,12 +1486,12 @@ static int do_verify(uint32_t spi_addr, const uint8_t *expected, uint32_t len) {
             MBOX->miss_pre_err     = MBOX->last_pre_err;
             MBOX->miss_rx_head0    = MBOX->last_rx_head0;
             MBOX->miss_rx_head1    = MBOX->last_rx_head1;
-            MBOX->miss_ch2_cfg     = MBOX->last_ch2_cfg;
-            MBOX->miss_ch3_cfg     = MBOX->last_ch3_cfg;
-            MBOX->miss_ch4_cfg     = MBOX->last_ch4_cfg;
-            MBOX->miss_ch5_cfg     = MBOX->last_ch5_cfg;
-            MBOX->miss_ch6_cfg     = MBOX->last_ch6_cfg;
-            MBOX->miss_ch7_cfg     = MBOX->last_ch7_cfg;
+            MBOX->miss_rdsr_after  = MBOX->last_rdsr_after;
+            MBOX->miss_dma_comb    = MBOX->last_dma_comb;
+            MBOX->miss_dma_errst   = MBOX->last_dma_errst;
+            MBOX->miss_dma_rawerr  = MBOX->last_dma_rawerr;
+            MBOX->miss_dma_enbldch = MBOX->last_dma_enbldch;
+            MBOX->miss_spi_40      = MBOX->last_spi_40;
             dwb();
             log_put(V2_EVT_VERIFY_MISS, (uint16_t)abs_off,
                     spi_addr + abs_off);
