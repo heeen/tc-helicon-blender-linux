@@ -83,9 +83,14 @@ $(BOOT_BIN): $(BOOT_S) $(BIN)
 	echo "Bootstrap: $$(stat -c%s $(BOOT_BIN)) bytes (max 152)" && \
 	[ $$(stat -c%s $(BOOT_BIN)) -le 152 ] || (echo "ERROR: bootstrap too large!"; rm $(BOOT_BIN); false)
 
-# Generate hooks_gen.S and patch.ld from hook definitions
-generate:
+# Generate hooks_gen.S and patch.ld from hook definitions. Both files
+# are produced by a single run of `hooks.py generate`, so the generic
+# build targets (hooks.elf, patch, flash) pick them up automatically;
+# no need to run `make generate` by hand.
+hooks_gen.S patch.ld &: hooks.py hook_framework.py
 	python3 hooks.py generate
+
+generate: hooks_gen.S patch.ld
 
 # Build and create patched SPI image (persistent)
 patch: $(BIN) $(BOOT_BIN)
@@ -110,7 +115,9 @@ SRAM_DRV_V2_LD  = ../../firmware/sram_flash_driver_v2.ld
 SRAM_DRV_V2_ELF = ../../firmware/sram_flash_driver_v2.elf
 SRAM_DRV_V2_BIN = ../../firmware/sram_flash_driver_v2.bin
 
-$(SRAM_DRV_V2_BIN): $(SRAM_DRV_V2_C) $(SRAM_DRV_V2_LD)
+SRAM_DRV_V2_HDRS = $(wildcard ../../firmware/dice3_*.h ../../firmware/sram_flash_mailbox_v2.h)
+
+$(SRAM_DRV_V2_BIN): $(SRAM_DRV_V2_C) $(SRAM_DRV_V2_LD) $(SRAM_DRV_V2_HDRS)
 	arm-none-eabi-gcc -march=armv5te -marm -Os -nostdlib -ffreestanding \
 		-Wall -Wextra -T $(SRAM_DRV_V2_LD) -o $(SRAM_DRV_V2_ELF) $(SRAM_DRV_V2_C)
 	$(OBJCOPY) -O binary $(SRAM_DRV_V2_ELF) $(SRAM_DRV_V2_BIN)
