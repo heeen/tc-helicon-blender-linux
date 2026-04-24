@@ -342,6 +342,26 @@ static void dma_abort(void) {
     dwb();
 }
 
+/* PL080 TRM §3.2.5 "Disabling a DMA channel without losing data in
+ * the FIFO": set Halt (bit 18), poll Active (bit 17) until 0, then
+ * clear Enable. This forces the channel to finish draining its
+ * internal 4-word FIFO before shutting down, instead of losing
+ * whatever bytes were stuck there. Used between bidir transactions
+ * to prevent stale TX bytes from clocking out at the start of the
+ * next transfer (root cause of the +2B verify shift — see
+ * 2026-04-24 diagnostic work in task #32).  */
+static void dma_channel_drain(uint32_t ch, uint32_t budget_us) {
+    volatile uint32_t *cfg = &DMA_CHREG(ch, 0x10);
+    *cfg |= (1u << 18);                /* Halt: ignore further DMA requests */
+    dwb();
+    uint32_t t0 = now_us();
+    while (*cfg & (1u << 17)) {        /* poll Active until FIFO empty */
+        if (now_us() - t0 > budget_us) break;
+    }
+    *cfg = 0;                          /* clear Enable (Active=0 → no data loss) */
+    dwb();
+}
+
 /* DMA TX — CS assert + N-byte burst + CS deassert. Timer-bounded. */
 static int dma_tx(const volatile uint8_t *buf, uint32_t len, uint32_t budget_us) {
     dwb();
@@ -1266,12 +1286,7 @@ static int do_aai_program_run(uint32_t spi_addr, const uint8_t *data, uint32_t l
  * BYTE_PRG wire payload is exactly `02 addrH addrM addrL data` (5 bytes),
  * so the write itself is on-target. */
 #define READ_RX_SKIP 4u
-/* 2026-04-24: 128 B chunks + RDSR between. 128 B is below the 224+
- * corruption threshold, and the inter-chunk RDSR (a) forces a short
- * bidir transfer to reset SPI-IP state and (b) gives us a chunk-by-
- * chunk SR readout so we can see what the flash/IP thinks is going on
- * when shifts occur. */
-#define READ_CHUNK   0x80u
+#define READ_CHUNK   0x800u
 
 static int dma_bidir_read(uint32_t spi_addr, uint8_t *out, uint32_t len,
                           uint32_t budget_us)
@@ -1326,18 +1341,12 @@ static int dma_bidir_read(uint32_t spi_addr, uint8_t *out, uint32_t len,
     DMA_CHREG(1, 0x00) = (uint32_t)(uintptr_t)BIDIR_TX_BUF;
     DMA_CHREG(1, 0x04) = SPI_TX_PORT;
     DMA_CHREG(1, 0x08) = 0;
-    /* TX count tuning notes (2026-04-22):
-     *  - xfer_len (no overrun): wait_dma_irq timeouts (V2_ERR_READ_DMA)
-     *  - 0xFFF (historical): works but intermittent +2-byte RX shift
-     *    (Arasan SPI FIFO is 32-bit × 32-deep word-oriented; 0xFFF
-     *    leaves the internal byte→word packer mid-word — 3 bytes mod 4
-     *    — so the next transaction's packer starts 1 byte past a
-     *    word boundary and emits [00 00 b0 b1] as its first FIFO
-     *    word, shifting RX_TEMP by +2).
-     *  - 0xFFC (4092): word-aligned. Exercises the hypothesis that
-     *    ending TX on a 4-byte boundary lets the packer reset cleanly
-     *    for the next arm. */
-    DMA_CHREG(1, 0x0C) = 0xFFC | DMA_CFG_TX;
+    /* TX count = xfer_len exactly (no overrun). Historical notes said
+     * this caused wait_dma_irq timeouts with 2 KB chunks, but with
+     * 128 B chunks + the drain-helper teardown below it may finally
+     * work — the historical timeout might have been "RX stalled 2 B
+     * short" which we now handle explicitly.  2026-04-24  */
+    DMA_CHREG(1, 0x0C) = (xfer_len & 0xFFF) | DMA_CFG_TX;
     dwb();
     DMA_CHREG(1, 0x10) = DMA_TRG_TX;
     dwb();
@@ -1361,17 +1370,18 @@ static int dma_bidir_read(uint32_t spi_addr, uint8_t *out, uint32_t len,
     MBOX->last_ch1_ctrl    = DMA_CHREG(1, 0x0C);
     MBOX->last_ch1_cfg     = DMA_CHREG(1, 0x10);
     MBOX->last_dma_en      = DMA_EN;
-    MBOX->last_dma_comb    = *(volatile uint32_t *)(DMA_BASE + 0x00);
-    MBOX->last_dma_errst   = *(volatile uint32_t *)(DMA_BASE + 0x0C);
-    MBOX->last_dma_rawerr  = *(volatile uint32_t *)(DMA_BASE + 0x18);
-    MBOX->last_dma_enbldch = *(volatile uint32_t *)(DMA_BASE + 0x1C);
-    MBOX->last_spi_40      = *(volatile uint32_t *)(SPI_BASE + 0x40);
     /* Capture the first 8 RX_TEMP bytes (including the READ_RX_SKIP=4
      * region we'd normally discard). Lets us see whether the shift is
      * on the TX-alignment side (real flash data leaks into skip region)
      * or on the RX-alignment side (dummies leak into our data).  */
     MBOX->last_rx_head0 = *(uint32_t *)(uintptr_t)RX_TEMP;
     MBOX->last_rx_head1 = *(uint32_t *)((uintptr_t)RX_TEMP + 4);
+    /* Drain both channels via PL080-proper Halt+Active-poll+Enable-clear
+     * BEFORE dropping CS / disabling the engine. Prevents stale bytes
+     * in either the PL080 channel FIFO or the SPI IP TX FIFO from
+     * persisting into the next transaction.  2026-04-24  */
+    dma_channel_drain(0, 1000);
+    dma_channel_drain(1, 1000);
     SPI_CS = 0;
     SPI_EN = 0;
     DMA_EN = 0;
@@ -1382,32 +1392,14 @@ static int dma_bidir_read(uint32_t spi_addr, uint8_t *out, uint32_t len,
 
 static int do_read(uint32_t spi_addr, uint8_t *dest, uint32_t len) {
     set_phase(V2_PHASE_READ);
-    /* Capture SR at the start — establishes the "clean" baseline value
-     * for comparing against per-chunk readings. */
-    MBOX->first_rdsr = rdsr();
-    uint32_t chunk_idx = 0;
-    uint32_t prev_rdsr_after = MBOX->first_rdsr;
-    for (uint32_t off = 0; off < len; off += READ_CHUNK, chunk_idx++) {
+    for (uint32_t off = 0; off < len; off += READ_CHUNK) {
         uint32_t chunk = len - off;
         if (chunk > READ_CHUNK) chunk = READ_CHUNK;
         spi_reset_clean();   /* clean state per chunk */
-        /* Stash the pre-chunk SR in miss_rdsr_before so that if the NEXT
-         * chunk's verify fails we see what SR said right before it. */
-        MBOX->miss_rdsr_before = (chunk_idx << 8) | (prev_rdsr_after & 0xFF);
         if (dma_bidir_read(spi_addr + off, dest + off, chunk, 100000) != 0) {
             set_error(V2_ERR_READ_DMA, spi_addr + off, (uint8_t)MBOX->last_sr);
             return -1;
         }
-        /* Short bidir transfer (RDSR, 2 B) between chunks. Records the
-         * SR value so host can see per-chunk variation correlated with
-         * whatever chunk missed. */
-        uint8_t sr = rdsr();
-        MBOX->last_rdsr_after = (chunk_idx << 8) | sr;
-        /* Push to log ring so host can reconstruct per-chunk SR
-         * trajectory across the whole read, not just the latest. */
-        log_put(V2_EVT_READ_CHUNK_SR, (uint16_t)((chunk_idx << 8) | sr),
-                spi_addr + off);
-        prev_rdsr_after = sr;
         MBOX->phase_detail = off + chunk;
     }
     return 0;
@@ -1487,11 +1479,6 @@ static int do_verify(uint32_t spi_addr, const uint8_t *expected, uint32_t len) {
             MBOX->miss_rx_head0    = MBOX->last_rx_head0;
             MBOX->miss_rx_head1    = MBOX->last_rx_head1;
             MBOX->miss_rdsr_after  = MBOX->last_rdsr_after;
-            MBOX->miss_dma_comb    = MBOX->last_dma_comb;
-            MBOX->miss_dma_errst   = MBOX->last_dma_errst;
-            MBOX->miss_dma_rawerr  = MBOX->last_dma_rawerr;
-            MBOX->miss_dma_enbldch = MBOX->last_dma_enbldch;
-            MBOX->miss_spi_40      = MBOX->last_spi_40;
             dwb();
             log_put(V2_EVT_VERIFY_MISS, (uint16_t)abs_off,
                     spi_addr + abs_off);
