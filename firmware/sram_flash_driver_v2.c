@@ -62,6 +62,16 @@ static void init_timings_if_needed(void) {
 #define RX_SCRATCH  ((volatile uint8_t *)0x0002E120u)
 #define TX_SCRATCH_MAX  16
 
+typedef struct {
+    volatile uint32_t src;
+    volatile uint32_t dst;
+    volatile uint32_t next;
+    volatile uint32_t cfg;
+} dma_desc_t;
+
+/* Chained descriptor scratch (inside 0x2E100-0x2E17F misc area). */
+#define RD_TX_DESC1 ((volatile dma_desc_t *)0x0002E150u)
+
 /* Bidir-read scratch (below driver code, doesn't collide with anything). */
 #define BIDIR_TX_BUF  ((volatile uint8_t *)0x00028000u)
 #define RX_TEMP       ((uint8_t *)0x0002A000u)
@@ -705,24 +715,6 @@ static void driver_setup(void) {
 
 /* ── Flash operations ─────────────────────────────────────── */
 
-static int wait_not_busy(uint32_t budget_us, uint8_t *out_sr) {
-    uint32_t t0 = now_us();
-    for (;;) {
-        uint8_t sr = rdsr();
-        if (sr != 0xFF) {
-            MBOX->last_sr = sr;
-            if (!(sr & SST_SR_BUSY)) {
-                if (out_sr) *out_sr = sr;
-                return 0;
-            }
-        }
-        if (now_us() - t0 > budget_us) {
-            if (out_sr) *out_sr = sr;
-            return -1;
-        }
-    }
-}
-
 /* Wait a fixed interval (long enough to cover the typical operation
  * time) then poll RDSR at poll_interval_us until BUSY clears or
  * max_extra_us is reached. Avoids the expensive dma_rx overhead during
@@ -1292,7 +1284,7 @@ static int dma_bidir_read(uint32_t spi_addr, uint8_t *out, uint32_t len,
                           uint32_t budget_us)
 {
     uint32_t xfer_len = READ_RX_SKIP + len;
-    if (xfer_len > 0xFFF) return -1;
+    if (len == 0 || xfer_len > 0xFFF) return -1;
 
     BIDIR_TX_BUF[0] = SST_CMD_READ;
     BIDIR_TX_BUF[1] = (spi_addr >> 16) & 0xFF;
@@ -1327,28 +1319,30 @@ static int dma_bidir_read(uint32_t spi_addr, uint8_t *out, uint32_t len,
     DMA_CHCLR(1) = 1;
     dwb();
 
+    /* Linked TX descriptor tail: payload dummy clocks after preamble. */
+    RD_TX_DESC1->src = (uint32_t)(uintptr_t)(BIDIR_TX_BUF + READ_RX_SKIP);
+    RD_TX_DESC1->dst = SPI_TX_PORT;
+    RD_TX_DESC1->next = 0;
+    RD_TX_DESC1->cfg = ((xfer_len - READ_RX_SKIP) & DMA_CFG_CNT_MASK) | DMA_CFG_TX;
+    dwb();
+
     DMA_CHREG(0, 0x10) = 0;
     DMA_CHREG(0, 0x00) = SPI_RX_PORT;
     DMA_CHREG(0, 0x04) = (uint32_t)(uintptr_t)RX_TEMP;
     DMA_CHREG(0, 0x08) = 0;
-    DMA_CHREG(0, 0x0C) = (xfer_len & 0xFFF) | DMA_CFG_RX;
+    DMA_CHREG(0, 0x0C) = (xfer_len & DMA_CFG_CNT_MASK) | DMA_CFG_RX;
     dwb();
     dma_done_flag = 0;
     dwb();
-    DMA_CHREG(0, 0x10) = DMA_TRG_RX;
+    DMA_CHREG(0, 0x10) = DMA_GO_ARM(DMA_TRG_RX);
 
     DMA_CHREG(1, 0x10) = 0;
     DMA_CHREG(1, 0x00) = (uint32_t)(uintptr_t)BIDIR_TX_BUF;
     DMA_CHREG(1, 0x04) = SPI_TX_PORT;
-    DMA_CHREG(1, 0x08) = 0;
-    /* TX count = xfer_len exactly (no overrun). Historical notes said
-     * this caused wait_dma_irq timeouts with 2 KB chunks, but with
-     * 128 B chunks + the drain-helper teardown below it may finally
-     * work — the historical timeout might have been "RX stalled 2 B
-     * short" which we now handle explicitly.  2026-04-24  */
-    DMA_CHREG(1, 0x0C) = (xfer_len & 0xFFF) | DMA_CFG_TX;
+    DMA_CHREG(1, 0x08) = (uint32_t)(uintptr_t)RD_TX_DESC1;
+    DMA_CHREG(1, 0x0C) = READ_RX_SKIP | (DMA_CFG_TX & ~DMA_CFG_END);
     dwb();
-    DMA_CHREG(1, 0x10) = DMA_TRG_TX;
+    DMA_CHREG(1, 0x10) = DMA_GO_ARM(DMA_TRG_TX);
     dwb();
 
     SPI_CS = 1;
