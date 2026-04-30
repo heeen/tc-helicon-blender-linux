@@ -25,7 +25,7 @@ ASFLAGS = -march=armv5te
 
 ELF     = hooks.elf
 BIN     = hooks.bin
-SRCS    = hooks_gen.S handlers.c ../reboot_common.c
+SRCS    = hooks_gen.S handlers.c uart_minprintf.c ../reboot_common.c
 LD      = patch.ld
 
 # Bootstrap: small DMA loader in safe code section gap
@@ -39,6 +39,7 @@ SRAM_DRV_ELF = ../../firmware/sram_flash_driver.elf
 SRAM_DRV_BIN = ../../firmware/sram_flash_driver.bin
 UART_LOAD = ../../firmware/uart_xmodem_load.py
 HYBRID_REPAIR = ../../firmware/repair_flash_hybrid.py
+BLENDER_HOST  = ../../firmware/blender_tool.py
 
 # Bootstrap addresses
 BOOTSTRAP_SRAM = 0x299EC
@@ -109,11 +110,15 @@ load: patch-load
 repair-hybrid:
 	python3 $(HYBRID_REPAIR) --ref $(REPAIR_REF) --sector $(REPAIR_SECTOR)
 
-# SRAM flash driver (v2) used by jtag_flash_v2.py
+# SRAM flash driver (v2) used by blender_tool flash strategy.
 SRAM_DRV_V2_C   = ../../firmware/sram_flash_driver_v2.c
 SRAM_DRV_V2_LD  = ../../firmware/sram_flash_driver_v2.ld
 SRAM_DRV_V2_ELF = ../../firmware/sram_flash_driver_v2.elf
 SRAM_DRV_V2_BIN = ../../firmware/sram_flash_driver_v2.bin
+REBOOT_STUB_C   = ../../firmware/reboot_stub.c
+REBOOT_COMMON_C = ../../firmware/reboot_common.c
+REBOOT_STUB_ELF = ../../firmware/reboot_stub.elf
+REBOOT_STUB_BIN = ../../firmware/reboot_stub.bin
 
 SRAM_DRV_V2_HDRS = $(wildcard ../../firmware/dice3_*.h ../../firmware/sram_flash_mailbox_v2.h)
 
@@ -122,18 +127,26 @@ $(SRAM_DRV_V2_BIN): $(SRAM_DRV_V2_C) $(SRAM_DRV_V2_LD) $(SRAM_DRV_V2_HDRS)
 		-Wall -Wextra -T $(SRAM_DRV_V2_LD) -o $(SRAM_DRV_V2_ELF) $(SRAM_DRV_V2_C)
 	$(OBJCOPY) -O binary $(SRAM_DRV_V2_ELF) $(SRAM_DRV_V2_BIN)
 
+$(REBOOT_STUB_BIN): $(REBOOT_STUB_C) $(REBOOT_COMMON_C) ../../firmware/reboot_common.h ../../firmware/blender_periph_lib.h
+	arm-none-eabi-gcc -march=armv5te -marm -Os -nostdlib -ffreestanding \
+		-I../../firmware/patch -I../../firmware -Wl,-Ttext=0x2B000 \
+		-Wl,--entry=reboot_entry -o $(REBOOT_STUB_ELF) \
+		$(REBOOT_STUB_C) $(REBOOT_COMMON_C)
+	$(OBJCOPY) -O binary $(REBOOT_STUB_ELF) $(REBOOT_STUB_BIN)
+
 # Flash patched image via JTAG using the v2 driver + flash-all planner.
 # v2 covers every 64 KB block (erase-only op for all-FF regions), catches
 # stale garbage that a bytes-differ-from-reference shortcut would skip.
 # python3 -u keeps stdout unbuffered so progress streams under make.
 # Override with `make flash FLASH_SPEED=400` if the 1 MHz default flakes.
 FLASH_SPEED ?= 1000
-flash: $(BIN) $(BOOT_BIN) $(SRAM_DRV_V2_BIN)
+flash: $(BIN) $(BOOT_BIN) $(SRAM_DRV_V2_BIN) $(REBOOT_STUB_BIN)
 	python3 -u hooks.py patch
-	python3 -u ../../firmware/jtag_flash_v2.py \
+	python3 -u $(BLENDER_HOST) flash \
 		--mode flash-all --nreset \
 		--ref ../../firmware/blender_spi_patched.bin \
-		--speed $(FLASH_SPEED)
+		--speed $(FLASH_SPEED) \
+		--reboot
 
 size: $(ELF)
 	$(SIZE) -A $<
