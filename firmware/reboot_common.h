@@ -29,12 +29,13 @@ void mixer_block_quiesce(void);
  * spi_ip_block_quiesce to clear any stale bytes. */
 void spi_ip_drain_rx(volatile uint32_t *s);
 
-/* Superset teardown: USB + SPI (flash + LED) + DMA (ch0-3) + VIC +
+/* Superset teardown: USB + SPI (flash + LED) + DMA (ch0-7) + VIC +
  * Timer + Mixer. Idempotent and safe in both TCAT-BOOT and eCos
  * states — TCAT-BOOT sees most of these as no-ops because peripherals
- * are already quiet; eCos gets properly quiesced. Does NOT touch 0xC9
- * clock/PLL block (write-key-protected, easy to brick). Callers
- * (v2 driver, reboot stub, handlers) reapply clocks they need after. */
+ * are already quiet; eCos gets properly quiesced. It also writes the
+ * keyed SPI parent clock mux at 0xC9000014 to force safe crystal
+ * fallback before SPI quiesce; callers reapply any faster mux they
+ * need afterward. */
 void peripheral_full_teardown(void);
 
 /* Strong symbol in each link (uart_print_string vs minimal uart_puts). */

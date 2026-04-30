@@ -100,6 +100,11 @@
                                      * post-mortem of +2B verify shifts.
                                      * detail = (chunk_idx<<8)|sr,
                                      * spi_addr = chunk start addr. */
+#define V2_EVT_READ_CHUNK_WEL 0x43  /* per-chunk WREN->RDSR sanity.
+                                      * detail = (chunk_idx<<8)|sr_after_wren */
+#define V2_EVT_READ_LONG_RDSR 0x44  /* per-chunk long-RDSR sample.
+                                      * detail = (resp[0]<<8)|resp[1] from
+                                      * dma_rx(RDSR, len=4). */
 #define V2_EVT_REPAIR_HIT    0x50   /* head-of-sector repair triggered */
 #define V2_EVT_DMA_TX_DONE   0x60
 #define V2_EVT_DMA_RX_DONE   0x61
@@ -300,10 +305,24 @@ struct v2_timings {
      * before framing the BYTE_PRG command. Default 4 (the empirical
      * off-by-4 workaround). Set to 0 to observe raw landing behavior. */
     volatile uint32_t byte_prog_offset;
+
+    /* Verify preflight quiesce mode (applies before do_verify):
+     *   0 = off    (no extra preflight beyond caller behavior)
+     *   1 = light  (SPI clean + DMA reset + short settle)
+     *   2 = strict (reboot-grade peripheral_full_teardown + timer re-arm)
+     *
+     * Strict mode is intended to mirror the reboot teardown discipline
+     * when chasing warm-state contamination issues (e.g. +2B verify shift
+     * that reproduces in eCos state but not in TCAT bootloader state). */
+    volatile uint32_t verify_quiesce_mode;
 };
 
 #define V2_XPORT_DMA 0u
 #define V2_XPORT_PIO 1u
+
+#define V2_VERIFY_QUIESCE_OFF    0u
+#define V2_VERIFY_QUIESCE_LIGHT  1u
+#define V2_VERIFY_QUIESCE_STRICT 2u
 
 #define V2_TIMINGS_MAGIC      0x54494D32u  /* 'TIM2' — HOST sets when valid */
 
@@ -323,5 +342,6 @@ struct v2_timings {
 #define V2_TIM_DEFAULT_ERASE_POLL_BUDGET_US      500000u
 #define V2_TIM_DEFAULT_XPORT_MODE                V2_XPORT_DMA
 #define V2_TIM_DEFAULT_BYTE_PROG_OFFSET          0u
+#define V2_TIM_DEFAULT_VERIFY_QUIESCE_MODE       V2_VERIFY_QUIESCE_STRICT
 
 #endif /* SRAM_FLASH_MAILBOX_V2_H */

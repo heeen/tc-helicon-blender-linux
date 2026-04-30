@@ -31,6 +31,7 @@
 #include <stdint.h>
 
 #include "dice3_hw.h"
+#include "blender_periph_lib.h"
 #include "sram_flash_mailbox_v2.h"
 
 /* ── Lvalue accessors for the fixed SRAM addresses ──────────── */
@@ -53,6 +54,7 @@ static void init_timings_if_needed(void) {
     TIM->erase_poll_budget_us      = V2_TIM_DEFAULT_ERASE_POLL_BUDGET_US;
     TIM->xport_mode                = V2_TIM_DEFAULT_XPORT_MODE;
     TIM->byte_prog_offset          = V2_TIM_DEFAULT_BYTE_PROG_OFFSET;
+    TIM->verify_quiesce_mode       = V2_TIM_DEFAULT_VERIFY_QUIESCE_MODE;
     TIM->magic                     = V2_TIMINGS_MAGIC;
 }
 #define LOG_RING  ((struct v2_log_entry *)V2_LOG_RING_ADDR)
@@ -308,8 +310,6 @@ static int wait_dma_irq(uint32_t budget_us) {
     return wait_dma_irq_mask(budget_us, 1u);
 }
 
-static void spi_ip_drain_rx(volatile uint32_t *s);
-
 /* ── SPI + DMA low-level ────────────────────────────────────
  * Values match v1's proven config (CTRL=0x107, DMAMD=2 for TX,
  * DMAMD=3 for bidir, DMACFG0=4, DMACFG1=3). Deliberately avoid the
@@ -517,111 +517,9 @@ static int spi_cmd2(uint8_t c1, uint8_t c2) {
 
 /* ── Peripheral teardown ──────────────────────────────────── */
 
-#define REBOOT_USB_BASE            0x90000000u
-#define REBOOT_USB_USBCMD          (*(volatile uint32_t *)(REBOOT_USB_BASE + 0x08))
-#define REBOOT_USB_USBSTS          (*(volatile uint32_t *)(REBOOT_USB_BASE + 0x14))
-#define REBOOT_USB_USBINTR         (*(volatile uint32_t *)(REBOOT_USB_BASE + 0x18))
-#define REBOOT_USB_DEVICEADDR      (*(volatile uint32_t *)(REBOOT_USB_BASE + 0x24))
-#define REBOOT_USB_ENDPTLISTADDR   (*(volatile uint32_t *)(REBOOT_USB_BASE + 0x28))
-#define REBOOT_TCAT_USBMODE        (*(volatile uint32_t *)(REBOOT_USB_BASE + 0x800))
-#define REBOOT_TCAT_EP_COMP_STATUS (*(volatile uint32_t *)(REBOOT_USB_BASE + 0x818))
-#define REBOOT_TCAT_EP_COMP_ENABLE (*(volatile uint32_t *)(REBOOT_USB_BASE + 0x81C))
-#define REBOOT_TCAT_EP_ASYNC_PRIME (*(volatile uint32_t *)(REBOOT_USB_BASE + 0x834))  /* IN prime */
-#define REBOOT_TCAT_EP_TX_EN       (*(volatile uint32_t *)(REBOOT_USB_BASE + 0x810))  /* IN/TX enable */
-#define REBOOT_TCAT_EP_RX_EN       (*(volatile uint32_t *)(REBOOT_USB_BASE + 0x814))  /* OUT/RX enable */
-
-#define REBOOT_VIC_INT_EN_CLR (*(volatile uint32_t *)0xFFFFF014)
-#define REBOOT_VIC_SOFT_CLR   (*(volatile uint32_t *)0xFFFFF01C)
-
 #define REBOOT_FLASH_SPI      ((volatile uint32_t *)0xCC000000u)
 #define REBOOT_LED_SPI        ((volatile uint32_t *)0xCF000000u)
 #define REBOOT_LED_GPIO       (*(volatile uint32_t *)0xCB000020)
-
-static void spi_ip_quiesce(volatile uint32_t *s) {
-    for (volatile int i = 0; i < 100000; i++)
-        if (!(s[0x28 / 4] & 1u)) break;
-    s[0x10 / 4] = 0;
-    s[0x08 / 4] = 0;
-    s[0x2C / 4] = 0;
-    s[0x4C / 4] = 0;
-    s[0x50 / 4] = 0;
-    s[0x54 / 4] = 0;
-    s[0x00 / 4] = 0;
-    s[0x04 / 4] = 0;
-    s[0x18 / 4] = 0;
-    s[0x34 / 4] = 0;
-    dwb();
-}
-
-static void dma_engine_reset(void) {
-    /* 8-channel engine (see dice3_dma.h / StockDmaAndSpi.md). Stock
-     * eCos dma_irq_init writes EN=0xFF, ICLR=0xFF, master_en=1. We
-     * disable the master, clear all 8 channel IRQs, then zero the
-     * descriptors of only the channels we'll use (CH0+CH1). Zeroing
-     * CH4..7 descriptors desyncs eCos's LED-SPI DMA state machine
-     * and produces 17 deterministic failures — stay away. */
-    volatile uint32_t *dma = (volatile uint32_t *)0x80000000u;
-    dma[0x08 / 4] = 0;          /* DMA_EN = 0 */
-    dma[0x10 / 4] = 0xFFu;      /* DMA_ICLR = 0xFF (8 channels) */
-    for (unsigned ch = 0; ch < 4; ch++)
-        dma[0x30 / 4 + ch] = 1; /* per-channel abort (+0x30..+0x3C) */
-    for (unsigned ch = 0; ch < 4; ch++) {
-        volatile uint32_t *b = (volatile uint32_t *)(0x80000100u + ch * 0x20u);
-        b[0x10 / 4] = 0;        /* GO */
-        b[0x0C / 4] = 0;        /* CFG */
-        b[0x08 / 4] = 0;        /* NEXT */
-        b[0x00 / 4] = 0;        /* SRC */
-        b[0x04 / 4] = 0;        /* DST */
-    }
-    dwb();
-}
-
-static void usb_hw_reset(void) {
-    REBOOT_USB_USBSTS = 0xFFFFFFFFu;
-    REBOOT_USB_USBCMD &= ~(uint32_t)1;
-    REBOOT_USB_USBCMD |= 2;
-    for (volatile int i = 0; i < 100000; i++)
-        if (!(REBOOT_USB_USBCMD & 2)) break;
-    REBOOT_USB_USBSTS = 0xFFFFFFFFu;
-    REBOOT_USB_USBINTR = 0;
-    REBOOT_USB_USBCMD &= ~(uint32_t)((1u << 0) | (1u << 13) | (1u << 14));
-    REBOOT_USB_DEVICEADDR = 0;
-    REBOOT_USB_ENDPTLISTADDR = 0;
-    REBOOT_TCAT_USBMODE = 2u;
-    REBOOT_TCAT_EP_COMP_STATUS = 0xFFFFFFFFu;
-    REBOOT_TCAT_EP_COMP_ENABLE = 0;
-    REBOOT_TCAT_EP_ASYNC_PRIME = 0;
-    REBOOT_TCAT_EP_RX_EN = 0;
-    REBOOT_TCAT_EP_TX_EN = 0;
-    dwb();
-}
-
-/* Timer0/Timer1 disable @ 0xC2000000. eCos drives Timer0 for its alarm
- * thread — leaving it running spews IRQs we don't service. Mirror of
- * reboot_common.c:timer_blocks_disable(). */
-static void timer_blocks_disable(void) {
-    *(volatile uint32_t *)0xC2000008 = 0;  /* Timer0 CTRL */
-    *(volatile uint32_t *)0xC200002C = 0;  /* Timer1 CTRL */
-}
-
-/* TCAT audio mixer / crossbar @ 0xC4000000. Zero the first 64 bytes
- * of its register window — observed non-destructive in both TCAT-BOOT
- * (already quiet) and eCos (silences stream, chip stays alive).
- * Mirror of reboot_common.c:mixer_block_quiesce(). */
-static void mixer_block_quiesce(void) {
-    volatile uint32_t *mx = (volatile uint32_t *)0xC4000000u;
-    for (unsigned i = 0; i < 16; i++) mx[i] = 0;
-    dwb();
-}
-
-/* Drain SPI RX FIFO (STAT bit 3 = RX_RDY; DATA read clears). Mirror of
- * reboot_common.c:spi_ip_drain_rx(). */
-static void spi_ip_drain_rx(volatile uint32_t *s) {
-    for (int i = 0; i < 32; i++) {
-        if (!(s[0x28 / 4] & 0x08u)) break;
-        (void)s[0x60 / 4];
-    }
-}
 
 /* Bundled teardown — safe in both TCAT-BOOT and eCos states. Order
  * matters: USB first (has DMA clients), then SPIs, then DMA engine,
@@ -636,35 +534,28 @@ static void spi_ip_drain_rx(volatile uint32_t *s) {
  * AAI pair TX — see the DRV_* comment near the top. All 0xC9 writes
  * need the 0xABCD upper-16 key. */
 static void peripheral_full_teardown(void) {
-    /* Force SPI clock to our known-good source BEFORE touching any SPI
-     * peripheral regs — subsequent STAT polls measure wire behaviour
-     * at this rate. */
+    /* Reboot-like teardown baseline shared with soft-reboot path. */
     *(volatile uint32_t *)0xC9000014u = 0xABCD0000u | DRV_CLK_DIV_SPI_RAW;
-    dwb();
+    blender_periph_dwb();
 
-    usb_hw_reset();
+    blender_usb_compact_handoff_reset();
 
-    spi_ip_quiesce(REBOOT_LED_SPI);
-    spi_ip_drain_rx(REBOOT_LED_SPI);
+    blender_spi_ip_block_quiesce(REBOOT_LED_SPI);
+    blender_spi_ip_drain_rx(REBOOT_LED_SPI);
     REBOOT_LED_GPIO = 0;
     REBOOT_LED_SPI[0x14 / 4] = 0xFF;
 
-    spi_ip_quiesce(REBOOT_FLASH_SPI);
-    spi_ip_drain_rx(REBOOT_FLASH_SPI);
+    blender_spi_ip_block_quiesce(REBOOT_FLASH_SPI);
+    blender_spi_ip_drain_rx(REBOOT_FLASH_SPI);
 
-    dma_engine_reset();
-
-    REBOOT_VIC_INT_EN_CLR = 0xFFFFFFFFu;
-    REBOOT_VIC_SOFT_CLR   = 0xFFFFFFFFu;
-    /* Clear vectored-IRQ slot controls so any stale handler binding
-     * from firmware doesn't route a later pending IRQ anywhere. */
-    for (unsigned i = 0; i < 16; i++)
-        *(volatile uint32_t *)(0xFFFFF200u + i * 4) = 0;
-
-    timer_blocks_disable();
-    mixer_block_quiesce();
-
-    dwb();
+    /* Keep CH4..7 intact in v2 path: historical bench data shows wiping
+     * those channels can desync runtime LED-SPI state and destabilize
+     * subsequent ops. Reboot-style in ordering, but CH0..3 only here. */
+    blender_dma_engine_reset((volatile uint32_t *)0x80000000u, 4u);
+    blender_vic_clear(0u);
+    blender_timer_blocks_disable();
+    blender_mixer_block_quiesce();
+    blender_periph_dwb();
 }
 
 static void driver_setup(void) {
@@ -1399,11 +1290,40 @@ static int do_read(uint32_t spi_addr, uint8_t *dest, uint32_t len) {
     return 0;
 }
 
+static void verify_preflight_quiesce(void) {
+    uint32_t mode = TIM->verify_quiesce_mode;
+
+    if (mode == V2_VERIFY_QUIESCE_OFF) return;
+
+    if (mode == V2_VERIFY_QUIESCE_LIGHT) {
+        /* Lightweight isolate-before-verify: clear SPI state and DMA
+         * channels that participate in dma_bidir_read. */
+        dma_abort();
+        spi_reset_clean();
+        blender_dma_engine_reset((volatile uint32_t *)0x80000000u, 4u);
+        busy_wait_us(200);
+        return;
+    }
+
+    /* Strict mode (default): reboot-like teardown so verify runs
+     * from a bootloader-like baseline even under live eCos state.
+     *
+     * Important: this tears down timers too, so we must re-enable Timer0
+     * immediately afterward or timeout paths (now_us/busy_wait_us) stall. */
+    peripheral_full_teardown();
+    timer_enable();
+    time_reset();
+    spi_reset_clean();
+    (void)spi_cmd1(SST_CMD_WRDI);
+    busy_wait_us(200);
+}
+
 /* In-driver verify-retry counter. Host reads for diagnostics. */
 #define V2_VERIFY_RETRY_MAX 4u
 
 static int do_verify(uint32_t spi_addr, const uint8_t *expected, uint32_t len) {
     set_phase(V2_PHASE_VERIFY);
+    verify_preflight_quiesce();
     /* 4 KB scratch buffer at the start of SRAM — reused across the driver
      * for single-sector readback. Host must not place data there while a
      * verify is in progress. */
@@ -1518,14 +1438,8 @@ static int do_flash_block(uint32_t spi_addr, const uint8_t *data, uint32_t len) 
     }
     if (do_erase_any(spi_addr, erase_op) != 0) return -1;
     if (do_aai_program(spi_addr, data, len) != 0) return -1;
-    /* Post-AAI quiesce before verify: AAI hot-loop cycles DMA state so
-     * aggressively that residual channel state leaks into the very next
-     * dma_bidir_read, causing +2 byte readback shift and false verify
-     * mismatch. See do_verify which also takes dma_engine_reset per
-     * chunk now. */
-    spi_reset_clean();
-    dma_engine_reset();
-    busy_wait_us(200);
+    /* Verify preflight is centralized in do_verify via
+     * verify_preflight_quiesce(). */
     if (do_verify(spi_addr, data, len) != 0) return -1;
     return 0;
 }
@@ -1544,10 +1458,8 @@ static int do_flash_sector(uint32_t spi_addr, const uint8_t *data, uint32_t len)
     }
     if (do_erase(spi_addr) != 0) return -1;
     if (do_aai_program(spi_addr, data, len) != 0) return -1;
-    /* Post-AAI quiesce — see do_flash_block for rationale. */
-    dma_abort();
-    spi_reset_clean();
-    busy_wait_us(50);
+    /* Verify preflight is centralized in do_verify via
+     * verify_preflight_quiesce(). */
     if (do_verify(spi_addr, data, len) != 0) return -1;
     return 0;
 }
@@ -1566,6 +1478,8 @@ static void handle_command(uint32_t cmd) {
     MBOX->err_spi_addr = 0;
     MBOX->phase_detail = 0;
     MBOX->pair_retries = 0;
+    MBOX->miss_ch2_cfg = MBOX->miss_ch3_cfg = MBOX->miss_ch4_cfg = 0;
+    MBOX->miss_ch5_cfg = MBOX->miss_ch6_cfg = MBOX->miss_ch7_cfg = 0;
     uint32_t op_start_us = now_us();
 
     int rc = -1;

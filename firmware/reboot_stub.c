@@ -3,24 +3,12 @@
 #include <stdint.h>
 #include "reboot_common.h"
 
-static void uart_putc(char c) {
-    volatile uint32_t *uart = (volatile uint32_t *)0xC5000000;
-    for (volatile int i = 0; i < 5000; i++) {
-        if (uart[1] & (1 << 5)) {
-            uart[0] = c;
-            return;
-        }
-    }
-}
-
-static void uart_puts(const char *s) {
-    while (*s)
-        uart_putc(*s++);
-}
-
-void reboot_uart_line(const char *s) { uart_puts(s); }
+/* Keep the JTAG stub independent from UART state.
+ * On crashy runtime states, touching UART can stall the reboot path. */
+void reboot_uart_line(const char *s) { (void)s; }
 
 void __attribute__((noreturn, section(".text.entry"))) reboot_entry(void) {
-    reboot_to_tcat_bootloader(REBOOT_SRAM_CLEAR_END, REBOOT_STUB_LOAD_ADDR,
+    /* JTAG path: skip SRAM scrub while stabilizing reboot mechanics. */
+    reboot_to_tcat_bootloader(0x200u, REBOOT_STUB_LOAD_ADDR,
                               REBOOT_STUB_LOAD_ADDR + REBOOT_STUB_RESERVE);
 }

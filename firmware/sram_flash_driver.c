@@ -1209,23 +1209,7 @@ static int do_flash_step(void) {
  * Mirror soft-reboot quiesce: USB reset, LED + flash SPI idle,
  * full DMA engine reset, VIC pending clear — then normal spi_reset() paths.
  */
-#define REBOOT_USB_BASE            0x90000000u
-#define REBOOT_USB_USBCMD          (*(volatile uint32_t *)(REBOOT_USB_BASE + 0x08))
-#define REBOOT_USB_USBSTS          (*(volatile uint32_t *)(REBOOT_USB_BASE + 0x14))
-#define REBOOT_USB_USBINTR         (*(volatile uint32_t *)(REBOOT_USB_BASE + 0x18))
-#define REBOOT_USB_DEVICEADDR      (*(volatile uint32_t *)(REBOOT_USB_BASE + 0x24))
-#define REBOOT_USB_ENDPTLISTADDR   (*(volatile uint32_t *)(REBOOT_USB_BASE + 0x28))
-#define REBOOT_TCAT_USBMODE        (*(volatile uint32_t *)(REBOOT_USB_BASE + 0x800))
-#define REBOOT_TCAT_EP_COMP_STATUS (*(volatile uint32_t *)(REBOOT_USB_BASE + 0x818))
-#define REBOOT_TCAT_EP_COMP_ENABLE (*(volatile uint32_t *)(REBOOT_USB_BASE + 0x81C))
-#define REBOOT_TCAT_EP_ASYNC_PRIME (*(volatile uint32_t *)(REBOOT_USB_BASE + 0x834))  /* IN prime */
-#define REBOOT_TCAT_EP_TX_EN       (*(volatile uint32_t *)(REBOOT_USB_BASE + 0x810))  /* IN/TX enable */
-#define REBOOT_TCAT_EP_RX_EN       (*(volatile uint32_t *)(REBOOT_USB_BASE + 0x814))  /* OUT/RX enable */
-
-#define REBOOT_USBCMD_RS    (1u << 0)
-#define REBOOT_USBCMD_RST   (1u << 1)
-#define REBOOT_USBCMD_SUTW  (1u << 13)
-#define REBOOT_USBCMD_ATDTW (1u << 14)
+#include "patch/dice_usb_regs.h"   /* DWC2 v3.20a register names */
 
 #define REBOOT_VIC_INT_EN_CLR (*(volatile uint32_t *)0xFFFFF014)
 #define REBOOT_VIC_SOFT_CLR   (*(volatile uint32_t *)0xFFFFF01C)
@@ -1271,25 +1255,30 @@ static void dma_engine_full_reset_reboot_style(void) {
 }
 
 static void usb_hw_reset_for_flash(void) {
-    REBOOT_USB_USBSTS = 0xFFFFFFFFu;
-    REBOOT_USB_USBCMD &= ~(uint32_t)1;
-    REBOOT_USB_USBCMD |= 2;
-    for (volatile int i = 0; i < 100000; i++) {
-        if (!(REBOOT_USB_USBCMD & 2))
-            break;
+    /* DWC2 graceful shutdown — same sequence as reboot_common.c::usb_hw_reset.
+     * Mask all interrupts → soft-disconnect → core soft-reset (CSFTRST,
+     * self-clears) → wait for AHBIDLE so the AHB master is quiesced before
+     * we touch SPI / DMA. */
+    USB_GAHBCFG  &= ~GAHBCFG_GLBLINTRMSK;
+    USB_GINTMSK   = 0;
+    USB_DAINTMSK  = 0;
+    USB_DIEPMSK   = 0;
+    USB_DOEPMSK   = 0;
+    USB_DIEPEMPMSK = 0;
+
+    USB_GINTSTS = 0xFFFFFFFFu;
+    USB_GOTGINT = 0xFFFFFFFFu;
+
+    USB_DCTL |= DCTL_SFTDISCON;
+    for (volatile int i = 0; i < 200000; i++) {}
+
+    USB_GRSTCTL = GRSTCTL_CSFTRST;
+    for (volatile int i = 0; i < 200000; i++) {
+        if ((USB_GRSTCTL & GRSTCTL_CSFTRST) == 0u) break;
     }
-    REBOOT_USB_USBSTS = 0xFFFFFFFFu;
-    REBOOT_USB_USBINTR = 0;
-    REBOOT_USB_USBCMD &= ~(uint32_t)(REBOOT_USBCMD_RS | REBOOT_USBCMD_SUTW |
-                                     REBOOT_USBCMD_ATDTW);
-    REBOOT_USB_DEVICEADDR = 0;
-    REBOOT_USB_ENDPTLISTADDR = 0;
-    REBOOT_TCAT_USBMODE = 2u;
-    REBOOT_TCAT_EP_COMP_STATUS = 0xFFFFFFFFu;
-    REBOOT_TCAT_EP_COMP_ENABLE = 0;
-    REBOOT_TCAT_EP_ASYNC_PRIME = 0;
-    REBOOT_TCAT_EP_RX_EN = 0;
-    REBOOT_TCAT_EP_TX_EN = 0;
+    for (volatile int i = 0; i < 200000; i++) {
+        if (USB_GRSTCTL & GRSTCTL_AHBIDLE) break;
+    }
     dwb();
     for (volatile int i = 0; i < 400000; i++) {}
 }

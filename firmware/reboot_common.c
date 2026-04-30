@@ -1,105 +1,40 @@
 /*
  * Single implementation for soft-reboot (handlers + JTAG stub).
- * Combines: full ChipIdea USB RST + TCAT quiesce (handlers), full DMA ch0–3
- * teardown, optional SRAM scrub with stub skip, UART drain before XIP jump (stub).
+ * Combines: DWC2 warm-handoff quiesce (detach + EP/FIFO drain), full DMA
+ * ch0–7 teardown, optional SRAM scrub with stub skip, UART drain before XIP
+ * jump (stub).
  */
 
 #include "reboot_common.h"
-#include "dice_usb_regs.h"
+#include "blender_periph_lib.h"
 
 #define FLASH_SPI_BASE   ((volatile uint32_t *)0xCC000000u)
-#define VIC_INT_EN_CLR   (*(volatile uint32_t *)0xFFFFF014)
-#define VIC_SOFT_CLR     (*(volatile uint32_t *)0xFFFFF01C)
+#define DMA_CH_COUNT     8u
 
 __attribute__((weak)) void reboot_uart_line(const char *s) { (void)s; }
 
 void usb_hw_reset(void) {
-    USB_USBSTS = 0xFFFFFFFF;
-    USB_USBCMD &= ~(uint32_t)1;
-    USB_USBCMD |= 2;
-    for (volatile int i = 0; i < 100000; i++) {
-        if (!(USB_USBCMD & 2))
-            break;
-    }
-    USB_USBSTS = 0xFFFFFFFFu;
-    USB_USBINTR = 0;
-    USB_USBCMD &= ~(uint32_t)(USBCMD_RS | USBCMD_SUTW | USBCMD_ATDTW);
-    USB_DEVICEADDR = 0;
-    USB_ENDPTLISTADDR = 0;
-    TCAT_USBMODE = 2u;
-    TCAT_EP_COMP_STATUS = 0xFFFFFFFFu;
-    TCAT_EP_COMP_ENABLE = 0;
-    TCAT_EP_ASYNC_PRIME = 0;
-    TCAT_EP_RX_EN = 0;
-    TCAT_EP_TX_EN = 0;
-    __asm__ volatile("mcr p15, 0, %0, c7, c10, 4" ::"r"(0) : "memory");
-    for (volatile int i = 0; i < 400000; i++) {}
+    blender_usb_warm_handoff_reset();
 }
 
 void spi_ip_block_quiesce(volatile uint32_t *s) {
-    for (volatile int i = 0; i < 100000; i++) {
-        if (!(s[0x28 / 4] & 1u))
-            break;
-    }
-    s[0x10 / 4] = 0;
-    s[0x08 / 4] = 0;
-    s[0x2C / 4] = 0;
-    s[0x4C / 4] = 0;
-    s[0x50 / 4] = 0;
-    s[0x54 / 4] = 0;
-    s[0x00 / 4] = 0;
-    s[0x04 / 4] = 0;
-    s[0x18 / 4] = 0;
-    s[0x34 / 4] = 0;
-    __asm__ volatile("mcr p15, 0, %0, c7, c10, 4" ::"r"(0) : "memory");
+    blender_spi_ip_block_quiesce(s);
 }
 
 void dma_engine_full_reset(volatile uint32_t *dma) {
-    unsigned ch;
-    dma[0x08 / 4] = 0;
-    dma[0x10 / 4] = 0x0Fu;
-    for (ch = 0; ch < 4; ch++)
-        dma[0x30 / 4 + ch] = 1;
-    for (ch = 0; ch < 4; ch++) {
-        volatile uint32_t *b = (volatile uint32_t *)(0x80000100u + ch * 0x20u);
-        b[0x10 / 4] = 0;
-        b[0x0C / 4] = 0;
-        b[0x08 / 4] = 0;
-        b[0x00 / 4] = 0;
-        b[0x04 / 4] = 0;
-    }
-    __asm__ volatile("mcr p15, 0, %0, c7, c10, 4" ::"r"(0) : "memory");
+    blender_dma_engine_reset(dma, DMA_CH_COUNT);
 }
 
 void timer_blocks_disable(void) {
-    /* Timer0 (+0x00..+0x0B) and Timer1 (+0x20..+0x2B) at 0xC2000000.
-     * Writing 0 to CTRL (+0x08/+0x28) stops the counter and masks its
-     * IRQ line. Verified 2026-04-17 via diag_timer_state.py: eCos runs
-     * Timer0 at reload=0x493E0 / ~18 MHz tick. */
-    *(volatile uint32_t *)0xC2000008 = 0;  /* Timer0 CTRL */
-    *(volatile uint32_t *)0xC200002C = 0;  /* Timer1 CTRL */
+    blender_timer_blocks_disable();
 }
 
 void mixer_block_quiesce(void) {
-    /* TCAT audio mixer / crossbar @ 0xC4000000. Writing 0 to its main
-     * enable/control register (+0x00) stops channel routing. Full
-     * register map unknown, but zeroing the first 64 bytes matches
-     * what boot_check_and_load does for initialization and has been
-     * observed non-destructive in both states (audio silences, chip
-     * stays alive). Leaves clock source alone. */
-    volatile uint32_t *mx = (volatile uint32_t *)0xC4000000u;
-    for (unsigned i = 0; i < 16; i++) mx[i] = 0;
-    __asm__ volatile("mcr p15, 0, %0, c7, c10, 4" ::"r"(0) : "memory");
+    blender_mixer_block_quiesce();
 }
 
 void spi_ip_drain_rx(volatile uint32_t *s) {
-    /* STAT (+0x28) bit 3 = RX_RDY. DATA (+0x60) reads a byte from RX
-     * FIFO and clears it. Drain up to a small bound so a stuck bit
-     * doesn't hang us. */
-    for (int i = 0; i < 32; i++) {
-        if (!(s[0x28 / 4] & 0x08u)) break;
-        (void)s[0x60 / 4];
-    }
+    blender_spi_ip_drain_rx(s);
 }
 
 void peripheral_full_teardown(void) {
@@ -107,44 +42,14 @@ void peripheral_full_teardown(void) {
      * the DMA engine itself, then VIC (so no IRQ fires while we write
      * the rest), then timers and mixer. Caller must already have
      * masked CPSR.I — we don't touch CPU mode here. */
-    volatile uint32_t *flash_spi = FLASH_SPI_BASE;
-    volatile uint32_t *led_spi   = REBOOT_LED_SPI;
-    volatile uint32_t *dma       = (volatile uint32_t *)0x80000000u;
-
-    /* Drop SPI block clock mux back to fallback crystal BEFORE any SPI
-     * ops. eCos / stage-2 leave CLK_DIV_SPI (0xC9000014) = 0x8000
-     * (passthrough from 400 MHz PLL); combined with our SPI_CLK=2
-     * divider that's 200 MHz on the wire, past the SST25VF016B spec.
-     * Writing 0xABCD0000 (with the 0xC9 block's required write key)
-     * disables the PLL mux → SPI runs at the familiar ~3 MHz rate
-     * v2 driver was tuned for. Observed 2026-04-21: omitting this
-     * causes BP_CLEAR TIMEOUT after nRESET-then-boot-brief wait. */
-    *(volatile uint32_t *)0xC9000014u = 0xABCD0000u;
-    __asm__ volatile("mcr p15, 0, %0, c7, c10, 4" ::"r"(0) : "memory");
-
-    usb_hw_reset();
-
-    spi_ip_block_quiesce(led_spi);
-    spi_ip_drain_rx(led_spi);
-    REBOOT_LED_GPIO = 0;
-    led_spi[0x14 / 4] = 0xFF;
-
-    spi_ip_block_quiesce(flash_spi);
-    spi_ip_drain_rx(flash_spi);
-
-    dma_engine_full_reset(dma);
-
-    VIC_INT_EN_CLR = 0xFFFFFFFFu;
-    VIC_SOFT_CLR   = 0xFFFFFFFFu;
-    /* Clear vectored-IRQ slot controls so stale handler bindings from
-     * firmware don't route a later pending IRQ anywhere useful. */
-    for (unsigned i = 0; i < 16; i++)
-        *(volatile uint32_t *)(0xFFFFF200u + i * 4) = 0;
-
-    timer_blocks_disable();
-    mixer_block_quiesce();
-
-    __asm__ volatile("mcr p15, 0, %0, c7, c10, 4" ::"r"(0) : "memory");
+    blender_periph_cfg_t cfg = {
+        .spi_clk_div_raw = 0u,
+        .dma_channel_count = DMA_CH_COUNT,
+        .clear_vic_vector_slots = 1u,
+    };
+    volatile uint32_t *led_gpio = (volatile uint32_t *)&REBOOT_LED_GPIO;
+    blender_peripheral_full_teardown(
+        &cfg, FLASH_SPI_BASE, REBOOT_LED_SPI, led_gpio);
 }
 
 static void reboot_clear_sram(uint32_t end_exclusive, uint32_t skip_lo,
@@ -164,40 +69,16 @@ static void reboot_clear_sram(uint32_t end_exclusive, uint32_t skip_lo,
 void reboot_to_tcat_bootloader(uint32_t ram_clear_end, uint32_t skip_lo,
                                uint32_t skip_hi) {
     volatile uint32_t *spi = FLASH_SPI_BASE;
-    volatile uint32_t *led_spi = REBOOT_LED_SPI;
-    volatile uint32_t *dma = (volatile uint32_t *)0x80000000;
 
     reboot_uart_line("[reboot] start\r\n");
-
-    usb_hw_reset();
-    reboot_uart_line("[reboot] usb off\r\n");
 
     __asm__ volatile("mov r0, #0xD3 \n msr cpsr_c, r0 \n" ::: "r0");
     reboot_uart_line("[reboot] irq off\r\n");
 
-    /* Inlined instead of peripheral_full_teardown() because the patch-
-     * build's PATCH region is size-constrained (6528 B) and doesn't
-     * need the timer/mixer/extended-VIC teardown the v2 driver and
-     * reboot_stub get via peripheral_full_teardown(). If the patch
-     * ever needs eCos-level quiesce, call peripheral_full_teardown()
-     * here and grow PATCH in patch.ld. */
-    *(volatile uint32_t *)0xC2000008 = 0;
-    *(volatile uint32_t *)0xC200002C = 0;
-
-    spi_ip_block_quiesce(led_spi);
-    REBOOT_LED_GPIO = 0;
-    led_spi[0x14 / 4] = 0xFF;
-    __asm__ volatile("mcr p15, 0, %0, c7, c10, 4" ::"r"(0) : "memory");
-    reboot_uart_line("[reboot] led_spi off\r\n");
-
-    spi_ip_block_quiesce(spi);
-    reboot_uart_line("[reboot] flash_spi off\r\n");
-
-    dma_engine_full_reset(dma);
-    reboot_uart_line("[reboot] dma off\r\n");
-
-    VIC_INT_EN_CLR = 0xFFFFFFFFu;
-    VIC_SOFT_CLR = 0xFFFFFFFFu;
+    /* Use the same full quiesce sequence proven in the flash driver:
+     * USB + SPI + DMA + VIC + timer + mixer and SPI parent-clock fallback. */
+    peripheral_full_teardown();
+    reboot_uart_line("[reboot] periph off\r\n");
 
     spi[0x00 / 4] = 1;
     spi[0x04 / 4] = 2;
@@ -205,8 +86,29 @@ void reboot_to_tcat_bootloader(uint32_t ram_clear_end, uint32_t skip_lo,
     __asm__ volatile("mcr p15, 0, %0, c7, c10, 4" ::"r"(0) : "memory");
     reboot_uart_line("[reboot] xip ok\r\n");
 
-    if (ram_clear_end > 0x200)
-        reboot_clear_sram(ram_clear_end, skip_lo, skip_hi);
+    if (ram_clear_end > 0x200) {
+        /* Critical: reboot_clear_sram wipes low SRAM progressively from
+         * 0x200 upward. The caller's live stack is often in that range
+         * (~0x2AFxx in eCos / reboot stub path), so include a guard window
+         * around current SP in the skip range to avoid self-clobber while
+         * this function is still executing. */
+        uint32_t dyn_lo = skip_lo, dyn_hi = skip_hi;
+        uintptr_t sp_now;
+        __asm__ volatile("mov %0, sp" : "=r"(sp_now));
+        if (sp_now >= 0x200u && sp_now < ram_clear_end) {
+            uint32_t guard_lo = (sp_now > 0x1000u) ? (uint32_t)(sp_now - 0x1000u) : 0x200u;
+            uint32_t guard_hi = (uint32_t)(sp_now + 0x1000u);
+            if (guard_hi > ram_clear_end) guard_hi = ram_clear_end;
+            if (dyn_hi > dyn_lo) {
+                if (guard_lo < dyn_lo) dyn_lo = guard_lo;
+                if (guard_hi > dyn_hi) dyn_hi = guard_hi;
+            } else {
+                dyn_lo = guard_lo;
+                dyn_hi = guard_hi;
+            }
+        }
+        reboot_clear_sram(ram_clear_end, dyn_lo, dyn_hi);
+    }
     reboot_uart_line("[reboot] ram clear\r\n");
 
     reboot_uart_line("[reboot] jump 0x4F000\r\n");
