@@ -5,7 +5,7 @@ INCLUDE "/home/florian/src-misc/helicon-blender/firmware/firmware_symbols.ld"
 ENTRY(_hook_midi_loop_stub)
 
 MEMORY {
-    PATCH (rwx) : ORIGIN = 0x32600, LENGTH = 7168
+    PATCH (rwx) : ORIGIN = 0x32600, LENGTH = 9216
 }
 
 SECTIONS {

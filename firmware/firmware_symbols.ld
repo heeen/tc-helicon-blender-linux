@@ -40,7 +40,11 @@ dcp_register_handler = 0x1BEE0;
 dcp_send_response    = 0x1C1F8;
 dcp_state            = 0x30F78;
 
-/* Displaced function — original target of `bl` at 0x4FAC (primary event loop) */
+/* Displaced function — original target of `bl` at 0x5180 (midi_engine_thread main loop) */
+midi_rx_poll = 0x2AB8;
+FUN_2ab8 = 0x2AB8;
+
+/* Legacy: original target of `bl` at 0x4FAC (ble_spi_bridge_thread, no longer hooked) */
 FUN_2f38 = 0x2F38;
 
 /* eCos RTOS app init — called from firmware_entry at 0x344 */
@@ -79,15 +83,48 @@ usb_endpoint_submit_transfer = 0x2077C;  /* (ep, buf, size, callback, ctx) → p
 usb_midi_rx_complete         = 0x1B9E4;  /* bulk OUT DMA completion callback */
 usb_midi_rx_start            = 0x1BE50;  /* (ep_handle, num_cables) → arms EP for receive */
 usb_iface_get_rx_endpoint    = 0x20754;  /* (conn, type) → EP handle via vtable dispatch */
-usb_midi_conn                = 0x2A230;  /* USB MIDI connection object (vtable at word 0) */
+usb_iface_get_tx_endpoint    = 0x20768;  /* (conn, type) → EP handle via vtable dispatch */
+usb_midi_conn                = 0x2A230;  /* USB MIDI connection object (vtable at word 0, state at +0x2BC) */
 midi_rx_ep_handle            = 0x2A7E8;  /* EP handle struct for EP 0x03 OUT (expected addr) */
 midi_pkt_buf                 = 0x30D64;  /* USB-MIDI packet buffer (0x210 bytes + metadata) */
+
+/* USB MIDI streaming — proper init sequence (from usb_midi_streaming_start) */
+usb_midi_streaming_start         = 0x19C40;  /* full MIDI streaming init — needs R4 = streaming_state */
+usb_midi_streaming_reconfigure   = 0x19BF8;  /* reconfigure on alt-setting change */
+usb_midi_tx_endpoint_start       = 0x1BE10;  /* (tx_ep, cable_flag) → start TX side */
+usb_endpoint_descriptor_build    = 0x19A94;  /* (desc_area, ep_type) → build 7-byte EP descriptor */
+usb_endpoint_start_if_configured = 0x1FF34;  /* (conn) → program hardware via vtable if state >= 5 */
+usb_hw_ep_read_start             = 0x2115C;  /* (conn, ep_descriptor) → full QH init for endpoint */
+usb_hw_ep_start_transfer_rx      = 0x21A6C;  /* Ghidra "_rx" — actually IN submit (calls dma_start_rx which pokes 0x834 IN-prime) */
+usb_hw_ep_start_transfer         = 0x2140C;  /* Ghidra generic — actually OUT submit (calls dma_start; no 0x834 poke) */
+dcp_streaming_state_set          = 0x1C454;  /* (state) → enable/disable DCP streaming gate */
+
+/* MIDI engine startup functions */
+midi_usb_endpoints_init          = 0x4434;   /* mixer_hw_dsr callback + routing setup */
+midi_usb_endpoints_setup         = 0x1080;   /* find + link RX/TX endpoint handlers */
+midi_engine_start                = 0x2998;   /* clear FSS flag, set engine running */
+midi_rx_poll                     = 0x2AB8;   /* read ring buffer, feed parser */
+
+/* TCAT MIDI streaming state object (BSS) — referenced by streaming_start/reconfigure */
+midi_streaming_state             = 0x29CA4;  /* +0x20=EP desc, +0x28=cable cfg, +0x460=DCP TX ep */
 
 /* MIDI subsystem (primary firmware) */
 midi_parser_ctx         = 0x29764;  /* MIDI parser state: status+0, cb_channel+0x28, cb_sysex+0x2C */
 midi_channel_msg_cb_orig = 0x2A44; /* original channel message callback (chains to this) */
 midi_tx_write           = 0x1114;  /* (ringbuf+0x2C, data, len) → USB MIDI EP IN */
 midi_rx_ringbuf         = 0x29404; /* ring buffer: base+0, len+4, woff+8, roff+C */
+
+/* Canonical "set level + apply + LED + BLE notify" API — same path the BLE/
+ * knob dispatchers use. Updates mixer_state, calls *_apply (DSP), refreshes
+ * LED level meter, and schedules a BLE outbound notification. */
+master_level_set_notify     = 0x1F50;  /* (bus, level)        */
+compressor_level_set_notify = 0x1EE4;  /* (bus, level)        */
+channel_level_set_notify    = 0x1E64;  /* (input, bus, level) — note arg order! */
+
+/* Lower-level helpers (still useful for state dumps / diagnostics). */
+ble_send_full_state_dump = 0x1D14;  /* () — full mixer_state + hasblender to BLE outbound */
+ble_write_tuple         = 0x618C;  /* (paramId, subParam, value) — generic 3-byte tuple */
+led_full_refresh        = 0x1BD4;  /* () — full LED refresh (bargraph + button LEDs) */
 
 /*
  * ════════════════════════════════════════════════════════════

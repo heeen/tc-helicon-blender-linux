@@ -13,6 +13,7 @@
 
 #include "dice_platform.h"
 #include "dice_usb_regs.h"
+#include "uart_minprintf.h"
 #include "../reboot_common.h"
 
 void reboot_uart_line(const char *s) { uart_print_string(s); }
@@ -118,28 +119,31 @@ static void flash_handler(void *ctx, uint16_t category, uint16_t opcode,
 #define MIX_MASTER_OFFSET 0x20  /* master[4] starts here */
 #define MIX_STATE_SIZE    0x24  /* total: 4*7 + 4 + 4 = 36 bytes */
 
+/* MIDI 7-bit (0-127) ⇄ mixer 5-bit (0-31) full-range maps.
+ * Precomputed because the patch isn't linked against libgcc (no __aeabi_uidiv).
+ * TX table values = round((level * 127) / 31), so level 31 → cc 127. */
+static const uint8_t TX_LEVEL_TO_CC[32] = {
+      0,   4,   8,  12,  16,  20,  25,  29,
+     33,  37,  41,  45,  49,  53,  57,  62,
+     66,  70,  74,  78,  82,  86,  90,  94,
+     98, 103, 107, 111, 115, 119, 123, 127,
+};
+static inline uint8_t mixer_from_cc(uint8_t cc_val) {
+    /* RX uses simple right-shift: 124..127 all map to level 31, lossless
+     * round-trip with TX_LEVEL_TO_CC for the 32 canonical points. */
+    return (uint8_t)((cc_val & 0x7F) >> 2);
+}
+static inline uint8_t cc_from_mixer(uint8_t level) {
+    return TX_LEVEL_TO_CC[level & 0x1F];
+}
+
 /* ── MIDI CC output ─────────────────────────────────────────────────── */
 
 static void midi_send_cc(uint8_t channel, uint8_t cc_num, uint8_t cc_val) {
     uint8_t msg[3] = { (uint8_t)(0xB0 | (channel & 0x0F)), cc_num & 0x7F, cc_val & 0x7F };
     int ret = midi_tx_write(msg, 3);
-    {
-        static const char hex[] = "0123456789ABCDEF";
-        uart_putc('<');
-        uart_putc(hex[(msg[0] >> 4) & 0xF]);
-        uart_putc(hex[msg[0] & 0xF]);
-        uart_putc(' ');
-        uart_putc(hex[(msg[1] >> 4) & 0xF]);
-        uart_putc(hex[msg[1] & 0xF]);
-        uart_putc(' ');
-        uart_putc(hex[(msg[2] >> 4) & 0xF]);
-        uart_putc(hex[msg[2] & 0xF]);
-        uart_putc(' ');
-        uart_putc(ret > 0 ? 'k' : 'E');
-        uart_putc('>');
-        uart_putc('\r');
-        uart_putc('\n');
-    }
+    uart_mini_printf("<%b %b %b %c>\r\n", (unsigned)msg[0], (unsigned)msg[1],
+                     (unsigned)msg[2], (char)(ret > 0 ? 'k' : 'E'));
 }
 
 /* Snapshot of mixer_state for change detection.
@@ -156,7 +160,7 @@ static void midi_emit_state_diff(void) {
             uint8_t cur = live[off];
             if (cur != mixer_snapshot[off]) {
                 mixer_snapshot[off] = cur;
-                midi_send_cc((uint8_t)bus, (uint8_t)(16 + input), (uint8_t)(cur << 2));
+                midi_send_cc((uint8_t)bus, (uint8_t)(16 + input), cc_from_mixer(cur));
             }
         }
         /* Compressor → CC 23 */
@@ -165,7 +169,7 @@ static void midi_emit_state_diff(void) {
             uint8_t cur = live[off];
             if (cur != mixer_snapshot[off]) {
                 mixer_snapshot[off] = cur;
-                midi_send_cc((uint8_t)bus, 23, (uint8_t)(cur << 2));
+                midi_send_cc((uint8_t)bus, 23, cc_from_mixer(cur));
             }
         }
         /* Master → CC 7 */
@@ -174,7 +178,7 @@ static void midi_emit_state_diff(void) {
             uint8_t cur = live[off];
             if (cur != mixer_snapshot[off]) {
                 mixer_snapshot[off] = cur;
-                midi_send_cc((uint8_t)bus, 7, (uint8_t)(cur << 2));
+                midi_send_cc((uint8_t)bus, 7, cc_from_mixer(cur));
             }
         }
     }
@@ -182,26 +186,11 @@ static void midi_emit_state_diff(void) {
 
 /* ── MIDI CC → Mixer Control ────────────────────────────────────────── */
 
-static void midi_cc_handler(void *parser_ctx, void *parser_ctx2) {
+static void midi_cc_handler(void *parser_ctx, void *parser_ctx2, int len) {
     uint8_t *p = (uint8_t *)parser_ctx;
     uint8_t status = p[0];
 
-    uart_putc('[');
-    /* Print status and data bytes as hex via putc */
-    {
-        static const char hex[] = "0123456789ABCDEF";
-        uart_putc(hex[(status >> 4) & 0xF]);
-        uart_putc(hex[status & 0xF]);
-        uart_putc(' ');
-        uart_putc(hex[(p[1] >> 4) & 0xF]);
-        uart_putc(hex[p[1] & 0xF]);
-        uart_putc(' ');
-        uart_putc(hex[(p[2] >> 4) & 0xF]);
-        uart_putc(hex[p[2] & 0xF]);
-    }
-    uart_putc(']');
-    uart_putc('\r');
-    uart_putc('\n');
+    uart_mini_printf("[%b %b %b]\r\n", (unsigned)p[0], (unsigned)p[1], (unsigned)p[2]);
 
     /* Only handle Control Change (0xB0-0xBF) */
     if ((status & 0xF0) != 0xB0)
@@ -216,49 +205,42 @@ static void midi_cc_handler(void *parser_ctx, void *parser_ctx2) {
         goto chain;
 
     int bus   = (int)channel;
-    int level = (int)(cc_val >> 2);  /* 0-127 → 0-31 */
+    int level = (int)mixer_from_cc(cc_val);  /* 0-127 → 0-31, full-range linear */
 
+    /* Use the canonical *_set_notify helpers — they update mixer_state,
+     * apply DSP gain, refresh the LED level meter, and schedule the BLE
+     * outbound notification in one call. Same path the knob/BLE dispatchers
+     * use, so on-device LEDs and the BT phone app stay in sync.
+     *
+     * No echo on host CCs (idiomatic MIDI): we update mixer_snapshot in
+     * lockstep so the diff path doesn't re-emit the same value back. */
     if (cc_num == 7) {
-        /* CC 7: Master volume */
-        MIXER_STATE[MIX_MASTER_OFFSET + bus] = (uint8_t)level;
+        master_level_set_notify(bus, level);
         mixer_snapshot[MIX_MASTER_OFFSET + bus] = (uint8_t)level;
-        master_level_apply(bus, level);
-        midi_send_cc(channel, cc_num, cc_val);
     } else if (cc_num >= 16 && cc_num <= 22) {
-        /* CC 16-22: Input 1-7 levels */
         int input = cc_num - 16;
-        int off = bus * MIX_INPUT_STRIDE + input;
-        MIXER_STATE[off] = (uint8_t)level;
-        mixer_snapshot[off] = (uint8_t)level;
-        channel_level_apply(bus, input, level);
-        midi_send_cc(channel, cc_num, cc_val);
+        channel_level_set_notify(input, bus, level);   /* input first! */
+        mixer_snapshot[bus * MIX_INPUT_STRIDE + input] = (uint8_t)level;
     } else if (cc_num == 23) {
-        /* CC 23: Compressor level */
-        MIXER_STATE[MIX_COMP_OFFSET + bus] = (uint8_t)level;
+        compressor_level_set_notify(bus, level);
         mixer_snapshot[MIX_COMP_OFFSET + bus] = (uint8_t)level;
-        compressor_level_apply(bus, level);
-        midi_send_cc(channel, cc_num, cc_val);
     }
     /* Unrecognized CCs fall through to original handler */
 
 chain:
-    midi_channel_msg_cb_orig(parser_ctx, parser_ctx2);
+    midi_channel_msg_cb_orig(parser_ctx, parser_ctx2, len);
 }
 
 /* ── USB control ────────────────────────────────────────────────────── */
 
-#define USB_USBMODE     TCAT_USBMODE
-
-/* Force USB re-enumeration: full reset, wait for host to process
- * disconnect, then re-init as device and reconnect. */
+/* Force USB re-enumeration via DWC2 soft disconnect/reconnect.
+ * DCTL.SFTDISCON (bit 1) = 1 holds the D+ pull-up low (host sees disconnect);
+ * clearing it re-asserts the pull-up (host sees a new connect). */
 static void usb_reenumerate(void) {
-    usb_hw_reset();
+    USB_DCTL |= DCTL_SFTDISCON;
     /* Wait ~500ms for host to fully process disconnect */
     for (volatile int i = 0; i < 2000000; i++) {}
-    /* Re-set device mode (required after RST clears USBMODE) */
-    USB_USBMODE = 2;
-    /* Reconnect: set RS → D+ pulled high → host sees new device */
-    USB_USBCMD |= 1;
+    USB_DCTL &= ~DCTL_SFTDISCON;
 }
 
 static void __attribute__((noreturn)) software_reboot(void) {
@@ -329,7 +311,7 @@ static void patch_midi_callback(void) {
     *cb_ptr = (uint32_t)(void *)midi_cc_handler;
     memcpy(mixer_snapshot, (const void *)MIXER_STATE, MIX_STATE_SIZE);
     midi_patched = 1;
-    uart_print_string("[midi] cb patched\r\n");
+    uart_mini_printf("[midi] cb patched\r\n");
 }
 
 /* ── Audio clock self-init ────────────────────────────────────────────── */
@@ -345,100 +327,60 @@ static volatile uint32_t loop_count;
 static volatile uint32_t last_total_pkts;
 static volatile uint32_t ep3_rx_enabled;
 static volatile uint32_t ep3_rx_primed;
+/* 2026-04-23 cleanup: removed ep3_slot_gate_clears (confirmed gate is normal
+ * stock behavior, not blocker), ep3_trace_calls (legacy IN-variant, unused),
+ * ep3_flags_fixes (confirmed stable), ep3_manual_kicks (removed with IN kick). */
+/* DWC2-aware EP3 OUT instrumentation */
+static volatile uint32_t ep3_active_pokes;       /* DOEPCTL3 EPENA|CNAK|USBACTEP repokes */
+static volatile uint32_t ep3_xfer_compl;         /* DOEPINT3.XFERCOMPL sightings */
+static volatile uint32_t ep3_out_disabled;       /* DOEPINT3.OUTTKNEPDIS sightings */
+/* Slave-mode HS arm state (DWC2 v3.20a, GAHBCFG.DMAEn=0). */
+static volatile uint32_t ep3_hs_arms;            /* hsa: full slave-mode arm sequences */
+static volatile uint32_t ep3_hs_rearms;          /* hsr: re-arms after EPENA observed clear */
+static volatile uint32_t ep3_dcfg_fixups;        /* DCFG.DevSpd→HS fix-ups applied */
+static volatile uint32_t ep3_rxflvl_seen;        /* rfc: GINTSTS.RXFLVL transitions seen */
+static volatile uint32_t ep3_rxflvl_last;        /* last observed GINTSTS.RXFLVL bit */
+static volatile uint32_t ep3_last_q0;            /* last observed DOEPCTL3 (for EPENA-clear edge detect) */
+static volatile uint32_t ep3_out_trace_calls;     /* 2026-04-22: OUT-variant wrapper (0x2140C) calls */
+static volatile uint32_t ep3_out_trace_installed; /* 1 once wrapper is installed as start_fn */
+/* 2026-04-23 instrumentation batch */
+static volatile uint32_t ep3_cmp_calls;           /* completion callback invocations (ours wrapping 0x1B9E4) */
+static volatile uint32_t ep3_cmp_installed;       /* 1 once complete_fn wrapper installed */
+static volatile uint32_t ep3_q2_changes;          /* DOEPINT3 value-change observations */
+static volatile uint32_t ep3_q2_last;             /* last observed DOEPINT3 */
+static volatile uint32_t ep3_cmps_seen;           /* DAINT bit 19 (EP3 OUT pending) sightings */
+static volatile uint32_t ep3_cf_clears;           /* complete_fn observed cleared (= ISR processed completion) */
+static volatile uint32_t ep3_cf_last;             /* last observed ep+0x08 (complete_fn) */
+static volatile uint32_t ep3_force_rearms;        /* manual re-arm attempts */
+static volatile int32_t  ep3_stuck_loops;         /* consecutive loops with state==3 + no q2 progress */
 
-static void uart_hex32(uint32_t v) {
-    static const char hex[] = "0123456789ABCDEF";
-    for (int i = 28; i >= 0; i -= 4) uart_putc(hex[(v >> i) & 0xF]);
+/* 2026-04-23 cleanup: removed uart_log_ep3_slot_and_dma + ep3_force_slot_gate_open
+ * + associated logging. Slot gate clears stopped being informative once we
+ * established the gate transition pattern is stock-correct. */
+
+/* 2026-04-22: removed legacy IN-variant trace wrapper and manual IN-kick path.
+ * Under corrected direction labels, 0x21A6C is the IN submit path, wrong for
+ * EP3 OUT. Replaced by usb_hw_ep_start_transfer_out_trace below. */
+
+/* 2026-04-22: OUT-variant trace. 0x2140C is the OUT submit path (dma_start;
+ * no 0x834 poke). Installed as ep->start_fn to count stock-flow invocations. */
+static void usb_hw_ep_start_transfer_out_trace(void *epv) {
+    ep3_out_trace_calls++;
+    extern void usb_hw_ep_start_transfer(void *);
+    usb_hw_ep_start_transfer(epv);
 }
 
-static void uart_hex8(uint8_t v) {
-    static const char hex[] = "0123456789ABCDEF";
-    uart_putc(hex[(v >> 4) & 0xF]);
-    uart_putc(hex[v & 0xF]);
-}
-
-/* usb_hw_ep_read_start OUT path: slot = (*(usb_midi_conn+4)) + (ep_num-1)*0x40;
- * qh/dTD ptr @ slot+0x1F4, gate byte @ +0x1F8 (must be 0 to enter), +0x1FC scratch.
- * See firmware/midi_usb_handoff.txt — do not confuse with ep_handle+0x20. */
-static void uart_log_ep3_slot_and_dma(void) {
-    uint32_t tbl = *(volatile uint32_t *)((uint8_t *)usb_midi_conn + 4);
-    if (tbl < 0x10000u || tbl >= 0x80000u)
-        return;
-    uint8_t *slot = (uint8_t *)(uintptr_t)(tbl + 2u * 0x40u); /* EP3 → index 2 */
-    uint8_t g1f8 = *(volatile uint8_t *)(slot + 0x1f8);
-    uint8_t g1fc = *(volatile uint8_t *)(slot + 0x1fc);
-    uint32_t qh_slot = *(volatile uint32_t *)(slot + 0x1f4);
-    uart_putc(' ');
-    uart_putc('s');
-    uart_putc('l');
-    uart_putc('=');
-    uart_hex8(g1f8);
-    uart_putc('>');
-    uart_hex8(g1fc);
-    uart_putc(' ');
-    uart_putc('s');
-    uart_putc('q');
-    uart_putc('=');
-    uart_hex32(qh_slot);
-}
-
-/* Gates + call order: firmware/usb_dma_ep_ghidra.txt (Ghidra: usb_endpoint_submit_transfer
- * sets ep+0x08 then calls start_fn; usb_hw_ep_start_transfer_rx needs (char)ep+0x24==0x02 and
- * ep+0x08!=0, buffer aligned — else completion_cb runs with -5/-16 and no 0x834 prime). */
-static void usb_hw_ep_start_transfer_rx_trace(void *epv) {
-    ep_handle_t *ep = (ep_handle_t *)epv;
-    uint32_t cb = *(volatile uint32_t *)((uint8_t *)epv + 0x08);
-    uint32_t buf = *(volatile uint32_t *)((uint8_t *)epv + 0x10);
-    uint32_t sz = *(volatile uint32_t *)((uint8_t *)epv + 0x14);
-    uint16_t mp_pre = *(volatile uint16_t *)((uint8_t *)epv + 0x3C);
-    uint8_t pre_st = *(volatile uint8_t *)((uint8_t *)epv + 0x20);
-    uint32_t pre_fl = ep->flags;
-    volatile uint32_t *qh = ep->qh_ptr;
-    uint32_t qh2_pre = qh[2];
-    uint8_t post_st;
-    uint32_t post_fl;
-    uint32_t qh2_post;
-    uint16_t mp_post;
-    /* Ghidra: usb_hw_ep_start_transfer_rx gates on *(char *)(ep+0x24)==0x02 — that is
-     * flags low byte, NOT ep->state (+0x20). JTAG dump: state=3, flags=0x205 → fail. */
-    ep->flags = (ep->flags & ~0xFFu) | 0x02u;
-    /* usb_hw_ep_dma_start_rx(ep+0x1c) reads MPS as *(ushort*)(uint32_t* param+8 words)
-     * => ep+0x3C. HS bulk OUT needs 0x200 here or the prime path may not run. */
-    *(volatile uint16_t *)((uint8_t *)epv + 0x3C) = 0x200u;
-    mp_post = *(volatile uint16_t *)((uint8_t *)epv + 0x3C);
-    /* Do not call usb_hw_ep_dma_start_rx from here: this runs as the EP
-     * start_fn inside usb_midi_rx_start → usb_hw_ep_start_transfer_rx, which
-     * already takes cyg_scheduler_lock; a second lock + direct dma caused
-     * data/prefetch aborts (PC ~0x279xx). Use the stock wrapper only. */
-    extern void usb_hw_ep_start_transfer_rx(void *);
-    usb_hw_ep_start_transfer_rx(epv);
-    post_st = *(volatile uint8_t *)((uint8_t *)epv + 0x20);
-    post_fl = ep->flags;
-    qh2_post = qh[2];
-    uart_putc('R'); uart_putc(' ');
-    uart_putc("0123456789ABCDEF"[pre_st & 0xF]);
-    uart_putc('>');
-    uart_putc("0123456789ABCDEF"[post_st & 0xF]);
-    uart_putc(' ');
-    uart_hex32(pre_fl);
-    uart_putc('>');
-    uart_hex32(post_fl);
-    uart_putc(' ');
-    uart_hex32(cb);
-    uart_putc(' ');
-    uart_hex32(buf);
-    uart_putc(' ');
-    uart_hex32(sz);
-    uart_putc(' ');
-    uart_hex32((uint32_t)mp_pre);
-    uart_putc('>');
-    uart_hex32((uint32_t)mp_post);
-    /* +0x834 async prime often reads 0 (WO/pulse). QH[2]=dTD overlay; 0 = none. */
-    uart_print_string(" q2=");
-    uart_hex32(qh2_pre);
-    uart_putc('>');
-    uart_hex32(qh2_post);
-    uart_putc('\r'); uart_putc('\n');
+/* 2026-04-23: completion-callback trace. Stock submit_transfer fills ep+0x08
+ * with the callback ptr passed by usb_midi_rx_dispatch (= 0x1B9E4). After
+ * first arm we override ep+0x08 with our wrapper so every completion-IRQ
+ * upcall is counted. If ep3_cmp_calls stays 0 across host bursts, the
+ * completion IRQ never reaches the MIDI layer. */
+static void usb_midi_rx_complete_trace(void *ctx, int byte_count) {
+    ep3_cmp_calls++;
+    if (ep3_cmp_calls <= 4u)
+        uart_mini_printf("[midi] cmp %x %x\r\n", ep3_cmp_calls, (unsigned)byte_count);
+    extern void usb_midi_rx_complete(void *, int);
+    usb_midi_rx_complete(ctx, byte_count);
 }
 
 static void init_audio_clock(void) {
@@ -446,7 +388,7 @@ static void init_audio_clock(void) {
         return;
     usb_audio_rx_set_sample_rate(48000);
     clock_initialized = 1;
-    uart_print_string("[clock] 48kHz\r\n");
+    uart_mini_printf("[clock] 48kHz\r\n");
 }
 
 /* hooks.py patches firmware_entry's `bl rtos_app_init` at 0x344 to call
@@ -478,12 +420,33 @@ void boot_init(void) {
     last_total_pkts = 0;
     ep3_rx_enabled = 0;
     ep3_rx_primed = 0;
+    ep3_active_pokes = 0;
+    ep3_xfer_compl = 0;
+    ep3_out_disabled = 0;
+    ep3_out_trace_calls = 0;
+    ep3_out_trace_installed = 0;
+    ep3_cmp_calls = 0;
+    ep3_cmp_installed = 0;
+    ep3_q2_changes = 0;
+    ep3_q2_last = 0;
+    ep3_cmps_seen = 0;
+    ep3_cf_clears = 0;
+    ep3_cf_last = 0;
+    ep3_force_rearms = 0;
+    ep3_stuck_loops = 0;
+    ep3_hs_arms = 0;
+    ep3_hs_rearms = 0;
+    ep3_dcfg_fixups = 0;
+    ep3_rxflvl_seen = 0;
+    ep3_rxflvl_last = 0;
+    ep3_last_q0 = 0;
 
     /* Initialize HPLL clock before USB starts. Without this, the kernel's
      * snd-usb-audio driver fails to probe (clock descriptors invalid).
      * Safe here: .ctors have populated the clock source table, but the
      * scheduler hasn't started yet so no USB/DMA/thread interference. */
     init_audio_clock();
+    uart_mini_printf("[midi] build tag=fx-flags-v1\r\n");
 
     /* PATCH: Make firmware always take the FS MIDI arming path.
      *
@@ -496,7 +459,15 @@ void boot_init(void) {
     *(volatile uint32_t *)0x19BE0 = 0xE1530003;  /* cmp r3, r3 (always EQ) */
     icache_invalidate();
 
-    uart_print_string("[boot_init] DCP registered\r\n");
+    /* IP is Synopsys DWC2 v3.20a (GSNPSID=0x4F54320A). Defensively set DWC2
+     * device-mode interrupt masks — stock fw sets these during SET_CONFIG but
+     * we've seen them read as 0 under some conditions. Idempotent OR. */
+    USB_DOEPMSK  |= DOEP_XFERCOMPL | DOEP_EPDISBLD | DOEP_AHBERR
+                  | DOEP_SETUP | DOEP_STSPHSERCVD;
+    USB_DAINTMSK |= DAINT_IN(0) | DAINT_IN(1) | DAINT_IN(2)
+                  | DAINT_OUT(0) | DAINT_OUT(3);
+
+    uart_mini_printf("[boot_init] DCP registered\r\n");
 
     /* Chain to original rtos_app_init — starts scheduler, never returns */
     rtos_app_init();
@@ -514,49 +485,40 @@ void midi_loop_hook(void) {
      * now arms MIDI endpoints at High Speed. Just log the result. */
     if (!ep3_rx_enabled) {
         uint32_t ep_h = *(volatile uint32_t *)(midi_pkt_buf + MIDI_PKT_RX_EP);
-        if (ep_h) {
-            uart_print_string("[midi] ep=");
-            {
-                static const char hex[] = "0123456789ABCDEF";
-                for (int i = 28; i >= 0; i -= 4) uart_putc(hex[(ep_h >> i) & 0xF]);
-            }
-        } else {
+        if (!ep_h) {
             /* After soft reboot, first hook often runs before SET_CONFIGURATION
              * arms midi_pkt_buf+RX_EP. Do not latch ep3_rx_enabled until we see
              * a non-zero handle — otherwise we never run the EP3 patch (cold
              * boot usually has the handle already). */
             static uint8_t ep_wait_logged;
             if (!ep_wait_logged) {
-                uart_print_string("[midi] ep=0 (waiting for USB arm)\r\n");
+                uart_mini_printf("[midi] ep=0 (waiting for USB arm)\r\n");
                 ep_wait_logged = 1;
             }
-        }
-        if (ep_h) {
-            uint8_t st = *(volatile uint8_t *)(ep_h + 0x20);
-            uart_print_string(" st=");
-            uart_putc('0' + st);
-            uart_print_string(" f=");
-            uart_hex32(*(volatile uint32_t *)(ep_h + 0x00));
-            uart_print_string(" cb=");
-            uart_hex32(*(volatile uint32_t *)(ep_h + 0x08));
-            uart_print_string(" b=");
-            uart_hex32(*(volatile uint32_t *)(ep_h + 0x10));
-            uart_print_string(" n=");
-            uart_hex32(*(volatile uint32_t *)(ep_h + 0x14));
-            uart_print_string(" fl=");
-            uart_hex32(*(volatile uint32_t *)(ep_h + 0x24));
-            uart_print_string(" m=");
-            uart_hex32((uint32_t)*(volatile uint16_t *)(ep_h + 0x3C));
+        } else {
+            uint8_t st = *(volatile uint8_t *)(ep_h + ECOS_EP_STATE);
             /* 2026-04-20: After ISR decomp, EP3 OUT stock init is correct —
              * no runtime ep_handle mutation needed here. See
-             * firmware/usb_dma_ep_ghidra.txt. The HS-skip bypass in boot_init
-             * is sufficient to enter the arming path; remaining bug is that
-             * QH[0] ACTIVE bit (26) / QH[6] state (0x80 vs 0x10) don't
-             * transition correctly — needs deeper investigation. */
-            uart_putc('\r'); uart_putc('\n');
+             * firmware/usb_dma_ep_ghidra.txt. */
+            uart_mini_printf("[midi] ep=%x st=%c\r\n", ep_h, (char)('0' + st));
             if (!ep3_rx_primed) {
-                *(volatile uint32_t *)(ep_h + 0x00) = (uint32_t)(void *)usb_hw_ep_start_transfer_rx_trace;
-                uart_print_string("[midi] ep3 start_fn->trace\r\n");
+                uint32_t fn0 = *(volatile uint32_t *)(ep_h + ECOS_EP_START_FN);
+                uint32_t fn4 = *(volatile uint32_t *)(ep_h + ECOS_EP_SET_HALTED_FN);
+                uint32_t fn8 = *(volatile uint32_t *)(ep_h + ECOS_EP_COMPLETE_FN);
+                uart_mini_printf("[midi] ep3 fn0=%x fn4=%x fn8=%x\r\n", fn0, fn4, fn8);
+                /* 2026-04-22: install OUT-variant trace wrapper as ep->start_fn
+                 * to count every stock-flow invocation in ep3_out_trace_calls. */
+                if (!ep3_out_trace_installed) {
+                    *(volatile uint32_t *)(ep_h + ECOS_EP_START_FN) =
+                        (uint32_t)(uintptr_t)usb_hw_ep_start_transfer_out_trace;
+                    ep3_out_trace_installed = 1;
+                    uart_mini_printf("[midi] installed OUT trace as start_fn\r\n");
+                }
+
+                /* No manual kick needed: OUT trace wrapper is now installed as
+                 * ep->start_fn, so next stock submit-transfer call routes
+                 * through our trace + stock OUT path and increments otc. */
+                uart_mini_printf("[midi] otc=%x\r\n", ep3_out_trace_calls);
                 ep3_rx_primed = 1;
             }
             ep3_rx_enabled = 1;
@@ -565,6 +527,111 @@ void midi_loop_hook(void) {
 
     /* Call the displaced midi_rx_poll first — processes USB MIDI RX data */
     midi_rx_poll();
+
+    /* 2026-04-23 instrumentation: per-loop EP3 OUT state poll. */
+    {
+        uint32_t ep_h = *(volatile uint32_t *)(midi_pkt_buf + MIDI_PKT_RX_EP);
+        if (ep_h) {
+            /* (a) Install completion-callback wrapper once complete_fn is non-zero. */
+            uint32_t cf = *(volatile uint32_t *)(ep_h + ECOS_EP_COMPLETE_FN);
+            if (!ep3_cmp_installed && cf != 0u
+                && cf != (uint32_t)(uintptr_t)usb_midi_rx_complete_trace) {
+                *(volatile uint32_t *)(ep_h + ECOS_EP_COMPLETE_FN) =
+                    (uint32_t)(uintptr_t)usb_midi_rx_complete_trace;
+                ep3_cmp_installed = 1;
+                uart_mini_printf("[midi] cmp wrapper installed (was %x)\r\n", cf);
+            }
+            /* (b) Track complete_fn transitions to zero — means stock ISR ran cmp. */
+            if (cf != ep3_cf_last) {
+                if (ep3_cf_last != 0u && cf == 0u) ep3_cf_clears++;
+                ep3_cf_last = cf;
+            }
+
+            /* (c) DOEPINT3 — DWC2 per-EP interrupt reg.
+             *   OUTTKNEPDIS = host OUT token arrived while EP disabled —
+             *   the hw's way of telling us arming never stuck. */
+            uint32_t q2_now = USB_DOEPINT(3);
+            if (q2_now != ep3_q2_last) {
+                ep3_q2_changes++;
+                if (q2_now & DOEP_XFERCOMPL)    ep3_xfer_compl++;
+                if (q2_now & DOEP_OUTTKNEPDIS)  ep3_out_disabled++;
+                if (ep3_q2_changes <= 16u)
+                    uart_mini_printf("[dwc2] DOEPINT3=%x\r\n", q2_now);
+                ep3_q2_last = q2_now;
+            }
+
+            /* (d) DAINT bit 19 = EP3 OUT interrupt pending. */
+            if (USB_DAINT & DAINT_OUT(3)) ep3_cmps_seen++;
+
+            /* (e) Slave-mode HS arm. Once ep_handle is allocated (state==2/3
+             *   means stock fw has reached configured / DMA-active), force
+             *   DOEPCTL3/DOEPTSIZ3 into the canonical HS-bulk-OUT shape and
+             *   leave it there. Re-run the sequence each time hw clears EPENA
+             *   (one-shot completion or OUTTKNEPDIS auto-disable). DOEPDMA3
+             *   is intentionally untouched — slave mode (GAHBCFG.DMAEn=0)
+             *   ignores it. */
+            uint32_t q0_now = USB_DOEPCTL(3);
+            uint8_t st = *(volatile uint8_t *)(ep_h + ECOS_EP_STATE);
+            uint8_t want_arm = 0;
+            /* Only arm once stock fw has progressed ep_state to 2 or 3
+             * (DMA_ACTIVE / READY). Arming earlier (st==0/1) clashes with
+             * stock fw's setup and can leave the EP halted (hl=1). */
+            if (st == 3u || st == 2u) {
+                if ((q0_now & DEPCTL_EPENA) == 0u) {
+                    /* hw cleared EPENA after one-shot completion — re-arm. */
+                    if ((ep3_last_q0 & DEPCTL_EPENA) != 0u) {
+                        ep3_hs_rearms++;
+                    }
+                    want_arm = 1;
+                } else if (ep3_hs_arms == 0u) {
+                    /* Boot path: first observation, stamp register fields
+                     * to canonical values. */
+                    want_arm = 1;
+                }
+                /* DON'T re-arm on NAKSTS=1 alone — see comment in earlier
+                 * commit; the FIFO-drain is the ISR's job. */
+            }
+            if (want_arm) {
+                /* Pre-arm DCFG fix-up: if the host enumerated us at HS speed
+                 * (DSTS.EnumSpd=0) but DCFG.DevSpd is non-HS (probably forced
+                 * by the FS arming path running via the HS-skip patch), clear
+                 * DevSpd back to 0 so the controller advertises HS. Idempotent. */
+                if ((USB_DSTS & DSTS_ENUMSPD_MASK) == DSTS_ENUMSPD_HS &&
+                    (USB_DCFG & DCFG_DEVSPD_MASK) != DCFG_DEVSPD_HS) {
+                    USB_DCFG = (USB_DCFG & ~DCFG_DEVSPD_MASK) | DCFG_DEVSPD_HS;
+                    ep3_dcfg_fixups++;
+                }
+
+                USB_DOEPINT(3)  = 0xFFFFFFFFu;                              /* W1C stale */
+                USB_DOEPTSIZ(3) = DEPTSIZ_PKTCNT(1) | DEPTSIZ_XFERSIZE(512);
+                USB_DOEPCTL(3) =
+                    (q0_now & ~(DEPCTL_MPS_MASK | DEPCTL_EPTYPE_MASK | DEPCTL_STALL))
+                    | DEPCTL_MPS(512) | DEPCTL_EPTYPE_BULK | DEPCTL_USBACTEP
+                    | DEPCTL_EPENA | DEPCTL_CNAK;
+                USB_DAINTMSK |= DAINT_OUT(3);
+
+                ep3_hs_arms++;
+                ep3_active_pokes++;
+                if (ep3_hs_arms <= 4u || (ep3_hs_arms & 0x3F) == 0u) {
+                    uart_mini_printf("[dwc2] hsarm #%x q0pre=%x q0post=%x dcfg=%x dsts=%x\r\n",
+                                     ep3_hs_arms, q0_now, USB_DOEPCTL(3),
+                                     USB_DCFG, USB_DSTS);
+                }
+            }
+            ep3_last_q0 = q0_now;
+
+            /* (f) RXFLVL telemetry. If GINTSTS.RXFLVL toggles, the global
+             *   RX FIFO has data — useful for distinguishing "tokens never
+             *   reach controller" from "tokens reach controller but ISR
+             *   doesn't classify EP3 OUT". */
+            uint32_t gints = USB_GINTSTS;
+            uint32_t rxflvl_now = (gints & GINT_RXFLVL) ? 1u : 0u;
+            if (rxflvl_now != ep3_rxflvl_last) {
+                ep3_rxflvl_seen++;
+                ep3_rxflvl_last = rxflvl_now;
+            }
+        }
+    }
 
     /* Patch MIDI parser callback (idempotent — first call patches, rest no-op) */
     patch_midi_callback();
@@ -575,20 +642,9 @@ void midi_loop_hook(void) {
     /* Monitor USB MIDI RX state — report changes */
     uint32_t total = *(volatile uint32_t *)(midi_pkt_buf + MIDI_PKT_TOTAL);
     if (total != last_total_pkts) {
-        static const char hex[] = "0123456789ABCDEF";
-        uart_print_string("[rx] ");
-        uart_putc(hex[(total >> 4) & 0xF]);
-        uart_putc(hex[total & 0xF]);
-        uart_putc('\r'); uart_putc('\n');
+        uart_mini_printf("[rx] %b\r\n", (unsigned)(uint8_t)total);
         last_total_pkts = total;
     }
-    /* 2026-04-20: removed periodic `TCAT_EP_ASYNC_PRIME |= EP_BIT_RX(3)`.
-     * Post-ISR-decomp, 0x90000834 is the IN async-prime register, not OUT.
-     * OUT direction endpoints (like EP3 MIDI RX) don't use 0x834. See
-     * dice_usb_regs.h and firmware/usb_dma_ep_ghidra.txt for the corrected
-     * direction labels. The old reinforcement poke was pulsing bit 3 of
-     * 0x834 which is actually EP3 IN prime — no effect for MIDI RX. */
-
     /* Periodic EP status + USB registers (~every 4 seconds). */
     loop_count++;
     if ((loop_count & 0x3FF) == 0) {
@@ -596,166 +652,74 @@ void midi_loop_hook(void) {
         uint8_t cable_cnt = *(volatile uint8_t *)(midi_pkt_buf + MIDI_PKT_CABLE_CNT);
         uint32_t complete_fn = ep_handle ? *(volatile uint32_t *)((uint8_t *)ep_handle + 8) : 0;
         uint32_t start_fn = ep_handle ? *(volatile uint32_t *)((uint8_t *)ep_handle + 0) : 0;
-        uint32_t qh_ptr = ep_handle ? *(volatile uint32_t *)((uint8_t *)ep_handle + 0x1C) : 0;
-        uint8_t ep_state = ep_handle ? *(volatile uint8_t *)((uint8_t *)ep_handle + 0x20) : 0;
-        uint32_t comp_status = TCAT_EP_COMP_STATUS;
-        uint32_t comp_enable = TCAT_EP_COMP_ENABLE;
-        uint32_t async_prime = TCAT_EP_ASYNC_PRIME;
-        uint32_t tcat_portsc = TCAT_PORTSC;
-        uint32_t tcat_rx_en = TCAT_EP_RX_EN;
-        uint32_t tcat_tx_en = TCAT_EP_TX_EN;
-        uint32_t epprime = *(volatile uint32_t *)(USB_BASE + 0x80);
-        uint32_t epstat = *(volatile uint32_t *)(USB_BASE + 0x88);
-        uint32_t epcomp = *(volatile uint32_t *)(USB_BASE + 0x8C);
-        uint32_t epctrl3 = *(volatile uint32_t *)(USB_BASE + 0x9C);
-        uint32_t qh0 = 0, qh2 = 0, qh4 = 0, qh6 = 0;
-        if (qh_ptr >= 0x90000000u && qh_ptr < 0x90001000u) {
-            volatile uint32_t *qh = (volatile uint32_t *)(uintptr_t)qh_ptr;
-            qh0 = qh[0];
-            qh2 = qh[2];
-            qh4 = qh[4];
-            qh6 = qh[6];
-        }
-        /* Fixed banks for quick sanity check against qh_ptr-dereferenced data. */
-        volatile uint32_t *qh_out_fixed = TCAT_QH_EP3_OUT;
-        volatile uint32_t *qh_in_fixed  = TCAT_QH_EP3_IN;
-        uint32_t q0o = qh_out_fixed[0];
-        uint32_t q0i = qh_in_fixed[0];
+        uint32_t ep_regs = ep_handle ? *(volatile uint32_t *)((uint8_t *)ep_handle + ECOS_EP_REGS) : 0;
+        uint8_t ep_state = ep_handle ? *(volatile uint8_t *)((uint8_t *)ep_handle + ECOS_EP_STATE) : 0;
 
-        uart_putc(ep_handle ? 'E' : 'e');    /* E=ep set, e=no ep */
-        uart_putc(complete_fn ? 'C' : 'c');  /* C=callback set, c=no cb */
-        uart_putc('0' + cable_cnt);          /* cable count digit */
-        uart_putc(' ');
-        uart_putc('s'); uart_putc('='); uart_putc('0' + ep_state);
-        uart_putc(' ');
-        uart_putc('f'); uart_putc('='); uart_hex32(start_fn);
-        uart_putc(' ');
-        uart_putc('q'); uart_putc('p'); uart_putc('=');
-        uart_hex32(qh_ptr);
-        uart_putc(' ');
-        uart_putc('c'); uart_putc('m'); uart_putc('p'); uart_putc('=');
-        uart_hex32(comp_status);
-        uart_putc(' ');
-        uart_putc('e'); uart_putc('n'); uart_putc('=');
-        uart_hex32(comp_enable);
-        uart_putc(' ');
-        uart_putc('p'); uart_putc('r'); uart_putc('=');
-        uart_hex32(async_prime);
-        (void)tcat_portsc; /* mostly churn/noise; omit from periodic log */
-        uart_putc(' ');
-        uart_putc('r'); uart_putc('x'); uart_putc('=');
-        uart_hex32(tcat_rx_en);
-        uart_putc(' ');
-        uart_putc('t'); uart_putc('x'); uart_putc('=');
-        uart_hex32(tcat_tx_en);
-        uart_putc(' ');
-        uart_putc('p'); uart_putc('m'); uart_putc('=');
-        uart_hex32(epprime);
-        uart_putc(' ');
-        uart_putc('s'); uart_putc('t'); uart_putc('=');
-        uart_hex32(epstat);
-        uart_putc(' ');
-        uart_putc('c'); uart_putc('p'); uart_putc('=');
-        uart_hex32(epcomp);
-        uart_putc(' ');
-        uart_putc('e'); uart_putc('3'); uart_putc('=');
-        uart_hex32(epctrl3);
-        uart_putc(' ');
-        uart_putc('q'); uart_putc('0'); uart_putc('=');
-        uart_hex32(qh0);
-        uart_putc(' ');
-        uart_putc('q'); uart_putc('2'); uart_putc('=');
-        uart_hex32(qh2);
-        uart_putc(' ');
-        uart_putc('q'); uart_putc('4'); uart_putc('=');
-        uart_hex32(qh4);
-        uart_putc(' ');
-        uart_putc('q'); uart_putc('6'); uart_putc('=');
-        uart_hex32(qh6);
-        uart_putc(' ');
-        uart_putc('o'); uart_putc('0'); uart_putc('=');
-        uart_hex32(q0o);
-        uart_putc(' ');
-        uart_putc('i'); uart_putc('0'); uart_putc('=');
-        uart_hex32(q0i);
-        uart_putc(' ');
-        uart_putc('d'); uart_putc('m'); uart_putc('=');
-        uart_hex32(TCAT_DMA_CFG);
-        uart_putc(' ');
-        uart_putc('z'); uart_putc('6'); uart_putc('=');
-        uart_hex32(TCAT_QH_OUT(0)[6]);
-        uart_putc('\r'); uart_putc('\n');
+        /* EC1 — EP3 OUT register window (DOEPCTL3 / DOEPINT3 / DOEPTSIZ3 /
+         * DOEPDMA3) + DAINT / DAINTMSK + counters.
+         *   qp= ep->ep_regs (was qh_ptr; now points at DOEPCTL3 MMIO)
+         *   q0= DOEPCTL3   q2= DOEPINT3   q4= DOEPTSIZ3   q5= DOEPDMA3
+         *   da= DAINT      dam= DAINTMSK
+         *   dim= DIEPMSK   dom= DOEPMSK   dem= DIEPEMPMSK   th= DTHRCTL */
+        uint32_t q0 = USB_DOEPCTL(3);
+        uint32_t q2 = USB_DOEPINT(3);
+        uint32_t q4 = USB_DOEPTSIZ(3);
+        uint32_t q5 = USB_DOEPDMA(3);
 
-        /* EC2 — one flash cycle: stack "next step" fields that EC1 omits:
-         *   USB conn state, TCAT USBMODE, streaming speed byte,
-         *   EP3 DMA buffer + size + flags + max_pkt + halted,
-         *   ENDPTCTRL0 vs EP3, USBCMD/STS/INTR, addr/list,
-         *   QH[1,3,5] (often dTD / overlay; EC1 has even words). */
-        uart_print_string("EC2 ");
-        {
-            uint8_t usb_st = usb_conn_get_state(usb_midi_conn);
-            uart_putc('u'); uart_putc('=');
-            uart_putc("0123456789ABCDEF"[(usb_st >> 4) & 0xF]);
-            uart_putc("0123456789ABCDEF"[usb_st & 0xF]);
-        }
-        uart_putc(' ');
-        {
-            uint8_t spd = *(volatile uint8_t *)(midi_streaming_state + 0x1C);
-            uart_putc('g'); uart_putc('=');
-            uart_putc("0123456789ABCDEF"[(spd >> 4) & 0xF]);
-            uart_putc("0123456789ABCDEF"[spd & 0xF]);
-        }
-        uart_putc(' ');
-        uart_putc('m'); uart_putc('=');
-        uart_hex32(TCAT_USBMODE);
+        uart_mini_printf(
+            "%c%c%c s=%c f=%x qp=%x q0=%x q2=%x q4=%x q5=%x da=%x dam=%x "
+            "dim=%x dom=%x dem=%x th=%x "
+            "otc=%x cmc=%x q2c=%x css=%x cfc=%x fr=%x act=%x xc=%x od=%x "
+            "hsa=%x hsr=%x dfx=%x rfc=%x\r\n",
+            ep_handle ? 'E' : 'e', complete_fn ? 'C' : 'c', (char)('0' + cable_cnt),
+            (char)('0' + ep_state), start_fn, ep_regs,
+            q0, q2, q4, q5,
+            USB_DAINT, USB_DAINTMSK,
+            USB_DIEPMSK, USB_DOEPMSK, USB_DIEPEMPMSK, USB_DTHRCTL,
+            ep3_out_trace_calls, ep3_cmp_calls, ep3_q2_changes,
+            ep3_cmps_seen, ep3_cf_clears, ep3_force_rearms, ep3_active_pokes,
+            ep3_xfer_compl, ep3_out_disabled,
+            ep3_hs_arms, ep3_hs_rearms, ep3_dcfg_fixups, ep3_rxflvl_seen);
+
+        /* EC2 — eCos conn state + speed byte + DSTS.EnumSpd decoded
+         *       (es=H/F/L/X) + DCFG/DCTL/DSTS + ep_handle fields. */
+        uint32_t dsts = USB_DSTS;
+        uint32_t enumspd = (dsts & DSTS_ENUMSPD_MASK) >> DSTS_ENUMSPD_SHIFT;
+        char es = (enumspd == 0u) ? 'H'
+                : (enumspd == 1u) ? 'F'
+                : (enumspd == 2u) ? 'L'
+                                  : 'X';   /* 3 = FS-on-HS-PHY */
+        uart_mini_printf(
+            "EC2 u=%b g=%b es=%c dcfg=%x dctl=%x dsts=%x",
+            (unsigned)(uint8_t)usb_conn_get_state(usb_midi_conn),
+            (unsigned)*(volatile uint8_t *)(midi_streaming_state + 0x1C),
+            es, USB_DCFG, USB_DCTL, dsts);
         if (ep_handle) {
             uint32_t bufp = *(volatile uint32_t *)((uint8_t *)ep_handle + ECOS_EP_BUFFER);
             int32_t bufsz = *(volatile int32_t *)((uint8_t *)ep_handle + ECOS_EP_BUFFER_SIZE);
             uint32_t halted_w = *(volatile uint32_t *)((uint8_t *)ep_handle + ECOS_EP_HALTED);
-            uint32_t epflags = *(volatile uint32_t *)((uint8_t *)ep_handle + 0x24);
-            uint16_t mps = *(volatile uint16_t *)((uint8_t *)ep_handle + 0x3C);
-            uart_putc(' ');
-            uart_putc('b'); uart_putc('p'); uart_putc('=');
-            uart_hex32(bufp);
-            uart_putc(' ');
-            uart_putc('b'); uart_putc('s'); uart_putc('=');
-            uart_hex32((uint32_t)bufsz);
-            uart_putc(' ');
-            uart_putc('h'); uart_putc('l'); uart_putc('=');
-            uart_hex32(halted_w);
-            uart_putc(' ');
-            uart_putc('F'); uart_putc('=');
-            uart_hex32(epflags);
-            uart_putc(' ');
-            uart_putc('m'); uart_putc('p'); uart_putc('s'); uart_putc('=');
-            uart_hex32((uint32_t)mps);
-            uart_log_ep3_slot_and_dma();
+            uint32_t epflags = *(volatile uint32_t *)((uint8_t *)ep_handle + ECOS_EP_FLAGS);
+            uint16_t mps = *(volatile uint16_t *)((uint8_t *)ep_handle + ECOS_EP_MAX_PKT);
+            uart_mini_printf(" bp=%x bs=%x hl=%x F=%x mps=%x", bufp, (uint32_t)bufsz,
+                             halted_w, epflags, (uint32_t)mps);
         }
-        uart_putc(' ');
-        uart_putc('e'); uart_putc('0'); uart_putc('=');
-        uart_hex32(*(volatile uint32_t *)(USB_BASE + 0x90));
-        uart_putc(' ');
-        uart_putc('C'); uart_putc('m'); uart_putc('d'); uart_putc('=');
-        uart_hex32(USB_USBCMD);
-        uart_putc(' ');
-        uart_putc('S'); uart_putc('t'); uart_putc('s'); uart_putc('=');
-        uart_hex32(USB_USBSTS);
-        uart_putc(' ');
-        uart_putc('I'); uart_putc('n'); uart_putc('t'); uart_putc('=');
-        uart_hex32(USB_USBINTR);
-        uart_putc(' ');
-        uart_putc('D'); uart_putc('a'); uart_putc('=');
-        uart_hex32(USB_DEVICEADDR);
-        uart_putc(' ');
-        uart_putc('E'); uart_putc('l'); uart_putc('a'); uart_putc('=');
-        uart_hex32(USB_ENDPTLISTADDR);
-        uart_putc(' ');
-        uart_putc('F'); uart_putc('r'); uart_putc('=');
-        uart_hex32(USB_FRINDEX);
-        uart_putc('\r'); uart_putc('\n');
+        uart_mini_printf("\r\n");
+
+        /* EC3 — DWC2 global regs:
+         *   ha= GAHBCFG   us= GUSBCFG   gis= GINTSTS   gim= GINTMSK
+         *   grf= GRXFSIZ  gnt= GNPTXFSIZ gns= GNPTXSTS
+         *   hc2= GHWCFG2  hc3= GHWCFG3  sid= GSNPSID   gdc= GDFIFOCFG */
+        uart_mini_printf(
+            "EC3 ha=%x us=%x gis=%x gim=%x grf=%x gnt=%x gns=%x hc2=%x hc3=%x "
+            "sid=%x gdc=%x\r\n",
+            USB_GAHBCFG, USB_GUSBCFG, USB_GINTSTS, USB_GINTMSK,
+            USB_GRXFSIZ, USB_GNPTXFSIZ, USB_GNPTXSTS,
+            USB_GHWCFG2, USB_GHWCFG3, USB_GSNPSID, USB_GDFIFOCFG);
     }
 
-    /* Emit MIDI CC feedback for mixer state changes (knobs, BLE) */
+    /* Emit MIDI CCs for any mixer_state changes since last poll.
+     * midi_cc_handler updates mixer_snapshot in lockstep with host-driven
+     * changes, so this only emits for BLE / knob / DCP-originated edits. */
     midi_emit_state_diff();
 }
 
@@ -872,7 +836,7 @@ static void flash_handler(void *ctx, uint16_t category, uint16_t opcode,
             if (channel >= 4)
                 continue;
             int bus = (int)channel;
-            int level = (int)(cc_val >> 2);
+            int level = (int)mixer_from_cc(cc_val);
             if (cc_num == 7) {
                 MIXER_STATE[MIX_MASTER_OFFSET + bus] = (uint8_t)level;
                 mixer_snapshot[MIX_MASTER_OFFSET + bus] = (uint8_t)level;
@@ -902,34 +866,35 @@ static void flash_handler(void *ctx, uint16_t category, uint16_t opcode,
         dcp_send_response(0, body, 4);
         /* Brief delay so USB can send the response */
         for (volatile int i = 0; i < 100000; i++) {}
-        uart_print_string("[usb] re-enumerate\r\n");
+        uart_mini_printf("[usb] re-enumerate\r\n");
         usb_reenumerate();
         return;
     }
 
-    case 8: { /* USB_DIAG — read USB controller + EP state */
+    case 8: { /* USB_DIAG — read DWC2 controller + EP state */
         uint32_t *out = (uint32_t *)body;
         uint32_t ep_h = *(volatile uint32_t *)(midi_pkt_buf + MIDI_PKT_RX_EP);
         /* EP struct fields */
-        out[0] = ep_h;  /* EP handle address */
-        out[1] = ep_h ? *(volatile uint32_t *)((uint8_t *)ep_h + 0x1C) : 0;  /* qh_ptr */
-        out[2] = ep_h ? *(volatile uint32_t *)((uint8_t *)ep_h + 0x20) : 0;  /* state+num */
-        out[3] = ep_h ? *(volatile uint32_t *)((uint8_t *)ep_h + 0x24) : 0;  /* flags */
-        out[4] = ep_h ? *(volatile uint32_t *)((uint8_t *)ep_h + 0x28) : 0;  /* dma_buf_copy */
-        out[5] = ep_h ? *(volatile uint32_t *)((uint8_t *)ep_h + 0x2C) : 0;  /* dma_size_copy */
-        /* QH from ep->qh_ptr (read actual HW QH) */
-        uint32_t qh_addr = ep_h ? *(volatile uint32_t *)((uint8_t *)ep_h + 0x1C) : 0;
-        if (qh_addr) {
-            volatile uint32_t *qh = (volatile uint32_t *)qh_addr;
-            out[6] = qh[0];  out[7] = qh[1];  out[8] = qh[2];
-            out[9] = qh[3];  out[10] = qh[4]; out[11] = qh[5];
-            out[12] = qh[6]; out[13] = qh[7];
+        out[0] = ep_h;                                                                    /* EP handle address */
+        out[1] = ep_h ? *(volatile uint32_t *)((uint8_t *)ep_h + ECOS_EP_REGS) : 0;          /* ep_regs (DOEPCTL3) */
+        out[2] = ep_h ? *(volatile uint32_t *)((uint8_t *)ep_h + ECOS_EP_STATE) : 0;         /* state+num */
+        out[3] = ep_h ? *(volatile uint32_t *)((uint8_t *)ep_h + ECOS_EP_FLAGS) : 0;         /* flags */
+        out[4] = ep_h ? *(volatile uint32_t *)((uint8_t *)ep_h + ECOS_EP_DMA_BUF_COPY) : 0;  /* dma_buf_copy */
+        out[5] = ep_h ? *(volatile uint32_t *)((uint8_t *)ep_h + ECOS_EP_DMA_SIZE_COPY) : 0; /* dma_size_copy */
+        /* Per-EP DWC2 register window (DOEPCTL3 / DOEPINT3 / DOEPTSIZ3 / DOEPDMA3 +
+         * shadow words at +0x4 / +0xC / +0x18 / +0x1C). */
+        uint32_t ep_regs = ep_h ? *(volatile uint32_t *)((uint8_t *)ep_h + ECOS_EP_REGS) : 0;
+        if (ep_regs) {
+            volatile uint32_t *r = (volatile uint32_t *)ep_regs;
+            out[6] = r[0];  out[7] = r[1];  out[8] = r[2];
+            out[9] = r[3];  out[10] = r[4]; out[11] = r[5];
+            out[12] = r[6]; out[13] = r[7];
         }
-        /* USB controller registers */
-        out[14] = *(volatile uint32_t *)0x90000818;  /* EP comp status */
-        out[15] = *(volatile uint32_t *)0x9000081C;  /* EP comp enable */
-        out[16] = *(volatile uint32_t *)0x90000810;  /* EP RX enable */
-        out[17] = *(volatile uint32_t *)0x90000028;  /* ENDPTLISTADDR */
+        /* DWC2 device-mode + global registers */
+        out[14] = USB_DAINT;
+        out[15] = USB_DAINTMSK;
+        out[16] = USB_DOEPMSK;
+        out[17] = USB_GNPTXFSIZ;
         dcp_send_response(0, body, 72);
         return;
     }
