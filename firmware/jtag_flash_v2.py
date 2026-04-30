@@ -22,6 +22,7 @@ import struct
 import subprocess
 import sys
 import time
+import zlib
 from pathlib import Path
 
 from jtag_common import DRIVER_V2_BIN
@@ -35,9 +36,9 @@ OPENOCD_CFG_SRST = ROOT / "jtag" / "miolink-dice3-openocd-srst.cfg"
 DRIVER_BIN = DRIVER_V2_BIN
 
 # Keep in sync with sram_flash_mailbox_v2.h.
-MBOX_ADDR        = 0x0002E000
-TIMINGS_ADDR     = 0x0002E180
-LOG_RING_ADDR    = 0x0002E200
+MBOX_ADDR        = 0x0002E400
+TIMINGS_ADDR     = 0x0002E580
+LOG_RING_ADDR    = 0x0002E600
 DATA_BUF_ADDR    = 0x0002B000
 IMAGE_BASE_ADDR  = 0x0002F900
 SECTOR_LIST_ADDR = 0x0002F100
@@ -163,6 +164,7 @@ O_MISS_DMA_ERR = 0x118
 O_MISS_DMA_RAW = 0x11C
 O_MISS_DMA_ENB = 0x120
 O_MISS_SPI_40  = 0x124
+O_HASH_RESULT  = 0x128
 
 STATUS_READY = 0
 STATUS_BUSY  = 1
@@ -184,6 +186,7 @@ CMD_FLASH_SECTOR = 10
 CMD_FLASH_BLOCK  = 11
 CMD_BYTE_PATCH   = 12
 CMD_READ_ID      = 13
+CMD_HASH_RANGE   = 14
 
 PHASE_NAMES = {
     0: "INIT", 1: "TEARDOWN", 2: "T0_ENABLE", 3: "IDLE", 4: "BP_CLEAR",
@@ -344,13 +347,34 @@ def ensure_crystal_clock(o):
           f"(CLK_PLL_OUTPUT=0x{pll_output_after:04x})")
 
 
+def maybe_drop_crystal(client, args):
+    """Run ensure_crystal_clock unless --no-crystal was passed.
+
+    Called right before any write op (bp_clear / erase / program) so reads
+    and CRC sweeps stay at PLL (matching the bootloader's CRC routine),
+    while writes drop to crystal (matching the user's XMODEM-validated
+    flash driver config).
+    """
+    if getattr(args, "drop_to_crystal", True):
+        ensure_crystal_clock(client.o)
+
+
 class FlashClientV2:
     def __init__(self, ocd, log_path=None):
         self.o = ocd
         self.log_path = log_path or "/tmp/flash_v2.log"
 
     # ── Driver lifecycle ──────────────────────────────────────
-    def load_driver(self, drop_to_crystal=True):
+    def load_driver(self, drop_to_crystal=False):
+        """Load the SRAM driver and bring it to READY.
+
+        drop_to_crystal: by default we no longer drop CPU to crystal here.
+        The bootloader's CRC routine runs at PLL on every successful boot,
+        so reads/hashes are validated at PLL and stay fast. The crystal
+        drop is invoked separately by maybe_drop_crystal() right before
+        any write op (bp_clear / erase / program), matching the user's
+        XMODEM-validated flash configuration.
+        """
         print("Loading v2 driver...")
         self.o.halt()
         host_teardown(self.o)
@@ -386,7 +410,7 @@ class FlashClientV2:
 
     # ── Command dispatch ──────────────────────────────────────
     def _issue(self, cmd, flash_addr=0, buf_addr=0, length=0, est_us=50_000,
-               poll_interval=0.05, overall_timeout=None):
+               poll_interval=0.05, overall_timeout=None, quiet=False):
         """Single command → poll phase/status → on ERR dump log ring."""
         if overall_timeout is None:
             overall_timeout = max(est_us / 1e6 * 4.0, 5.0)
@@ -410,7 +434,7 @@ class FlashClientV2:
             detail = self.o.mdw(MBOX_ADDR + O_PHASE_DETAIL)
             self.o.resume()
 
-            if seq != last_seq:
+            if seq != last_seq and not quiet:
                 print(f"  [{time.monotonic() - t_start:6.2f}s] "
                       f"status={status} phase={PHASE_NAMES.get(phase, phase)}"
                       f" detail={detail}")
@@ -421,7 +445,8 @@ class FlashClientV2:
                 elapsed = self.o.mdw(MBOX_ADDR + O_ELAPSED_US)
                 last_sr = self.o.mdw(MBOX_ADDR + O_LAST_SR)
                 self.o.resume()
-                print(f"  OK ({elapsed} µs, last_sr=0x{last_sr:02x})")
+                if not quiet:
+                    print(f"  OK ({elapsed} µs, last_sr=0x{last_sr:02x})")
                 return True
             if status == STATUS_ERR:
                 self._dump_error()
@@ -788,6 +813,55 @@ class FlashClientV2:
                            est_us=est_us,
                            overall_timeout=max(est_us / 1e6 * 2, 5.0))
 
+    def device_crc32(self, spi_addr, length, *, quiet=True,
+                     sector_buf_addr=0):
+        """CRC32 of [spi_addr, spi_addr+length) computed on-device by the
+        same ROM step routine the bootloader uses (poly 0xEDB88320, init=0,
+        no final XOR). Host equivalent: zlib.crc32(buf, ~0) ^ ~0.
+
+        If sector_buf_addr != 0, the driver also writes per-sector CRCs
+        (one u32 per V2_SECTOR_SIZE) to that SRAM address. length must
+        be a multiple of SECTOR_SIZE for batch mode.
+
+        Returns just the whole-range CRC. Caller must dump_image
+        sector_buf_addr separately if it wants the per-sector array.
+        """
+        if not quiet:
+            mode = "batch" if sector_buf_addr else "single"
+            print(f"hash 0x{spi_addr:06x} len={length} ({mode})...")
+        # Empirical: ~14 µs/byte at PLL (CLK_DIV_SPI=0, ~6 MHz SPI bus + per-
+        # chunk DMA setup), ~20 µs/byte at crystal. Batch mode adds a
+        # second CRC step per byte (~25% bump at PLL, ~1% at crystal since
+        # SPI dominates). Pad to 30 µs/byte plus a 1 s floor.
+        est_us = max(length * 30 + 1_000_000, 5_000)
+        ok = self._issue(CMD_HASH_RANGE, flash_addr=spi_addr,
+                         buf_addr=sector_buf_addr,
+                         length=length, est_us=est_us,
+                         overall_timeout=max(est_us / 1e6 * 2, 5.0),
+                         quiet=quiet)
+        if not ok:
+            raise RuntimeError(f"device_crc32(0x{spi_addr:06x}, {length}) failed")
+        self.o.halt()
+        v = self.o.mdw(MBOX_ADDR + O_HASH_RESULT)
+        self.o.resume()
+        return v & 0xFFFFFFFF
+
+    def device_crc32_batch(self, spi_addr, length, sector_buf_addr):
+        """One sweep that returns the whole-range CRC AND a list of
+        per-sector CRCs (one per V2_SECTOR_SIZE). Avoids the second pass
+        on the mismatch path."""
+        n_sectors = length // SECTOR_SIZE
+        if length % SECTOR_SIZE:
+            raise ValueError(
+                f"batch hash needs sector-aligned length, got {length}")
+        whole = self.device_crc32(spi_addr, length, quiet=True,
+                                  sector_buf_addr=sector_buf_addr)
+        self.o.halt()
+        raw = self.o.dump_image(sector_buf_addr, n_sectors * 4)
+        self.o.resume()
+        sec_crcs = list(struct.unpack(f"<{n_sectors}I", raw))
+        return whole, sec_crcs
+
     def read_id(self, mode="jedec"):
         """Exercise dma_rx + wait_dma_irq path on short bidir reads.
         mode='jedec' → cmd 0x9F, 3B response. mode='legacy' → cmd 0xAB, 1B.
@@ -965,6 +1039,59 @@ def plan_flash_ops(ref, image_size, block_threshold_64k=12,
     return ops
 
 
+def _zlib_rom_crc32(buf):
+    """Match the on-device ROM CRC32 step routine: poly 0xEDB88320, init=0,
+    no final XOR. Equivalent to zlib.crc32 with init/finalize cancelled
+    (zlib does ~init at start and ~result at end; passing 0xFFFFFFFF for
+    both inverts twice = identity)."""
+    return zlib.crc32(buf, 0xFFFFFFFF) ^ 0xFFFFFFFF
+
+
+def batch_diff(client, ref, sector_buf_addr=DATA_BUF_ADDR):
+    """Single device sweep that returns:
+      - whole-image match boolean
+      - set of differing sector start addresses (empty if matched)
+
+    Mirrors the bootloader's spi_dma_read_and_crc — one continuous
+    DMA+CRC run over the whole image — but additionally writes per-sector
+    CRCs to a host-readable SRAM buffer. Avoids the double-SPI-read of a
+    separate whole-image-then-per-sector flow on the mismatch path.
+    """
+    t0 = time.monotonic()
+    print(f"  batch CRC ({len(ref)} bytes, "
+          f"{len(ref) // SECTOR_SIZE} sectors)...")
+    whole_local = _zlib_rom_crc32(ref)
+    whole_dev, sec_crcs = client.device_crc32_batch(
+        0, len(ref), sector_buf_addr)
+    dt = time.monotonic() - t0
+    if whole_dev == whole_local:
+        print(f"  whole-image CRC match (0x{whole_local:08x}) in {dt:.1f}s")
+        return True, set()
+    diff = set()
+    for i, dev_crc in enumerate(sec_crcs):
+        addr = i * SECTOR_SIZE
+        local = _zlib_rom_crc32(ref[addr:addr + SECTOR_SIZE])
+        if local != dev_crc:
+            diff.add(addr)
+    print(f"  whole-image mismatch (local=0x{whole_local:08x}, "
+          f"device=0x{whole_dev:08x}); {len(diff)} sectors differ "
+          f"— sweep took {dt:.1f}s")
+    return False, diff
+
+
+def filter_ops_by_diff(ops, diff, sector_size=SECTOR_SIZE):
+    """Drop ops whose constituent sectors are all already-correct on
+    device. Preserves the density heuristic on top of the diff set:
+    a dense block op stays a single block op when any sector inside it
+    differs; an unchanged block op vanishes entirely."""
+    out = []
+    for kind, addr, span in ops:
+        sectors_in_op = range(addr, addr + span, sector_size)
+        if any(s in diff for s in sectors_in_op):
+            out.append((kind, addr, span))
+    return out
+
+
 def flash_all(client, args):
     """Flash every non-empty sector of --ref.
 
@@ -999,6 +1126,43 @@ def flash_all(client, args):
     print(f"  {non_empty // 1024} KB content, "
           f"plan: {kind_summary} ({len(ops)} commands)")
 
+    # CRC sweep (read-only) runs FIRST, at whatever clock the chip arrived
+    # in. The bootloader's CRC routine runs at PLL on every successful boot
+    # — same code path validates the SPI bus + DMA at PLL, so reads here
+    # are safe at PLL and fast. We only drop to crystal once we know we
+    # have ops to actually flash.
+    if args.diff and not args.sectors:
+        # ONE device sweep returns both whole-image CRC and per-sector
+        # CRCs. Idempotent re-flash exits after this single round-trip;
+        # mismatch case already has the per-sector localization in hand.
+        match, diff = batch_diff(client, ref)
+        if match:
+            print("\n=== flash-all done "
+                  "(image already matches device, whole-image CRC) ===")
+            return 0
+        if not diff:
+            # Whole-image said mismatch, per-sector says all-match.
+            # Shouldn't happen unless ref length isn't sector-aligned or
+            # there's a CRC implementation bug — fall through and flash
+            # everything per the original plan to be safe.
+            print("  ⚠ whole-image mismatch but per-sector found no diff "
+                  "— defaulting to full plan")
+        else:
+            before = len(ops)
+            ops = filter_ops_by_diff(ops, diff)
+            if not ops:
+                print(f"  diff filter: 0 of {before} ops needed (no-op)")
+                return 0
+            kinds_filt = {}
+            for k, *_ in ops: kinds_filt[k] = kinds_filt.get(k, 0) + 1
+            kind_filt = ", ".join(
+                f"{v}×{k}" for k, v in sorted(kinds_filt.items()))
+            print(f"  diff filter: {len(ops)} of {before} ops needed "
+                  f"({kind_filt})")
+
+    # About to write — drop CPU to crystal to match the user's XMODEM-
+    # validated flash configuration, then bp_clear (itself a WRSR write).
+    maybe_drop_crystal(client, args)
     if not client.bp_clear():
         return 1
 
@@ -1324,7 +1488,7 @@ def main(argv=None):
                                        "flash-all", "autonomous",
                                        "block-sector", "block-64k",
                                        "byte-test", "byte-only", "read-id",
-                                       "shift-repro"),
+                                       "shift-repro", "hash-range"),
                    default="test",
                    help="'test' = host-driven erase+program+verify on test sector, "
                         "'autonomous' = single V2_CMD_FLASH_SECTOR (4 KB only), "
@@ -1418,6 +1582,13 @@ def main(argv=None):
                         "the host writes 0xABCD0000 to 0xC900000C (PLL_OUTPUT) "
                         "with CPU halted, dropping CPU to crystal — matches "
                         "the TCAT-BOOT shell state where flash is known-good.")
+    p.add_argument("--no-diff", dest="diff",
+                   action="store_false", default=True,
+                   help="Skip the pre-flash per-sector CRC32 diff in flash-all. "
+                        "Default-on: sweep every sector with V2_CMD_HASH_RANGE "
+                        "(uses the bootloader's ROM CRC32 routine at 0x20000DA4) "
+                        "and only flash sectors whose CRC differs from --ref. "
+                        "Ignored when --sectors is given.")
     args = p.parse_args(argv)
 
     if not DRIVER_BIN.exists():
@@ -1463,7 +1634,13 @@ def main(argv=None):
                 ) from ex
             time.sleep(0.15)
         client = FlashClientV2(ocd)
-        client.load_driver(drop_to_crystal=args.drop_to_crystal)
+        # Crystal-drop deferred until just before any write op (see
+        # maybe_drop_crystal). Reads and CRC sweeps run at whatever clock
+        # the chip arrived in — PLL after a successful boot, crystal in
+        # TCAT-BOOT shell. The bootloader's CRC routine validates the
+        # SPI bus + DMA at PLL on every successful boot worldwide, so
+        # PLL reads are safe.
+        client.load_driver()
         if timing_overrides:
             client.set_timings(**timing_overrides)
         if args.show_timings:
@@ -1476,6 +1653,7 @@ def main(argv=None):
             rc = flash_all(client, args)
             return rc
         if args.mode == "autonomous":
+            maybe_drop_crystal(client, args)
             if not client.bp_clear():
                 raise SystemExit(1)
             pattern = bytes(((i * 37) & 0xFF) if (i % 257) else 0
@@ -1490,6 +1668,7 @@ def main(argv=None):
         if args.mode == "block-sector":
             # V2_CMD_FLASH_BLOCK with a single-sector (4 KB) payload —
             # exercises the auto-pick logic on its SE branch.
+            maybe_drop_crystal(client, args)
             if not client.bp_clear():
                 raise SystemExit(1)
             pattern = bytes(((i * 37) & 0xFF) if (i % 257) else 0
@@ -1508,6 +1687,7 @@ def main(argv=None):
             # image, safe).
             if args.test_sector & 0xFFFF:
                 raise SystemExit("--test-sector must be 64 KB-aligned for block-64k")
+            maybe_drop_crystal(client, args)
             if not client.bp_clear():
                 raise SystemExit(1)
             pattern = bytes(((i * 37) & 0xFF) if (i % 257) else 0
@@ -1531,11 +1711,28 @@ def main(argv=None):
             print(f"read-id: {'OK' if ok else 'FAIL'}")
             rc = 0 if ok else 1
             return rc
+        if args.mode == "hash-range":
+            # T4 verification: device CRC vs zlib-equivalent CRC of the
+            # same range read back via CMD_READ. They must match exactly.
+            addr = args.test_sector & ~0xFFF
+            length = SECTOR_SIZE
+            print(f"hash-range probe at 0x{addr:06x} len={length}...")
+            dev = client.device_crc32(addr, length, quiet=False)
+            host_buf = client.read(addr, length)
+            host = _zlib_rom_crc32(host_buf) if host_buf else None
+            print(f"  device CRC32 : 0x{dev:08x}")
+            print(f"  host   CRC32 : "
+                  f"{'0x' + format(host, '08x') if host is not None else 'READ FAIL'}")
+            ok = (host is not None and dev == host)
+            print(f"hash-range: {'OK' if ok else 'FAIL'}")
+            rc = 0 if ok else 1
+            return rc
         if args.mode == "byte-only":
             # Minimal: issue ONE BYTE_PRG at --byte-addr with --byte-val.
             # No bp_clear, no erase, no readback. For logic-analyzer probing.
             # On the wire you'll see: WREN (0x06) + BYTE_PRG (0x02 + 3B addr
             # + 1B data) + RDSR poll loop (0x05 + status until !BUSY).
+            maybe_drop_crystal(client, args)
             if not client.byte_patch(args.byte_addr, bytes([args.byte_val])):
                 raise SystemExit("byte_patch failed")
             print(f"byte-only: wrote 0x{args.byte_val:02x} @ 0x{args.byte_addr:06x}")
@@ -1555,6 +1752,7 @@ def main(argv=None):
             # whether the off-by-4 symptom survived the IRQ refactor.
             sector = args.byte_addr & ~0xFFF
             offset_in_sector = args.byte_addr & 0xFFF
+            maybe_drop_crystal(client, args)
             if not client.bp_clear():
                 raise SystemExit(1)
             if not client.erase(sector):
@@ -1582,6 +1780,7 @@ def main(argv=None):
             rc = _shift_repro(client, args)
             return rc
         if args.mode == "erase-only":
+            maybe_drop_crystal(client, args)
             ok = client.erase(args.test_sector)
         elif args.mode == "readback":
             data = client.read(args.test_sector, SECTOR_SIZE)
@@ -1595,6 +1794,7 @@ def main(argv=None):
                 ok = True
         else:
             # Full round-trip: erase → program known pattern → verify.
+            maybe_drop_crystal(client, args)
             if not client.bp_clear():
                 raise SystemExit(1)
             if not client.erase(args.test_sector):
