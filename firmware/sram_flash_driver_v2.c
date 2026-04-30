@@ -13,10 +13,10 @@
  * Layout (all fixed; host finds these via sram_flash_mailbox_v2.h):
  *   0x28000-0x29FFF  BIDIR_TX_BUF / RX_TEMP (flash read scratch)
  *   0x2B000-0x2BFFF  V2_DATA_BUF (single-sector source/dest, 4 KB)
- *   0x2C000-0x2DFFF  driver code
- *   0x2E000-0x2E0FF  V2_MBOX (mailbox)
- *   0x2E100-0x2E17F  TX_SCRATCH / RX_SCRATCH / misc
- *   0x2E200-0x2E7FF  V2_LOG_RING (128 × 12 B)
+ *   0x2C000-0x2E3FF  driver code (9 KB after V2_CMD_HASH_RANGE bump)
+ *   0x2E400-0x2E57F  V2_MBOX (mailbox)
+ *   0x2E580-0x2E5FF  V2_TIMINGS
+ *   0x2E600-0x2EBFF  V2_LOG_RING (128 × 12 B)
  *   0x2F100-0x2F8FF  V2_SECTOR_LIST
  *   0x2F900-0x7FFFF  V2_IMAGE_BASE
  *
@@ -1290,6 +1290,46 @@ static int do_read(uint32_t spi_addr, uint8_t *dest, uint32_t len) {
     return 0;
 }
 
+/* ROM CRC32 step routine — same one the TCAT bootloader uses
+ * (spi_dma_read_and_crc @ 0x4F32C calls *(ROM[0x10C]) = 0x20000DA4).
+ * Convention: poly 0xEDB88320 reflected, init=0, no final XOR. Host
+ * matches with `zlib.crc32(buf, ~0) ^ ~0`. */
+typedef uint32_t (*rom_crc_step_t)(uint32_t crc, const void *buf, uint32_t len);
+#define ROM_CRC_STEP ((rom_crc_step_t)0x20000DA4u)
+
+static int do_hash_range(uint32_t spi_addr, uint32_t len, uint32_t *out_crc,
+                         uint32_t *sec_buf) {
+    /* Reuse do_read into the 4 KB scratch at SRAM 0x0 — saves a duplicate
+     * chunk loop. Read errors come through as V2_ERR_READ_DMA.
+     *
+     * If sec_buf != NULL, also accumulate per-sector CRCs and write each
+     * one to sec_buf[i] when we cross a V2_SECTOR_SIZE boundary. With
+     * READ_CHUNK = 0x800 and V2_SECTOR_SIZE = 0x1000, exactly two chunks
+     * fit per sector — no need to split chunks. */
+    uint8_t *scratch = (uint8_t *)0x00000000u;
+    uint32_t crc = 0;
+    uint32_t sec_crc = 0;
+    uint32_t sec_off = 0;        /* bytes into the current sector */
+    uint32_t sec_idx = 0;        /* index into sec_buf */
+    for (uint32_t off = 0; off < len; off += READ_CHUNK) {
+        uint32_t chunk = len - off;
+        if (chunk > READ_CHUNK) chunk = READ_CHUNK;
+        if (do_read(spi_addr + off, scratch, chunk) != 0) return -1;
+        crc = ROM_CRC_STEP(crc, scratch, chunk);
+        if (sec_buf) {
+            sec_crc = ROM_CRC_STEP(sec_crc, scratch, chunk);
+            sec_off += chunk;
+            if (sec_off >= V2_SECTOR_SIZE) {
+                sec_buf[sec_idx++] = sec_crc;
+                sec_crc = 0;
+                sec_off = 0;
+            }
+        }
+    }
+    *out_crc = crc;
+    return 0;
+}
+
 static void verify_preflight_quiesce(void) {
     uint32_t mode = TIM->verify_quiesce_mode;
 
@@ -1591,6 +1631,14 @@ rid_done:
         if (rc != 0) set_error(V2_ERR_READ_DMA, MBOX->flash_addr, 0);
         break;
     }
+    case V2_CMD_HASH_RANGE: {
+        uint32_t crc = 0;
+        uint32_t *sec_buf = MBOX->buf_addr ?
+                            (uint32_t *)(uintptr_t)MBOX->buf_addr : (uint32_t *)0;
+        rc = do_hash_range(MBOX->flash_addr, MBOX->length, &crc, sec_buf);
+        MBOX->hash_result = crc;
+        break;
+    }
     default:
         set_error(V2_ERR_BAD_COMMAND, 0, (uint8_t)cmd);
         MBOX->elapsed_us = now_us() - op_start_us;
@@ -1620,7 +1668,7 @@ void do_main(void) {
     MBOX->seq          = 0;
     MBOX->log_head     = 0;
     MBOX->log_tail     = 0;
-    MBOX->build_tag    = 0x56324652u;   /* 'V2FR' marker */
+    MBOX->build_tag    = 0x56324648u;   /* 'V2FH' — adds V2_CMD_HASH_RANGE */
     init_timings_if_needed();
     /* Latch the AAI transport backend from the timings struct. The
      * default is DMA; host may set xport_mode=V2_XPORT_PIO before

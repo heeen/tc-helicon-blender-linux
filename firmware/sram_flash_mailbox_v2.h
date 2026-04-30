@@ -6,7 +6,7 @@
  * DEV fields are never touched by the host. This closes the init-race
  * v1 had where driver's do_main clobbered mb->command.
  *
- * The mailbox lives at SRAM 0x2E000 and the log ring at 0x2E200 (both
+ * The mailbox lives at SRAM 0x2E400 and the log ring at 0x2E600 (both
  * placed by sram_flash_driver_v2.ld). Do not change these addresses
  * without updating every host tool.
  */
@@ -16,9 +16,11 @@
 #include <stdint.h>
 
 /* ── Fixed SRAM addresses ─────────────────────────────────── */
-#define V2_MBOX_ADDR        0x0002E000u
-#define V2_TIMINGS_ADDR     0x0002E180u   /* 64 B, all DEV/HOST-R/W */
-#define V2_LOG_RING_ADDR    0x0002E200u
+#define V2_MBOX_ADDR        0x0002E400u   /* shifted +0x400 from v1 layout
+                                           * to free SRAM for driver text after
+                                           * V2_CMD_HASH_RANGE addition. */
+#define V2_TIMINGS_ADDR     0x0002E580u   /* 64 B, all DEV/HOST-R/W */
+#define V2_LOG_RING_ADDR    0x0002E600u
 #define V2_DATA_BUF_ADDR    0x0002B000u   /* single-sector source/dest */
 #define V2_IMAGE_BASE_ADDR  0x0002F900u   /* bulk sector payload */
 #define V2_SECTOR_LIST_ADDR 0x0002F100u
@@ -53,6 +55,22 @@
                                    * Result bytes land at buf_addr (DATA_BUF if host
                                    * doesn't set it). Diagnostic — confirms the full
                                    * DMA-RX + IRQ/polling fallback machinery works. */
+#define V2_CMD_HASH_RANGE   14u   /* CRC32 of [flash_addr, flash_addr+length).
+                                   * Calls bootloader's CRC32 step routine in ROM
+                                   * (0x20000DA4, fnptr at ROM+0x10C, poly
+                                   * 0xEDB88320, init=0, no final XOR — bit-for-bit
+                                   * the bootloader's spi_dma_read_and_crc).
+                                   * Result u32 in mb->hash_result.
+                                   * Host equivalent: zlib.crc32(buf, ~0) ^ ~0.
+                                   *
+                                   * If buf_addr != 0: BATCH mode. Driver writes
+                                   * per-sector CRCs (4 B each, V2_SECTOR_SIZE
+                                   * granularity) starting at buf_addr while folding
+                                   * the same bytes into the running whole-range CRC.
+                                   * Length must be a multiple of V2_SECTOR_SIZE.
+                                   * Lets host get both whole-image and per-sector
+                                   * diffs in a single sweep — no second pass on
+                                   * the mismatch path. */
 
 /* ── Status (DEV) ─────────────────────────────────────────── */
 #define V2_STATUS_READY     0u
@@ -130,6 +148,7 @@
 #define V2_ERR_BAD_COMMAND      0x0501
 #define V2_ERR_BAD_LENGTH       0x0502
 #define V2_ERR_BAD_ADDR         0x0503
+#define V2_ERR_HASH_READ        0x0601
 
 /* ── Mailbox struct (single-writer-per-field) ─────────────── */
 struct v2_mailbox {
@@ -257,6 +276,9 @@ struct v2_mailbox {
     volatile uint32_t miss_dma_rawerr;     /* +0x11C */
     volatile uint32_t miss_dma_enbldch;    /* +0x120 */
     volatile uint32_t miss_spi_40;         /* +0x124 */
+
+    /* CRC32 result for V2_CMD_HASH_RANGE. DEV writes once per command. */
+    volatile uint32_t hash_result;         /* +0x128 */
 };
 
 /* ── Log ring entry (12 bytes) ────────────────────────────── */
