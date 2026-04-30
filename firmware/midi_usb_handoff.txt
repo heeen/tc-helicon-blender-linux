@@ -1,6 +1,6 @@
 MIDI USB bulk endpoint (EP3 OUT) — current understanding
 ========================================================
-Last updated: 2026-04-20
+Last updated: 2026-04-22
 Repo: /home/florian/src-misc/helicon-blender
 
 Goal
@@ -8,6 +8,32 @@ Goal
 Make **USB MIDI host→device bulk OUT** (EP 0x03) work on the patched Blender
 firmware at High Speed. Device→host (MIDI TX / bulk IN) already works. FS
 speed also appears to work in stock firmware.
+
+2026-04-22 runtime delta (new evidence)
+---------------------------------------
+All findings below are from repeated power-cycle captures using
+`firmware/midi_timeout_diag.py --wait-for-power` and UART logs:
+
+- **Patched image is definitely running** (boot tag + handler prints).
+- EP3 handle is present and stable:
+  - `ep=0002A7E8`, `f=0002140C`, `fn0=0002140C fn4=00021DCC fn8=0001B9E4`
+- Host probe now intermittently writes one packet (`WROTE 4`) but most writes
+  still timeout.
+- Slot-gate fix is active and effective:
+  - before: `sl=03>03` (blocked)
+  - after:  `sl=00>00` and logs like `gate 03->00 aux 03->00`
+- EP flags low-byte fix is active:
+  - logs like `fl 00000200->00000202`
+- Despite those fixes, receive still does not arm:
+  - `pr=00000000` (EP prime reg)
+  - `tc=00000000` (trace start callback never called by stock path)
+  - no sustained RX progress (`q2` not transitioning to a stable receive flow)
+
+Current interpretation (2026-04-22):
+- The failure has moved upstream of qh/slot preparation.
+- We can set correct handle pointers/flags and clear slot gates, but firmware
+  still does not naturally invoke the EP3 OUT start callback path often enough
+  (or at all) to establish steady RX arming.
 
 2026-04-20 direction-label correction (READ THIS FIRST)
 -------------------------------------------------------
@@ -78,6 +104,11 @@ base 0x200)
 
 Patch framework current state (`firmware/patch/`)
 -------------------------------------------------
+- **UART EC1 / EC2 (periodic, ~4 s):** EC1 adds **`dm=`** `TCAT_DMA_CFG` (**`0x90000830`**)
+  and **`z6=`** EP0 OUT **QH[6]** (working OUT anchor). EC2 adds **`mps=`** (ep **+0x3C**)
+  and **`sl=`** / **`sq=`** — **EP3 controller-slot** bytes **`+0x1F8`>`+0x1FC`** and **QH ptr @
+  `+0x1F4`** from `(*(usb_midi_conn+4)) + 2×0x40` (same layout as `usb_hw_ep_read_start` OUT
+  branch). Compare **`sl`** gate vs **`ep_handle+0x20`** state in EC1 **`s=`**.
 - `boot_init` HS-skip patch at `0x19BE0` = `0xE1530003` (cmp r3,r3 always
   EQ) bypasses the "only arm MIDI at FS" check so that
   `usb_midi_set_interface_handler` runs the MIDI endpoint arming code at
@@ -158,11 +189,35 @@ firmware skips (hence the 0x19BE0 bypass bug) is incomplete — bypassing
 the check lets later code run, but something else is still missing or
 misconfigured that would transition the OUT QH to hardware-armed state.
 
+Root-cause narrowing addendum (2026-04-22)
+------------------------------------------
+Additional hypotheses tested with runtime evidence:
+
+- Rejected: wrong EP handle function pointer (`f`) for EP3 OUT.
+  Runtime repeatedly shows `f=0002140C` and boot one-shot logs show
+  `fn0=0002140C fn4=00021DCC fn8=0001B9E4`.
+- Rejected: slot gate stuck nonzero as sole blocker.
+  Runtime now shows `sl=00>00` after explicit clear path.
+- Rejected: flags low-byte mismatch as sole blocker.
+  Runtime logs show repeated `fl 00000200->00000202`.
+- Still confirmed: start trace callback is not invoked by normal flow:
+  `tc=00000000` across captures, even with EP handle/gate/flags corrected.
+
+Working conclusion:
+- HS MIDI RX path is failing at a control-flow stage before (or bypassing)
+  regular EP3 start callback invocation. Current best next step is to trace
+  where and why EP3 scheduling is suppressed after `usb_midi_rx_dispatch`.
+
 Suggested next-round investigation
 ----------------------------------
-1. **Decode TCAT reg `0x90000830`** — read as 0x0C100020 live, not in
-   dice_usb_regs.h yet. Possibly an OUT-direction arming register or
-   similar. Check xrefs in Ghidra, see when it's written.
+1. **TCAT reg `0x90000830` (DMA cfg)** — documented live value 0x0C100020 in
+   `firmware/dice3_usb_registers.md`. **`blender_primary_body.bin` has no
+   data-pool literal `0x0C100020` and no instruction uses offset `#0x830` from
+   `0x90000000` in a simple listing pass** — so this firmware image may never
+   poke it (boot ROM / one-shot init elsewhere, or table in another segment).
+   **`TCAT_DMA_CFG`** is now declared in `firmware/patch/dice_usb_regs.h` for
+   on-device dumps and UART probes. Next: compare **cold boot vs configured
+   HS** and **FS vs HS** after `usb_midi_set_interface_handler`.
 2. **Walk FS enumeration path vs HS.** FS works pre-patch. Find the
    divergence: what does FS path do at submit-time that HS doesn't?
    Specifically, after usb_midi_rx_start → dispatch → submit_transfer →
@@ -172,13 +227,20 @@ Suggested next-round investigation
    ACTIVE or a flag on the pointer). Maybe MIDI OUT needs a dTD to be
    allocated and linked; stock TCAT driver might be missing this for
    bulk OUT endpoints at HS.
-4. **Check `slot+0x1F8` byte vs read_start gate.** Live EP3 OUT has byte
-   at (controller-ctx slot +0x1F8) = 0x03 (the state byte). read_start's
-   OUT branch gates on this == 0. So if read_start tried to re-run, it
-   would bail. But initial call should have found 0 and completed. Need
-   to confirm via trace whether read_start's OUT branch fully ran for
-   EP3 OUT at HS.
-5. **Breakpoint trace.** Set a software bp at 0x2140C (start_transfer
+4. **`usb_hw_ep_read_start` (`0x2115C`) OUT slot state @ +0x1F8** — Decompilation
+   shows the OUT descriptor path only enters if **`(slot + 0x1F8) == 0`**; on
+   success it stores **2** there (not 3). The **`ep_handle +0x20` "state=3
+   (DMA_ACTIVE)"** in UART dumps is the **per-endpoint handle** field — do not
+   conflate with **`slot+0x1F8`** without mapping `0x2A7E8` → controller slot
+   base for EP3 OUT. If **`read_start` never ran** for MIDI EP at HS, QH caps
+   stay half-programmed relative to a control OUT path.
+5. **ISR OUT completion loop (`usb_hw_dsr_interrupt_dispatch` ~`0x22320`–`0x225D4`)** —
+   For each bit in the OUT completion mask, the ISR walks **dTD/QH state at
+   `slot+0x1F4`**, may call work that **re-sets QH[0] `| 0x84000000`** and
+   `usb_hw_ep_dma_continue`-like logic. If **EP3 never raises completion**, this
+   loop never feeds the hardware path that EP0 OUT sees — consistent with **q2=0 /
+   q6 stuck at idle** on EP3 OUT.
+6. **Breakpoint trace.** Set a software bp at 0x2140C (start_transfer
    entry) to confirm it's actually called for EP3 OUT. And at 0x20EAC
    (dma_start) to confirm IT's called with ep=EP3_OUT handle. And at
    0x2115C (read_start) to confirm IT ran its OUT branch to completion.
@@ -202,8 +264,9 @@ References in repo
 - `firmware/usb_dma_ep_ghidra.txt` — full ISR decomp, direction-convention
   reconciliation, ep_handle array map, live QH bank dumps with working vs
   broken comparison.
-- `firmware/patch/dice_usb_regs.h` — corrected TCAT register addresses
-  and bank labels (2026-04-20).
+- `firmware/patch/dice_usb_regs.h` — corrected TCAT register addresses,
+  bank labels, **`TCAT_DMA_CFG` @ +0x830** (2026-04-20).
+- `firmware/dice3_usb_registers.md` — live register snapshot incl. **0x830**.
 - `firmware/patch/handlers.c` — midi_loop_hook, boot_init with HS-skip
   patch, EC1/EC2 UART diagnostics.
 - `firmware/patch/dice_platform.h` — `USB_EP_TYPE_MIDI_RX`, MIDI EP helpers.

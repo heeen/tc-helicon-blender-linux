@@ -17,9 +17,9 @@
 
 /*
  * Scope: SPI flash + system DMA engine (0xCC…, 0x8000…). USB MIDI bulk OUT/RX
- * uses the USB device controller at 0x90000000 (ChipIdea-like + TCAT), QH banks,
- * and TCAT async prime at +0x834 — not SPI_DMAMD / DMA_TRG_* here. See
- * firmware/patch/dice_usb_regs.h and firmware/usb_dma_ep_ghidra.txt.
+ * uses the Synopsys DesignWare USB 2.0 OTG (DWC2) v3.20a controller at
+ * 0x90000000 — not SPI_DMAMD / DMA_TRG_* here. See firmware/patch/dice_usb_regs.h
+ * and firmware/dice3_usb_registers.md.
  */
 
 /* ──────────────────────────────────────────────────────────────
