@@ -7,9 +7,10 @@ Speaks the mailbox protocol defined in sram_flash_mailbox_v2.h:
   * Structured log ring dump on ERROR for postmortem without guessing.
 
 CLI:
-    python3 firmware/jtag_flash_v2.py --ref firmware/blender_spi_patched.bin \\
+    python3 firmware/blender_tool.py flash --ref firmware/blender_spi_patched.bin \\
         --speed 1000 --test-sector 0x3f000
-    python3 firmware/jtag_flash_v2.py --mode flash-all --nreset
+    python3 firmware/blender_tool.py flash --mode flash-all --nreset
+    python3 firmware/blender_tool.py flash --mode flash-all --reboot
 """
 from __future__ import annotations
 
@@ -23,12 +24,15 @@ import sys
 import time
 from pathlib import Path
 
+from jtag_common import DRIVER_V2_BIN
+from jtag_reboot import run_reboot
+
 FIRMWARE_DIR = Path(__file__).resolve().parent
 ROOT = FIRMWARE_DIR.parent
 OPENOCD_CFG = ROOT / "jtag" / "miolink-dice3-openocd.cfg"
 # Hardware nRST enabled — required for `reset halt` to pulse the target.
 OPENOCD_CFG_SRST = ROOT / "jtag" / "miolink-dice3-openocd-srst.cfg"
-DRIVER_BIN = FIRMWARE_DIR / "sram_flash_driver_v2.bin"
+DRIVER_BIN = DRIVER_V2_BIN
 
 # Keep in sync with sram_flash_mailbox_v2.h.
 MBOX_ADDR        = 0x0002E000
@@ -56,6 +60,7 @@ TIMING_FIELDS = (
     "erase_poll_budget_us",
     "xport_mode",
     "byte_prog_offset",
+    "verify_quiesce_mode",
 )
 XPORT_DMA = 0
 XPORT_PIO = 1
@@ -74,6 +79,7 @@ TIMING_DEFAULTS = {
     "erase_poll_budget_us":       500000,
     "xport_mode":                 XPORT_DMA,
     "byte_prog_offset":           0,
+    "verify_quiesce_mode":        2,
 }
 
 MAGIC_CMD = 0x4D324657  # 'M2FW'
@@ -194,6 +200,7 @@ EVT_NAMES = {
     0x30: "AAI_WREN", 0x31: "AAI_FIRST", 0x32: "AAI_PAIR",
     0x33: "AAI_BUSY_FAST", 0x34: "AAI_BUSY_POLL", 0x35: "AAI_WRDI",
     0x40: "VERIFY_OK", 0x41: "VERIFY_MISS", 0x42: "READ_CHUNK_SR",
+    0x43: "READ_CHUNK_WEL", 0x44: "READ_LONG_RDSR",
     0x50: "REPAIR_HIT",
     0x60: "DMA_TX_DONE", 0x61: "DMA_RX_DONE",
     0xF0: "TIMEOUT", 0xF1: "ABORT", 0xF2: "BAD_STATE",
@@ -297,16 +304,58 @@ def host_teardown(o):
     o.mww(0x90000014, 0xFFFFFFFF) # USBSTS: clear all
 
 
+def ensure_crystal_clock(o):
+    """Drop the chip to base-crystal clock — matches the TCAT-BOOT shell
+    state where flash is known-good 100%.
+
+    Mirrors the ROM boot-fail sequence (see dice3_clock_pll.md and
+    register_state_tcat-boot_*.md): one keyed write to PLL_OUTPUT
+    (0xC900000C = 0xABCD0000) disables the PLL. The hardware MUX
+    auto-falls-back to the crystal source — that's how the ROM survives
+    disabling its own clock at 0x20000B24 while running on PLL.
+
+    The driver's own peripheral_full_teardown() then forces CLK_DIV_SPI
+    (0xC9000014) to crystal-fallback for the SPI bus parent. Together
+    these two writes give us CPU + SPI on crystal, like TCAT-BOOT.
+
+    No-op if PLL output is already disabled. CPU must be halted before
+    the write; the post-write delay covers the clock-domain switch.
+    """
+    o.halt()
+    pll_config_before = o.mdw(0xC9000000)
+    pll_output_before = o.mdw(0xC900000C)
+    if pll_output_before == 0:
+        print(f"  PLL already disabled "
+              f"(CLK_PLL_CONFIG=0x{pll_config_before:04x}) — on crystal")
+        return
+    print(f"  Dropping to crystal: "
+          f"CLK_PLL_CONFIG=0x{pll_config_before:04x}, "
+          f"CLK_PLL_OUTPUT=0x{pll_output_before:04x} → 0")
+    o.mww(0xC900000C, 0xABCD0000)
+    time.sleep(0.05)  # let the clock-domain switch settle
+    pll_output_after = o.mdw(0xC900000C)
+    if pll_output_after != 0:
+        raise RuntimeError(
+            f"Failed to disable PLL output: read 0x{pll_output_after:04x}, "
+            f"expected 0. CPU may still be on PLL — flash from this state "
+            f"is not the validated TCAT-BOOT baseline."
+        )
+    print(f"  PLL disabled — CPU on crystal "
+          f"(CLK_PLL_OUTPUT=0x{pll_output_after:04x})")
+
+
 class FlashClientV2:
     def __init__(self, ocd, log_path=None):
         self.o = ocd
         self.log_path = log_path or "/tmp/flash_v2.log"
 
     # ── Driver lifecycle ──────────────────────────────────────
-    def load_driver(self):
+    def load_driver(self, drop_to_crystal=True):
         print("Loading v2 driver...")
         self.o.halt()
         host_teardown(self.o)
+        if drop_to_crystal:
+            ensure_crystal_clock(self.o)
         self.o.load_image(str(DRIVER_BIN), DRIVER_CODE_ADDR)
         # Zero the mailbox (HOST fields); driver only touches DEV fields.
         for off in (O_MAGIC, O_COMMAND, O_FLASH_ADDR, O_BUF_ADDR, O_LENGTH):
@@ -418,6 +467,11 @@ class FlashClientV2:
         miss_rdsr_bf = self.o.mdw(MBOX_ADDR + O_MISS_RDSR_BF)
         first_rdsr   = self.o.mdw(MBOX_ADDR + O_FIRST_RDSR)
         last_rdsr_af = self.o.mdw(MBOX_ADDR + O_LAST_RDSR_AF)
+        miss_dma_cmb = self.o.mdw(MBOX_ADDR + O_MISS_DMA_CMB)
+        miss_dma_err = self.o.mdw(MBOX_ADDR + O_MISS_DMA_ERR)
+        miss_dma_raw = self.o.mdw(MBOX_ADDR + O_MISS_DMA_RAW)
+        miss_dma_enb = self.o.mdw(MBOX_ADDR + O_MISS_DMA_ENB)
+        miss_spi_40  = self.o.mdw(MBOX_ADDR + O_MISS_SPI_40)
         last_chX_cfg = [self.o.mdw(MBOX_ADDR + off) for off in
                         (O_LAST_CH2_CFG, O_LAST_CH3_CFG, O_LAST_CH4_CFG,
                          O_LAST_CH5_CFG, O_LAST_CH6_CFG, O_LAST_CH7_CFG)]
@@ -431,6 +485,11 @@ class FlashClientV2:
         last_ch1_ctl = self.o.mdw(MBOX_ADDR + O_LAST_CH1_CTL)
         last_ch1_cfg = self.o.mdw(MBOX_ADDR + O_LAST_CH1_CFG)
         last_dma_en  = self.o.mdw(MBOX_ADDR + O_LAST_DMA_EN)
+        last_dma_cmb = self.o.mdw(MBOX_ADDR + O_LAST_DMA_CMB)
+        last_dma_err = self.o.mdw(MBOX_ADDR + O_LAST_DMA_ERR)
+        last_dma_raw = self.o.mdw(MBOX_ADDR + O_LAST_DMA_RAW)
+        last_dma_enb = self.o.mdw(MBOX_ADDR + O_LAST_DMA_ENB)
+        last_spi_40  = self.o.mdw(MBOX_ADDR + O_LAST_SPI_40)
         last_pre_st  = self.o.mdw(MBOX_ADDR + O_LAST_PRE_ST)
         last_pre_err = self.o.mdw(MBOX_ADDR + O_LAST_PRE_ERR)
         last_rx_h0   = self.o.mdw(MBOX_ADDR + O_LAST_RX_H0)
@@ -547,6 +606,16 @@ class FlashClientV2:
                         f"last=0x{last_dma_st:08x}\n")
                 f.write(f"miss_dma_en      = 0x{miss_dma_en:08x}   "
                         f"last=0x{last_dma_en:08x}\n")
+                f.write(f"miss_dma_comb    = 0x{miss_dma_cmb:08x}   "
+                        f"last=0x{last_dma_cmb:08x}\n")
+                f.write(f"miss_dma_errst   = 0x{miss_dma_err:08x}   "
+                        f"last=0x{last_dma_err:08x}\n")
+                f.write(f"miss_dma_rawerr  = 0x{miss_dma_raw:08x}   "
+                        f"last=0x{last_dma_raw:08x}\n")
+                f.write(f"miss_dma_enbldch = 0x{miss_dma_enb:08x}   "
+                        f"last=0x{last_dma_enb:08x}\n")
+                f.write(f"miss_spi_40      = 0x{miss_spi_40:08x}   "
+                        f"last=0x{last_spi_40:08x}\n")
                 f.write(f"miss_ch0_ctrl    = 0x{miss_ch0_ctl:08x}   "
                         f"({_decode_ctl(miss_ch0_ctl)})\n")
                 f.write(f"     last_ch0    = 0x{last_ch0_ctl:08x}   "
@@ -587,7 +656,9 @@ class FlashClientV2:
                       f"H={(miss_ch0_cfg>>18)&1} E={miss_ch0_cfg&1}  "
                       f"ch1 cfg A={(miss_ch1_cfg>>17)&1} "
                       f"H={(miss_ch1_cfg>>18)&1} E={miss_ch1_cfg&1}  "
-                      f"spi_err=0x{miss_spi_err:x}")
+                      f"spi_err=0x{miss_spi_err:x}  "
+                      f"dma_err=0x{miss_dma_err:x} raw=0x{miss_dma_raw:x} "
+                      f"enb=0x{miss_dma_enb:x}")
             f.write("#\n")
             f.write(f"{'t_us':>10} {'evt':<16} {'phase':<12} "
                     f"{'detail':>6} {'spi_addr':>10}\n")
@@ -604,6 +675,13 @@ class FlashClientV2:
                 detail_str = f"{detail:>6}"
                 if evt == 0x42:  # READ_CHUNK_SR — decode the detail field.
                     detail_str = f"ch{(detail>>8)&0xFF:>3} sr=0x{detail&0xFF:02x}"
+                elif evt == 0x43:  # READ_CHUNK_WEL — sanity after WREN.
+                    sr = detail & 0xFF
+                    detail_str = (f"ch{(detail>>8)&0xFF:>3} sr=0x{sr:02x} "
+                                  f"WEL={(sr>>1)&1}")
+                elif evt == 0x44:  # READ_LONG_RDSR — first two response bytes.
+                    detail_str = (f"b0=0x{((detail>>8)&0xFF):02x} "
+                                  f"b1=0x{detail&0xFF:02x}")
                 f.write(f"{t_us:>10} {ename:<16} {pname:<12} "
                         f"{detail_str:<15} 0x{spi:08x}\n")
         print(f"  error log → {path}")
@@ -1234,7 +1312,7 @@ def _shift_repro(client, args):
     return 0 if not misses else 2
 
 
-def main():
+def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--ref", default=str(FIRMWARE_DIR / "blender_spi_patched.bin"),
                    help="Reference SPI image for smoke tests")
@@ -1332,7 +1410,15 @@ def main():
     p.add_argument("--openocd-cfg", type=str, default="",
                    help="OpenOCD config file (default: miolink-dice3-openocd.cfg, "
                         "or -srst variant when --nreset is set)")
-    args = p.parse_args()
+    p.add_argument("--reboot", action="store_true",
+                   help="Run reboot strategy after a successful flash run.")
+    p.add_argument("--no-crystal", dest="drop_to_crystal",
+                   action="store_false", default=True,
+                   help="Skip the pre-flash PLL-disable step. Default-on: "
+                        "the host writes 0xABCD0000 to 0xC900000C (PLL_OUTPUT) "
+                        "with CPU halted, dropping CPU to crystal — matches "
+                        "the TCAT-BOOT shell state where flash is known-good.")
+    args = p.parse_args(argv)
 
     if not DRIVER_BIN.exists():
         raise SystemExit(f"ERROR: driver binary not found: {DRIVER_BIN}. "
@@ -1364,6 +1450,7 @@ def main():
         ocd_cfg = OPENOCD_CFG
 
     ocd = OpenOCD(speed=args.speed, openocd_cfg=ocd_cfg)
+    rc = 1
     try:
         if args.nreset:
             print("nRESET: reset halt (target should stop at reset vector)...")
@@ -1376,16 +1463,18 @@ def main():
                 ) from ex
             time.sleep(0.15)
         client = FlashClientV2(ocd)
-        client.load_driver()
+        client.load_driver(drop_to_crystal=args.drop_to_crystal)
         if timing_overrides:
             client.set_timings(**timing_overrides)
         if args.show_timings:
             t = client.read_timings()
             for k, v in t.items():
                 print(f"  {k} = {v}")
-            return 0
+            rc = 0
+            return rc
         if args.mode == "flash-all":
-            return flash_all(client, args)
+            rc = flash_all(client, args)
+            return rc
         if args.mode == "autonomous":
             if not client.bp_clear():
                 raise SystemExit(1)
@@ -1396,7 +1485,8 @@ def main():
             dt = time.monotonic() - t0
             print(f"autonomous flash_sector: {dt:.2f}s wall, "
                   f"{'OK' if ok else 'FAIL'}")
-            return 0 if ok else 1
+            rc = 0 if ok else 1
+            return rc
         if args.mode == "block-sector":
             # V2_CMD_FLASH_BLOCK with a single-sector (4 KB) payload —
             # exercises the auto-pick logic on its SE branch.
@@ -1409,7 +1499,8 @@ def main():
             dt = time.monotonic() - t0
             print(f"flash_block(4 KB): {dt:.2f}s wall, "
                   f"{'OK' if ok else 'FAIL'}")
-            return 0 if ok else 1
+            rc = 0 if ok else 1
+            return rc
         if args.mode == "block-64k":
             # FLASH_BLOCK with a 64 KB payload — auto-pick → BE64.
             # --test-sector must be 64 KB-aligned and pointing at an
@@ -1426,7 +1517,8 @@ def main():
             dt = time.monotonic() - t0
             print(f"flash_block(64 KB): {dt:.2f}s wall, "
                   f"{'OK' if ok else 'FAIL'}")
-            return 0 if ok else 1
+            rc = 0 if ok else 1
+            return rc
         if args.mode == "read-id":
             jedec = client.read_id(mode="jedec")
             legacy = client.read_id(mode="legacy")
@@ -1437,7 +1529,8 @@ def main():
             ok = (jedec == bytes.fromhex("bf2541")
                   and legacy == bytes.fromhex("bf"))
             print(f"read-id: {'OK' if ok else 'FAIL'}")
-            return 0 if ok else 1
+            rc = 0 if ok else 1
+            return rc
         if args.mode == "byte-only":
             # Minimal: issue ONE BYTE_PRG at --byte-addr with --byte-val.
             # No bp_clear, no erase, no readback. For logic-analyzer probing.
@@ -1453,7 +1546,8 @@ def main():
             al =  args.byte_addr        & 0xFF
             print(f"  2. BYTE_PRG: 02 {ah:02x} {am:02x} {al:02x} {args.byte_val:02x}")
             print(f"  3. RDSR    : 05 XX (poll until !BUSY)  [repeats]")
-            return 0
+            rc = 0
+            return rc
         if args.mode == "byte-test":
             # Isolate BYTE_PROGRAM landing offset: erase the containing
             # sector, write one byte at --byte-addr, read the sector
@@ -1482,9 +1576,11 @@ def main():
             expected = [(offset_in_sector, args.byte_val)]
             ok = hits == expected
             print(f"byte-test: {'OK' if ok else 'FAIL'}")
-            return 0 if ok else 1
+            rc = 0 if ok else 1
+            return rc
         if args.mode == "shift-repro":
-            return _shift_repro(client, args)
+            rc = _shift_repro(client, args)
+            return rc
         if args.mode == "erase-only":
             ok = client.erase(args.test_sector)
         elif args.mode == "readback":
@@ -1511,9 +1607,16 @@ def main():
                 raise SystemExit(1)
             print("ALL GOOD.")
             ok = True
-        return 0 if ok else 1
+        rc = 0 if ok else 1
+        return rc
     finally:
         ocd.close()
+        if args.reboot and rc == 0:
+            print("Post-flash reboot via shared reboot path...")
+            reboot_rc = run_reboot(speed=args.speed, classify=True)
+            if reboot_rc != 0:
+                print(f"WARNING: post-flash reboot failed ({reboot_rc})", file=sys.stderr)
+                raise SystemExit(reboot_rc)
 
 
 if __name__ == "__main__":

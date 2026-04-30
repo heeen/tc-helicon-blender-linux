@@ -1,99 +1,87 @@
 #!/usr/bin/env python3
-"""Upload reboot stub to SRAM and execute it via JTAG.
+"""Upload reboot stub to SRAM and execute it via JTAG."""
 
-Usage:
-    python3 firmware/jtag_reboot.py
-"""
-
-import socket
-import subprocess
-import sys
+import argparse
 import time
-from pathlib import Path
 
-FIRMWARE_DIR = Path(__file__).parent
-OPENOCD_CFG = FIRMWARE_DIR.parent / "jtag" / "miolink-dice3-openocd.cfg"
-REBOOT_BIN = FIRMWARE_DIR / "reboot_stub.bin"
-REBOOT_ADDR = 0x2B000
-
-
-class OpenOCD:
-    def __init__(self, speed=1000):
-        subprocess.run(["pkill", "-x", "openocd"], capture_output=True)
-        time.sleep(0.5)
-        self.proc = subprocess.Popen(
-            ["openocd", "-f", str(OPENOCD_CFG)],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-        time.sleep(3)
-        self.sock = socket.create_connection(("localhost", 6666), timeout=30)
-        self.cmd(f"adapter speed {speed}")
-
-    def close(self):
-        try:
-            self.cmd("resume")
-        except Exception:
-            pass
-        self.sock.close()
-        self.proc.terminate()
-        self.proc.wait(timeout=5)
-
-    def cmd(self, c, timeout=30):
-        self.sock.settimeout(timeout)
-        self.sock.sendall((c + "\x1a").encode())
-        buf = b""
-        while b"\x1a" not in buf:
-            buf += self.sock.recv(4096)
-        return buf.decode().strip("\x1a").strip()
-
-    def halt(self):
-        self.cmd("halt")
-
-    def resume(self):
-        self.cmd("resume")
-
-    def load_image(self, path, addr):
-        self.cmd(f"load_image {path} {addr:#010x} bin")
+from jtag_common import (
+    REBOOT_ADDR,
+    REBOOT_BIN,
+    REBOOT_ELF,
+    REBOOT_STACK,
+    BOOTLOADER_START,
+    BOOTLOADER_END,
+    OpenOCDSession,
+    classify_pc,
+    read_elf_entry,
+)
 
 
-def main():
-    if not REBOOT_BIN.exists():
-        print(f"ERROR: {REBOOT_BIN} not found. Build with:")
-        print("  cd firmware && arm-none-eabi-gcc -march=armv5te -marm -Os -nostdlib "
-              "-ffreestanding -Wl,-Ttext=0x2B000 -Wl,--entry=reboot_entry "
-              "-o reboot_stub.elf reboot_stub.c && "
-              "arm-none-eabi-objcopy -O binary reboot_stub.elf reboot_stub.bin")
-        sys.exit(1)
+def run_reboot(speed=1000, classify=True, settle=2.0):
+    if not REBOOT_BIN.exists() or not REBOOT_ELF.exists():
+        print(f"ERROR: missing reboot artifacts: {REBOOT_BIN} / {REBOOT_ELF}")
+        return 1
 
     print(f"Reboot stub: {REBOOT_BIN} ({REBOOT_BIN.stat().st_size} bytes)")
+    entry = read_elf_entry(REBOOT_ELF)
 
-    o = OpenOCD()
+    o = OpenOCDSession(speed=speed)
     try:
+        o.resume()
+        time.sleep(0.05)
         print("Halting CPU...")
         o.halt()
-
-        # Get entry point from ELF
-        import struct as st
-        with open(FIRMWARE_DIR / "reboot_stub.elf", "rb") as f:
-            f.seek(0x18)  # e_entry offset in ELF32
-            entry = st.unpack("<I", f.read(4))[0]
         print(f"Loading stub to {REBOOT_ADDR:#x}, entry at {entry:#x}")
-
         o.load_image(str(REBOOT_BIN), REBOOT_ADDR)
 
-        # Invalidate I-cache so CPU fetches fresh code
         o.cmd("arm mcr 15 0 7 5 0 0")
+        o.reg_set("pc", entry)
+        o.reg_set("cpsr", 0xD3)
+        for reg_name in ("sp", "sp_svc", "sp_usr", "sp_irq", "sp_abt", "sp_und"):
+            try:
+                o.reg_set(reg_name, REBOOT_STACK)
+            except Exception:
+                pass
 
-        # Set entry point and SVC mode
-        o.cmd(f"reg pc {entry:#x}")
-        o.cmd("reg cpsr 0xd3")
-
-        print("Resuming — watch UART for [reboot] messages...")
+        print("Resuming reboot stub...")
         o.resume()
+        time.sleep(settle)
 
+        if not classify:
+            return 0
+
+        samples = []
+        for wait_s in (1.0, 3.0, 6.0):
+            time.sleep(wait_s)
+            o.halt()
+            pc = o.reg_get("pc")
+            cpsr = o.reg_get("cpsr")
+            samples.append((wait_s, pc, cpsr, classify_pc(pc)))
+            o.resume()
+
+        print("Reboot state samples:")
+        for wait_s, pc, cpsr, tag in samples:
+            print(f"  +{wait_s:>4.1f}s pc=0x{pc:08x} cpsr=0x{cpsr:08x} ({tag})")
+
+        last_pc = samples[-1][1]
+        if BOOTLOADER_START <= last_pc < BOOTLOADER_END:
+            print("ERROR: bootloader_stuck (post-reboot PC stayed in 0x4F000 range)")
+            return 2
+        return 0
     finally:
         o.close()
 
 
+def main(argv=None):
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--speed", type=int, default=1000, help="JTAG speed in kHz")
+    p.add_argument("--no-classify", action="store_true",
+                   help="Skip post-reboot PC state classification")
+    p.add_argument("--settle", type=float, default=2.0,
+                   help="Seconds to wait immediately after resume")
+    args = p.parse_args(argv)
+    return run_reboot(speed=args.speed, classify=not args.no_classify, settle=args.settle)
+
+
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

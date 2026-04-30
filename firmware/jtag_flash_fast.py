@@ -228,8 +228,23 @@ class OpenOCD:
         self.cmd(f"mww {addr:#x} {val:#x}")
 
     def mdw(self, addr):
-        r = self.cmd(f"mdw {addr:#x}")
-        return int(r.split()[-1], 16)
+        # Retry once — OpenOCD's mdw can return empty output if the target
+        # wasn't fully halted yet (e.g. right after attach or after a halt
+        # racing with an in-flight transfer).
+        for attempt in range(3):
+            r = self.cmd(f"mdw {addr:#x}")
+            parts = r.split()
+            if parts:
+                try:
+                    return int(parts[-1], 16)
+                except ValueError:
+                    pass
+            if attempt == 2:
+                raise RuntimeError(
+                    f"mdw {addr:#x} returned {r!r} — target may not be halted"
+                )
+            self.cmd("halt")
+            time.sleep(0.05)
 
     def load_image(self, path, addr):
         r = self.cmd(f"load_image {path} {addr:#x} bin", timeout=120)
@@ -243,6 +258,46 @@ def send_cmd(o, cmd, spi_addr=0):
     o.mww(MAILBOX + MB_SPI_ADDR, spi_addr)
     o.mww(MAILBOX + MB_COMMAND, cmd)
     o.resume()
+
+
+def ensure_crystal_clock(o):
+    """Drop the chip to base-crystal clock — matches the TCAT-BOOT shell
+    state where flash is known-good 100%.
+
+    Mirrors the ROM boot-fail sequence (see dice3_clock_pll.md and
+    register_state_tcat-boot_*.md): one keyed write to PLL_OUTPUT
+    (0xC900000C = 0xABCD0000) disables the PLL. The hardware MUX
+    auto-falls-back to the crystal source — that's how the ROM survives
+    disabling its own clock at 0x20000B24 while running on PLL.
+
+    The driver's own peripheral_full_teardown() then forces CLK_DIV_SPI
+    (0xC9000014) to crystal-fallback for the SPI bus parent. Together
+    these two writes give us CPU + SPI on crystal, like TCAT-BOOT.
+
+    No-op if PLL output is already disabled. CPU must be halted before
+    the write; the post-write delay covers the clock-domain switch.
+    """
+    o.halt()
+    pll_config_before = o.mdw(0xC9000000)
+    pll_output_before = o.mdw(0xC900000C)
+    if pll_output_before == 0:
+        print(f"  PLL already disabled "
+              f"(CLK_PLL_CONFIG=0x{pll_config_before:04x}) — on crystal")
+        return
+    print(f"  Dropping to crystal: "
+          f"CLK_PLL_CONFIG=0x{pll_config_before:04x}, "
+          f"CLK_PLL_OUTPUT=0x{pll_output_before:04x} → 0")
+    o.mww(0xC900000C, 0xABCD0000)
+    time.sleep(0.05)  # let the clock-domain switch settle
+    pll_output_after = o.mdw(0xC900000C)
+    if pll_output_after != 0:
+        raise RuntimeError(
+            f"Failed to disable PLL output: read 0x{pll_output_after:04x}, "
+            f"expected 0. CPU may still be on PLL — flash from this state "
+            f"is not the validated TCAT-BOOT baseline."
+        )
+    print(f"  PLL disabled — CPU on crystal "
+          f"(CLK_PLL_OUTPUT=0x{pll_output_after:04x})")
 
 
 def host_reboot_style_teardown(o):
@@ -335,7 +390,10 @@ def wait_cmd(o, timeout=60):
 def main():
     p = argparse.ArgumentParser(description="Fast autonomous JTAG flash writer")
     p.add_argument("--ref", default=str(FIRMWARE_DIR / "blender_spi_flash_restored.bin"))
-    p.add_argument("--speed", type=int, default=10000)
+    p.add_argument("--speed", type=int, default=1000,
+                   help="JTAG adapter clock in kHz (default 1000). 10000 often "
+                        "starts with RDSR=0xFFFF on this setup; 400 is stable "
+                        "but slow; 1000 is the sweet spot.")
     p.add_argument("--reboot", action="store_true",
                    help="Attempt soft reboot after flashing")
     p.add_argument("--ignore-errors", action="store_true",
@@ -353,6 +411,12 @@ def main():
     p.add_argument("--no-host-teardown", action="store_true",
                    help="Skip host-side reboot-style USB/DMA/SPI/VIC teardown "
                    "(driver still runs on-device pre_flash_teardown)")
+    p.add_argument("--no-crystal", dest="drop_to_crystal",
+                   action="store_false", default=True,
+                   help="Skip the pre-flash PLL-disable step. Default-on: "
+                        "the host writes 0xABCD0000 to 0xC900000C (PLL_OUTPUT) "
+                        "with CPU halted, dropping CPU to crystal — matches "
+                        "the TCAT-BOOT shell state where flash is known-good.")
     args = p.parse_args()
 
     spi = Path(args.ref).read_bytes()
@@ -405,6 +469,10 @@ def main():
             print("\nDisabling USB (minimal)...")
             o.mww(0x90000008, 0)
             o.mww(0x90000014, 0xFFFFFFFF)
+
+        if args.drop_to_crystal:
+            print("\nEnsuring base-crystal clock (TCAT-BOOT-equivalent)...")
+            ensure_crystal_clock(o)
 
         # Load driver once (driver configures PLL internally if needed)
         print("Loading driver...")
