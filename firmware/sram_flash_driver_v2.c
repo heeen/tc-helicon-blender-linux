@@ -60,8 +60,23 @@ static void init_timings_if_needed(void) {
 #define LOG_RING  ((struct v2_log_entry *)V2_LOG_RING_ADDR)
 #define DATA_BUF  ((uint8_t *)V2_DATA_BUF_ADDR)
 
-#define TX_SCRATCH  ((volatile uint8_t *)0x0002E100u)
-#define RX_SCRATCH  ((volatile uint8_t *)0x0002E120u)
+/* TX_SCRATCH / RX_SCRATCH must live OUTSIDE the linker-managed driver
+ * region (`.text + .data + .bss`, currently 0x2C000-0x2E3FF). The
+ * historical 0x2E100/0x2E120 placement was inside .bss territory —
+ * when the driver grew (e.g. adding any new BSS-resident variable),
+ * the compiler-emitted .bss zero-fill at startup would clobber
+ * TX_SCRATCH[0..3], silently sending opcode 0x00 to flash on every
+ * dma_rx call. Symptom: JEDEC ID returned 0xffffff, RDSR readbacks
+ * showed bogus 0xef. Diagnosed 2026-05-01 — the "+2B verify shift"
+ * we'd been characterizing was actually a +4B (one full FIFO word)
+ * shift contaminated by RDSR/AAI-busy-poll running on bogus state.
+ *
+ * Park the scratches well below BIDIR_TX_BUF in unused SRAM — the
+ * bus scan in dice3_address_map.md confirms 0x00000-0x2AFFF is
+ * fixture-free.
+ */
+#define TX_SCRATCH  ((volatile uint8_t *)0x00029F00u)
+#define RX_SCRATCH  ((volatile uint8_t *)0x00029F40u)
 #define TX_SCRATCH_MAX  16
 
 typedef struct {
