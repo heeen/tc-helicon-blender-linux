@@ -62,9 +62,13 @@ TIMING_FIELDS = (
     "xport_mode",
     "byte_prog_offset",
     "verify_quiesce_mode",
+    "log_silent",
+    "read_mode",
 )
 XPORT_DMA = 0
 XPORT_PIO = 1
+READ_MODE_BIDIR  = 0
+READ_MODE_RXONLY = 1
 TIMING_DEFAULTS = {
     "aai_pair_fixed_us":          10,
     "aai_pair_poll_interval_us":  5,
@@ -80,7 +84,9 @@ TIMING_DEFAULTS = {
     "erase_poll_budget_us":       500000,
     "xport_mode":                 XPORT_DMA,
     "byte_prog_offset":           0,
-    "verify_quiesce_mode":        2,
+    "verify_quiesce_mode":        0,
+    "log_silent":                 0,
+    "read_mode":                  READ_MODE_BIDIR,
 }
 
 MAGIC_CMD = 0x4D324657  # 'M2FW'
@@ -347,6 +353,37 @@ def ensure_crystal_clock(o):
           f"(CLK_PLL_OUTPUT=0x{pll_output_after:04x})")
 
 
+def ensure_pll_clock(o):
+    """Re-enable PLL output after a prior ensure_crystal_clock disable.
+
+    Used by --cpu-clock=pll/toggle in shift-repro to flip CPU/AHB clock
+    state and observe the +2B verify-shift failure rate as a function of
+    DMA-controller clock domain. Crystal: ~12 MHz CPU/AHB; PLL: 196 MHz
+    derived from the bootloader's PLL_CONFIG=0x8364 (M=100, N=3 → 400 MHz
+    VCO with /2 post-divide).
+
+    Writes 0xABCD8001 to PLL_OUTPUT — the inverse of ensure_crystal_clock.
+    Bit 15 = enable, bits 3:0 = source select 1 (PLL output, vs 0 = bypass).
+    """
+    o.halt()
+    pll_output_before = o.mdw(0xC900000C)
+    if pll_output_before != 0:
+        print(f"  PLL already enabled "
+              f"(CLK_PLL_OUTPUT=0x{pll_output_before:04x}) — on PLL")
+        return
+    print(f"  Re-enabling PLL: CLK_PLL_OUTPUT=0x{pll_output_before:04x} → 0x8001")
+    o.mww(0xC900000C, 0xABCD8001)
+    time.sleep(0.05)
+    pll_output_after = o.mdw(0xC900000C)
+    if pll_output_after == 0:
+        raise RuntimeError(
+            f"Failed to enable PLL output: read 0x{pll_output_after:04x}, "
+            f"expected nonzero."
+        )
+    print(f"  PLL enabled — CPU on PLL "
+          f"(CLK_PLL_OUTPUT=0x{pll_output_after:04x})")
+
+
 def maybe_drop_crystal(client, args):
     """Run ensure_crystal_clock unless --no-crystal was passed.
 
@@ -384,6 +421,11 @@ class FlashClientV2:
         # Zero the mailbox (HOST fields); driver only touches DEV fields.
         for off in (O_MAGIC, O_COMMAND, O_FLASH_ADDR, O_BUF_ADDR, O_LENGTH):
             self.o.mww(MBOX_ADDR + off, 0)
+        # Zero v2_timings.magic so the driver re-runs init_timings_if_needed
+        # and picks up the current build's defaults — otherwise stale values
+        # from a prior driver-load session persist (the magic survives in
+        # SRAM across driver reloads). 2026-05-01.
+        self.o.mww(TIMINGS_ADDR, 0)
         # Invalidate caches so driver sees clean SRAM.
         self.o.cmd("arm mcr 15 0 7 5 0 0")
         self.o.cmd("arm mcr 15 0 7 6 0 0")
@@ -1433,10 +1475,21 @@ def _shift_repro(client, args):
                 got4 = miss_got.to_bytes(4, "little")
                 exp4 = miss_exp.to_bytes(4, "little")
                 shift_hint = ""
-                for s in (1, 2, 3, 4):
-                    if got4[0] == exp4[s] if s < 4 else False:
+                for s in (1, 2, 3):
+                    if got4[0] == exp4[s]:
                         shift_hint = f" +{s}B shift"
                         break
+                else:
+                    # Off-buffer shift (got[0] beyond exp's 4-byte
+                    # window). Probe the synthesized pattern for a
+                    # match up to +8 bytes — TX_SCRATCH fix exposed
+                    # post-AAI shifts of +4 (one full word).
+                    for s in range(4, 9):
+                        target = miss_off + s
+                        if target + 4 <= len(expected) \
+                                and expected[target:target+4] == got4:
+                            shift_hint = f" +{s}B shift"
+                            break
                 print(f"  iter {i}: DEVICE VERIFY_MISS @0x{miss_off:x}"
                       f"  got={got4.hex(' ')} exp={exp4.hex(' ')}"
                       f"{shift_hint}")
@@ -1449,8 +1502,9 @@ def _shift_repro(client, args):
         got4 = data[first:first+4].ljust(4, b'\x00')
         exp4 = expected[first:first+4].ljust(4, b'\x00')
         shift_hint = ""
-        for s in (1, 2, 3, 4):
-            if first + s < length and got4[0] == expected[first + s]:
+        for s in range(1, 9):
+            if first + s + 4 <= length and \
+                    expected[first + s:first + s + 4] == got4:
                 shift_hint = f" +{s}B shift"
                 break
         print(f"  iter {i}: MISS @0x{first:04x} (dec {first})"
@@ -1557,6 +1611,37 @@ def main(argv=None):
                         "4096 exercises 2 back-to-back dma_bidir_reads per iter.")
     p.add_argument("--repro-iters", type=int, default=200,
                    help="shift-repro: number of read iterations (default 200)")
+    p.add_argument("--repro-variant",
+                   choices=("bidir", "rxonly"),
+                   default="bidir",
+                   help="shift-repro: which read backend to exercise. "
+                        "'bidir' (default) = current dma_bidir_read "
+                        "(DMAMD=3, has +4B post-AAI shift bug). "
+                        "'rxonly' = dma_rxonly_read mirroring the ROM "
+                        "bootloader's read path (DMAMD=1, CTRL=0x307, "
+                        "cmd via PIO DATA-register writes, RX-DMA "
+                        "from DATA register). Bypasses the bidir FIFO "
+                        "packer state.")
+    p.add_argument("--cpu-clock",
+                   choices=("as-is", "crystal", "pll"),
+                   default="as-is",
+                   help="shift-repro: force CPU/AHB clock state before the "
+                        "loop. 'as-is' (default) leaves whatever the chip "
+                        "arrived in. 'crystal' drops PLL_OUTPUT (CPU ~12 MHz). "
+                        "'pll' re-enables PLL (CPU ~196 MHz). Diagnostic for "
+                        "the +2B shift's correlation with CPU/AHB-clock-tied "
+                        "DMA controller speed.")
+    p.add_argument("--clk-div-spi", type=lambda x: int(x, 0), default=None,
+                   metavar="VAL",
+                   help="shift-repro: write VAL to CLK_DIV_SPI (0xC9000014) "
+                        "after timings are set. Use 0x8000+div to tie SPI parent "
+                        "to PLL with the given post-PLL divider (e.g. 0x8022 = "
+                        "200MHz/34 ≈ 6 MHz IP parent → 3 MHz wire after SPI_CLK=2). "
+                        "0x0000 = crystal fallback (the driver's default). Pair "
+                        "with --timing verify_quiesce_mode=0 so the driver does "
+                        "NOT reset CLK_DIV_SPI back to crystal between reads. "
+                        "Tests the user hypothesis: does the shift go away when "
+                        "SPI parent and AHB/DMA both run from PLL?")
     p.add_argument("--byte-addr", type=lambda x: int(x, 0), default=0x3F020,
                    help="byte-test: target SPI address for the single-byte write")
     p.add_argument("--byte-val", type=lambda x: int(x, 0), default=0x5A,
@@ -1607,6 +1692,8 @@ def main(argv=None):
         timing_overrides[name] = int(val.strip(), 0)
     if args.xport is not None:
         timing_overrides["xport_mode"] = XPORT_PIO if args.xport == "pio" else XPORT_DMA
+    if getattr(args, "repro_variant", "bidir") == "rxonly":
+        timing_overrides["read_mode"] = READ_MODE_RXONLY
 
     if args.openocd_cfg:
         ocd_cfg = Path(args.openocd_cfg)
@@ -1777,6 +1864,18 @@ def main(argv=None):
             rc = 0 if ok else 1
             return rc
         if args.mode == "shift-repro":
+            cpu_clock = getattr(args, "cpu_clock", "as-is")
+            if cpu_clock == "crystal":
+                ensure_crystal_clock(client.o)
+            elif cpu_clock == "pll":
+                ensure_pll_clock(client.o)
+            if args.clk_div_spi is not None:
+                client.o.halt()
+                before = client.o.mdw(0xC9000014)
+                client.o.mww(0xC9000014, 0xABCD0000 | (args.clk_div_spi & 0xFFFF))
+                after = client.o.mdw(0xC9000014)
+                client.o.resume()
+                print(f"  CLK_DIV_SPI: 0x{before:04x} → 0x{after:04x}")
             rc = _shift_repro(client, args)
             return rc
         if args.mode == "erase-only":

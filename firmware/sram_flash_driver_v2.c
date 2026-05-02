@@ -55,26 +55,22 @@ static void init_timings_if_needed(void) {
     TIM->xport_mode                = V2_TIM_DEFAULT_XPORT_MODE;
     TIM->byte_prog_offset          = V2_TIM_DEFAULT_BYTE_PROG_OFFSET;
     TIM->verify_quiesce_mode       = V2_TIM_DEFAULT_VERIFY_QUIESCE_MODE;
+    TIM->log_silent                = V2_TIM_DEFAULT_LOG_SILENT;
+    TIM->read_mode                 = V2_TIM_DEFAULT_READ_MODE;
     TIM->magic                     = V2_TIMINGS_MAGIC;
 }
 #define LOG_RING  ((struct v2_log_entry *)V2_LOG_RING_ADDR)
 #define DATA_BUF  ((uint8_t *)V2_DATA_BUF_ADDR)
 
-/* TX_SCRATCH / RX_SCRATCH must live OUTSIDE the linker-managed driver
- * region (`.text + .data + .bss`, currently 0x2C000-0x2E3FF). The
- * historical 0x2E100/0x2E120 placement was inside .bss territory —
- * when the driver grew (e.g. adding any new BSS-resident variable),
- * the compiler-emitted .bss zero-fill at startup would clobber
- * TX_SCRATCH[0..3], silently sending opcode 0x00 to flash on every
- * dma_rx call. Symptom: JEDEC ID returned 0xffffff, RDSR readbacks
- * showed bogus 0xef. Diagnosed 2026-05-01 — the "+2B verify shift"
- * we'd been characterizing was actually a +4B (one full FIFO word)
- * shift contaminated by RDSR/AAI-busy-poll running on bogus state.
- *
- * Park the scratches well below BIDIR_TX_BUF in unused SRAM — the
- * bus scan in dice3_address_map.md confirms 0x00000-0x2AFFF is
- * fixture-free.
- */
+/* TX_SCRATCH / RX_SCRATCH live ABOVE the driver-managed region (which
+ * runs 0x2C000..0x2E3FF). They were originally at 0x2E100/0x2E120, but
+ * the driver's .bss section grew over them when log_silent was added —
+ * silently zeroing TX_SCRATCH[0..3] right before each dma_rx populated
+ * its cmd byte. Symptom: JEDEC ID returned 0xffffff (cmd 0x00 sent
+ * instead of 0x9F), legacy ID still worked because BIDIR_TX_BUF lives
+ * at 0x28000 and is unaffected. Park the scratches well below
+ * BIDIR_TX_BUF in unused SRAM — the bus scan in dice3_address_map.md
+ * confirms 0x00000-0x2AFFF is free of fixtures. */
 #define TX_SCRATCH  ((volatile uint8_t *)0x00029F00u)
 #define RX_SCRATCH  ((volatile uint8_t *)0x00029F40u)
 #define TX_SCRATCH_MAX  16
@@ -154,6 +150,7 @@ static void busy_wait_us(uint32_t us) {
 
 /* ── Log ring ──────────────────────────────────────────────── */
 static void log_put(uint8_t evt, uint16_t detail, uint32_t spi_addr) {
+    if (TIM->log_silent) return;
     uint32_t idx = MBOX->log_head & V2_LOG_RING_MASK;
     struct v2_log_entry *e = &LOG_RING[idx];
     e->t_us     = now_us();
@@ -785,6 +782,13 @@ static int do_erase_block_64k(uint32_t spi_addr) {
  * then a separate tiny 4-byte AAI run for those last 4 bytes — short
  * runs don't trigger the quirk. Total overhead per big run: one extra
  * WREN + AAI_FIRST + 2 pairs + WRDI ≈ ~100 µs. */
+/* 2026-05-02: capping AAI_MAX_RUN to 0x400 (512 pairs) was tested
+ * but does NOT help the post-AAI +4B verify-read shift — the bug
+ * accumulates across separate AAI runs (each with their own
+ * WREN/AAI_FIRST/WRDI), not just within a single continuous run.
+ * Host-level chunking (test G in StockDmaAndSpi.md §10) and
+ * driver-internal chunking both fail the same way. Restoring 32 KB
+ * cap; the bug is mitigated by do_verify's 4× retry, not here. */
 #define AAI_MAX_RUN 0x8000u
 #define AAI_TAIL_SPLIT 4u
 
@@ -1189,6 +1193,21 @@ static int do_aai_program_run(uint32_t spi_addr, const uint8_t *data, uint32_t l
 static int dma_bidir_read(uint32_t spi_addr, uint8_t *out, uint32_t len,
                           uint32_t budget_us)
 {
+    /* 2026-05-02: post-AAI FIFO word-drop workaround.
+     * One dummy 8-byte JEDEC bidir read (single CS cycle) before the
+     * real read absorbs whatever stuck FIFO state AAI leaves behind.
+     * Threshold (empirical): ≥ 5 bytes total in the dummy CS cycle
+     * eliminates the +4B verify shift; below that it's only partial
+     * mitigation. 8 bytes gives safety margin. 4 + 8 = 12 µs overhead
+     * per chunk at 6 MHz wire — negligible vs the chunk's ~25 ms.
+     *
+     * Why JEDEC: it's a known-clean SPI cmd that returns valid data
+     * regardless of chip state, and it goes through the same dma_rx
+     * bidir path. The dummy_buf return value is discarded. */
+    {
+        uint8_t dummy_buf[7];
+        (void)dma_rx(0x9F, dummy_buf, 7, 5000);
+    }
     uint32_t xfer_len = READ_RX_SKIP + len;
     if (len == 0 || xfer_len > 0xFFF) return -1;
 
@@ -1290,13 +1309,110 @@ static int dma_bidir_read(uint32_t spi_addr, uint8_t *out, uint32_t len,
     return 0;
 }
 
+/* Split-mode read (TX-only DMA cmd + mid-CS DMAMD switch to RX-only DMA)
+ * was tested 2026-05-01 and does not work on this Arasan IP — flash
+ * returns idle 0xFF whether SPI_EN is toggled or not between phases.
+ * Best explanation: the IP needs a CS edge to start clocking a new
+ * transfer, so a mid-CS DMAMD/CTRL/LEN change does not re-trigger SCK.
+ * Stock eCos's spi_flash_cmd_pp only splits across separate CS cycles —
+ * which works for PROGRAM but not for READ (READ requires cmd→data
+ * contiguous within a single CS hold). See StockDmaAndSpi.md §8 for the
+ * full investigation log. */
+
+/* RX-only DMA read mirroring the ROM bootloader's dma_spi_read_setup
+ * @ 0x4F290. Verified pattern that the bootloader uses to CRC-check
+ * every firmware boot at PLL clock — proves it works at PLL.
+ *
+ * Differences from dma_bidir_read:
+ *   - SPI_CTRL = 0x307 (RX-DMA mode, not 0x007 base)
+ *   - SPI_DMAMD = 1 (RX-only, not 3 bidir)
+ *   - Single DMA channel (CH0 RX), no TX channel
+ *   - DMA SRC = SPI_BASE + 0x60 (DATA register), NOT 0x70 (RX_PORT)
+ *   - cmd + 3-byte address pushed via PIO writes to SPI_DATA register
+ *     before kicking the engine via SPI_CS = 1
+ *
+ * The DATA-register-as-DMA-source is the key bit: bypasses the bidir
+ * RX_PORT FIFO packer state that causes the +4B post-AAI shift.
+ * Output goes directly to caller's `out` buffer — no echo bytes to
+ * skip, no RX_TEMP intermediate copy. */
+static int dma_rxonly_read(uint32_t spi_addr, uint8_t *out, uint32_t len,
+                           uint32_t budget_us)
+{
+    if (len == 0 || len > 0xFFF) return -1;
+
+    while (SPI_STAT & SPI_STAT_BUSY) {}
+    SPI_EN = 0;
+    SPI_CS = 0;
+    SPI_DMAGO = 0;
+    SPI_CTRL = 0x307;            /* RX-DMA mode (bootloader value) */
+    SPI_LEN = len - 1;           /* response length only */
+    SPI_DMAMD = 1;               /* RX-only DMA */
+    SPI_CLK = DRV_SPI_CLK_DIV;
+    SPI_DMACFG0 = 4;
+    SPI_DMACFG1 = 3;
+    dwb();
+    SPI_EN = 1;
+    dwb();
+
+    /* Arm CH0 RX-only, sourcing from DATA register (0xCC000060). */
+    DMA_EN = 1;
+    DMA_ICLR = 0xF;
+    DMA_CHCLR(0) = 1;
+    dwb();
+    DMA_CHREG(0, 0x10) = 0;
+    DMA_CHREG(0, 0x00) = SPI_BASE + 0x60u;   /* DATA register */
+    DMA_CHREG(0, 0x04) = (uint32_t)(uintptr_t)out;
+    DMA_CHREG(0, 0x08) = 0;
+    DMA_CHREG(0, 0x0C) = (len & DMA_CFG_CNT_MASK) | DMA_CFG_RX;
+    dwb();
+    dma_done_flag = 0;
+    dwb();
+    DMA_CHREG(0, 0x10) = DMA_GO_ARM(DMA_TRG_RX);
+    dwb();
+
+    /* Push READ opcode + 3-byte address via PIO DATA-register writes —
+     * the bootloader pattern. The IP queues these on the TX side; CS=1
+     * (= bootloader's "SPI_FLASH_START=1") starts clocking. */
+    SPI_DATA = 0x03;
+    SPI_DATA = (spi_addr >> 16) & 0xFF;
+    SPI_DATA = (spi_addr >> 8) & 0xFF;
+    SPI_DATA = spi_addr & 0xFF;
+    dwb();
+
+    SPI_CS = 1;
+    SPI_CLRINT = 0;
+    dwb();
+
+    if (wait_dma_irq(budget_us) != 0) { dma_abort(); return -1; }
+    {
+        uint32_t t0 = now_us();
+        while (SPI_STAT & SPI_STAT_BUSY) {
+            if (now_us() - t0 > budget_us) { dma_abort(); return -1; }
+        }
+    }
+
+    /* VERIFY_MISS introspection — first 8 bytes of the destination so the
+     * existing miss classifier can compare against expected. */
+    MBOX->last_rx_head0 = *(uint32_t *)(uintptr_t)out;
+    MBOX->last_rx_head1 = *(uint32_t *)((uintptr_t)out + 4);
+
+    SPI_CS = 0;
+    SPI_EN = 0;
+    DMA_EN = 0;
+    DMA_ICLR = 0xF;
+    return 0;
+}
+
 static int do_read(uint32_t spi_addr, uint8_t *dest, uint32_t len) {
     set_phase(V2_PHASE_READ);
+    int (*read_fn)(uint32_t, uint8_t *, uint32_t, uint32_t) =
+        (TIM->read_mode == V2_READ_MODE_RXONLY) ? dma_rxonly_read
+                                                : dma_bidir_read;
     for (uint32_t off = 0; off < len; off += READ_CHUNK) {
         uint32_t chunk = len - off;
         if (chunk > READ_CHUNK) chunk = READ_CHUNK;
         spi_reset_clean();   /* clean state per chunk */
-        if (dma_bidir_read(spi_addr + off, dest + off, chunk, 100000) != 0) {
+        if (read_fn(spi_addr + off, dest + off, chunk, 100000) != 0) {
             set_error(V2_ERR_READ_DMA, spi_addr + off, (uint8_t)MBOX->last_sr);
             return -1;
         }

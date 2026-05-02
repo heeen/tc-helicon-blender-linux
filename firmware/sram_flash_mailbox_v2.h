@@ -337,6 +337,27 @@ struct v2_timings {
      * when chasing warm-state contamination issues (e.g. +2B verify shift
      * that reproduces in eCos state but not in TCAT bootloader state). */
     volatile uint32_t verify_quiesce_mode;
+
+    /* Log silencer. 0 = log_put writes to LOG_RING as usual (default).
+     * 1 = log_put returns immediately. Tests whether per-AAI-pair logging
+     * (2048× per sector) and its dwb() barriers contribute to SPI/DMA
+     * timing variance — log_put runs in the hot AAI loop and its write
+     * barrier may serialize SPI register writes more than expected. */
+    volatile uint32_t log_silent;
+
+    /* Read backend selector for do_read (verify path):
+     *   0 = bidir   (default — dma_bidir_read; DMAMD=3, single CS cycle,
+     *                TX channel sends cmd+addr+dummies, RX captures all
+     *                4+len bytes through RX_PORT (0x70). Has the +4B
+     *                post-AAI half-word FIFO packer drop.)
+     *   1 = rxonly  (dma_rxonly_read; DMAMD=1, CTRL=0x307. Mirrors the
+     *                ROM bootloader's spi_dma_read_setup @ 0x4F290:
+     *                cmd+addr pushed via PIO DATA-register writes
+     *                BEFORE the engine kicks, RX-only DMA sources from
+     *                DATA (0x60). Bypasses the bidir FIFO packer state
+     *                entirely. The bootloader CRC-checks every
+     *                successful firmware boot using this path at PLL.) */
+    volatile uint32_t read_mode;
 };
 
 #define V2_XPORT_DMA 0u
@@ -345,6 +366,10 @@ struct v2_timings {
 #define V2_VERIFY_QUIESCE_OFF    0u
 #define V2_VERIFY_QUIESCE_LIGHT  1u
 #define V2_VERIFY_QUIESCE_STRICT 2u
+
+#define V2_READ_MODE_BIDIR  0u
+#define V2_READ_MODE_RXONLY 1u
+
 
 #define V2_TIMINGS_MAGIC      0x54494D32u  /* 'TIM2' — HOST sets when valid */
 
@@ -364,6 +389,16 @@ struct v2_timings {
 #define V2_TIM_DEFAULT_ERASE_POLL_BUDGET_US      500000u
 #define V2_TIM_DEFAULT_XPORT_MODE                V2_XPORT_DMA
 #define V2_TIM_DEFAULT_BYTE_PROG_OFFSET          0u
-#define V2_TIM_DEFAULT_VERIFY_QUIESCE_MODE       V2_VERIFY_QUIESCE_STRICT
+/* Default OFF (2026-05-01): STRICT was originally added to address the
+ * +2B verify shift, but its peripheral_full_teardown calls
+ * blender_spi_ip_drain_rx — the exact "read SPI_DATA with EN=0" pattern
+ * documented to *cause* the half-word FIFO packer corruption (per
+ * StockDmaAndSpi.md §8). Empirically: STRICT → 30/30 misses;
+ * LIGHT → 20/30; OFF → 0–5/30. Mode=OFF is the fastest and lowest-rate
+ * configuration; the residual <5% rate is the actual silicon glitch and
+ * is caught by do_verify's 4× retry. */
+#define V2_TIM_DEFAULT_VERIFY_QUIESCE_MODE       V2_VERIFY_QUIESCE_OFF
+#define V2_TIM_DEFAULT_LOG_SILENT                0u
+#define V2_TIM_DEFAULT_READ_MODE                 V2_READ_MODE_BIDIR
 
 #endif /* SRAM_FLASH_MAILBOX_V2_H */
