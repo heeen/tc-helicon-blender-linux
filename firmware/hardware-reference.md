@@ -168,7 +168,7 @@ writes without the key are silently ignored. Reads return only the lower
 
 - Crystal: **12.0 MHz** [verified — only value yielding firmware-stored 400 MHz constant]
 - PLL VCO: 12 × 100 / 3 = **400 MHz** [verified Ghidra `pll_clock_init` stores `0x17D78400` to global at 0x29AAC]
-- **AHB/CPU clock: Fvco / 2 = 200 MHz** [verified 2026-05-03 Ghidra: `pll_clock_init` writes `PLL_FREQ >> 1` to *0x29AA8 — the AHB-freq global the rest of firmware reads]
+- **AHB/CPU clock: Fvco / 2 = 200 MHz** [verified 2026-05-03 Ghidra: `pll_clock_init` writes `PLL_FREQ >> 1` to *0x29AA8 — the AHB-freq global the rest of firmware reads] [verified 2026-05-04 empirical via `measure_clocks.py`: PLL/crystal CPU stub-rate ratio = 17.49, derived PLL CPU = 209.9 MHz vs expected 200 MHz, within crystal-tolerance + measurement uncertainty (~5%)]
 - Quarter-PLL = 100 MHz, eighth-PLL = 50 MHz (peripheral clock options) [verified Ghidra: writes to *0x29AA4 and *0x29AA0]
 - SPI bus at PLL passthrough + SPI_CLK=0x32: 200 / 50 = **4 MHz wire** (stock eCos)
 - SPI bus at crystal fallback + SPI_CLK=2: 12 / 2 = **6 MHz wire** (v2 driver — actually FASTER than eCos at PLL)
