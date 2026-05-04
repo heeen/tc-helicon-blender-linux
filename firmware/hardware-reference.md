@@ -172,6 +172,7 @@ writes without the key are silently ignored. Reads return only the lower
 - Quarter-PLL = 100 MHz, eighth-PLL = 50 MHz (peripheral clock options) [verified Ghidra: writes to *0x29AA4 and *0x29AA0]
 - SPI bus at PLL passthrough + SPI_CLK=0x32: 200 / 50 = **4 MHz wire** (stock eCos)
 - SPI bus at crystal fallback + SPI_CLK=2: 12 / 2 = **6 MHz wire** (v2 driver — actually FASTER than eCos at PLL)
+- **Timer0 tick rate: AHB / 8** [verified 2026-05-04 empirical via `measure_clocks.py`: at PLL CPU Timer0 = 26.27 MHz (≈ 200/8 = 25 MHz), at crystal CPU Timer0 = 1.512 MHz (= 12/8 = 1.5 MHz exactly). Timer0 PLL/crystal ratio = 17.37 matches CPU ratio = 17.44 → Timer0 shares CPU clock domain, not a fixed oscillator.]
 
 `Registers.md`'s "400 MHz / 50 = 8 MHz wire" inference was based on
 treating Fvco as the SPI parent. Ghidra confirms there is a /2 between
