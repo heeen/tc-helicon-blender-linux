@@ -393,7 +393,7 @@ struct v2_timings {
  * +2B verify shift, but its peripheral_full_teardown calls
  * blender_spi_ip_drain_rx — the exact "read SPI_DATA with EN=0" pattern
  * documented to *cause* the half-word FIFO packer corruption (per
- * StockDmaAndSpi.md §8). Empirically: STRICT → 30/30 misses;
+ * spi-flash.md §8). Empirically: STRICT → 30/30 misses;
  * LIGHT → 20/30; OFF → 0–5/30. Mode=OFF is the fastest and lowest-rate
  * configuration; the residual <5% rate is the actual silicon glitch and
  * is caught by do_verify's 4× retry. */

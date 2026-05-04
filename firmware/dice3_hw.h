@@ -19,7 +19,7 @@
  * Scope: SPI flash + system DMA engine (0xCC…, 0x8000…). USB MIDI bulk OUT/RX
  * uses the Synopsys DesignWare USB 2.0 OTG (DWC2) v3.20a controller at
  * 0x90000000 — not SPI_DMAMD / DMA_TRG_* here. See firmware/patch/dice_usb_regs.h
- * and firmware/dice3_usb_registers.md.
+ * and firmware/usb-stack.md.
  */
 
 /* ──────────────────────────────────────────────────────────────
@@ -175,7 +175,7 @@
  * Full annotated register map in firmware/dice3_dma.h — use the
  * `DMA->...` struct accessors there for new code. Macros below are
  * kept for the v2 flash driver's hot paths and eventually should be
- * migrated. See also firmware/StockDmaAndSpi.md for the Ghidra
+ * migrated. See also firmware/spi-flash.md for the Ghidra
  * decompile that motivated the struct.
  * ────────────────────────────────────────────────────────────── */
 #include "dice3_dma.h"

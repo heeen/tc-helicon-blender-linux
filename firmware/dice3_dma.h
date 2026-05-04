@@ -13,8 +13,8 @@
  * Offsets never touched by stock (but seen live / used by our driver):
  *   +0x00, +0x14, +0x18, +0x1C, +0x20, +0x24, +0x28, +0x2C, +0x34..+0xFC
  *
- * Full register file in firmware/Registers.md, decompile of the above
- * functions in firmware/StockDmaAndSpi.md. */
+ * Full register file in firmware/hardware-reference.md, decompile of the above
+ * functions in firmware/spi-flash.md. */
 
 #ifndef DICE3_DMA_H
 #define DICE3_DMA_H

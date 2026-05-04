@@ -110,7 +110,7 @@ static inline void dwb(void) {
  * very first pair after AAI_FIRST) — the SPI IP likely can't latch at
  * 400 MHz input even though eCos's idle snapshot shows this config. To
  * go faster safely we'd need to keep the SPI IP clocked by something
- * closer to its rated input — probe further. See Registers.md and
+ * closer to its rated input — probe further. See hardware-reference.md and
  * firmware/flash_stats.csv. */
 #define DRV_CLK_DIV_SPI_RAW  0x0000u
 #define DRV_SPI_CLK_DIV      2u
@@ -786,7 +786,7 @@ static int do_erase_block_64k(uint32_t spi_addr) {
  * but does NOT help the post-AAI +4B verify-read shift — the bug
  * accumulates across separate AAI runs (each with their own
  * WREN/AAI_FIRST/WRDI), not just within a single continuous run.
- * Host-level chunking (test G in StockDmaAndSpi.md §10) and
+ * Host-level chunking (test G in spi-flash.md §10) and
  * driver-internal chunking both fail the same way. Restoring 32 KB
  * cap; the bug is mitigated by do_verify's 4× retry, not here. */
 #define AAI_MAX_RUN 0x8000u
@@ -1316,7 +1316,7 @@ static int dma_bidir_read(uint32_t spi_addr, uint8_t *out, uint32_t len,
  * transfer, so a mid-CS DMAMD/CTRL/LEN change does not re-trigger SCK.
  * Stock eCos's spi_flash_cmd_pp only splits across separate CS cycles —
  * which works for PROGRAM but not for READ (READ requires cmd→data
- * contiguous within a single CS hold). See StockDmaAndSpi.md §8 for the
+ * contiguous within a single CS hold). See spi-flash.md §8 for the
  * full investigation log. */
 
 /* RX-only DMA read mirroring the ROM bootloader's dma_spi_read_setup
@@ -1510,7 +1510,7 @@ static int do_verify(uint32_t spi_addr, const uint8_t *expected, uint32_t len) {
          * MAX times. The flash content is almost certainly correct
          * (silicon-bug causes ~+2 SRAM offset in the captured bytes,
          * not miswritten flash). Retrying gives the buggy capture a
-         * fresh roll of the dice. See firmware/StockDmaAndSpi.md and
+         * fresh roll of the dice. See firmware/spi-flash.md and
          * task #32 for the full story. */
         uint32_t first_bad = chunk;  /* sentinel for "all matched" */
         uint8_t  first_got = 0, first_exp = 0;
