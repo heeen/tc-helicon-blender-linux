@@ -28,6 +28,7 @@ XIP_BASE = 0x40000;
 /* SST25xx SPI flash driver */
 sst25xx_sector_erase   = 0x8B38;
 sst25xx_aai_write      = 0x8968;
+sst25xx_fast_read      = 0x8734;   /* FAST_READ (0x0B) — see sram_flash_handler.c plate comment */
 sst25xx_driver_ctx     = 0x2A93C;
 dma_transfer_execute   = 0xF5CC;
 spi_flash_cmd_rdsr     = 0x8550;
@@ -104,6 +105,7 @@ midi_usb_endpoints_init          = 0x4434;   /* mixer_hw_dsr callback + routing 
 midi_usb_endpoints_setup         = 0x1080;   /* find + link RX/TX endpoint handlers */
 midi_engine_start                = 0x2998;   /* clear FSS flag, set engine running */
 midi_rx_poll                     = 0x2AB8;   /* read ring buffer, feed parser */
+midi_parser_process_bytes        = 0x3ED0;   /* (ctx, buf, len) MIDI byte SM — used by midi_rx_dispatch passthrough */
 
 /* TCAT MIDI streaming state object (BSS) — referenced by streaming_start/reconfigure */
 midi_streaming_state             = 0x29CA4;  /* +0x20=EP desc, +0x28=cable cfg, +0x460=DCP TX ep */

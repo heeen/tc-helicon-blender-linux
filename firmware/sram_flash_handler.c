@@ -28,19 +28,13 @@
 
 #include <stdint.h>
 
+#include "midi_flash_dispatch.h"
+
 /* ── Firmware functions (resolved by linker via firmware_symbols.ld) ── */
 
-extern int  sst25xx_sector_erase(void *ctx, uint32_t addr);
-extern int  sst25xx_aai_write(void *ctx, uint32_t addr,
-                               const void *buf, uint32_t len);
-extern void *memcpy(void *dst, const void *src, unsigned int len);
 extern void FUN_2f38(void);
 extern void dcp_register_handler(void *node);
 extern void dcp_send_response(int retcode, void *body, int len);
-
-extern char sst25xx_driver_ctx;  /* linker symbol — use &sst25xx_driver_ctx */
-
-#define DRIVER_CTX       ((void *)&sst25xx_driver_ctx)
 
 /* ── Fixed addresses (must match inject_handler.py) ─────────────────── */
 
@@ -60,23 +54,9 @@ struct handler_node {
     void     *context;
 };
 
-/* ── Constants ──────────────────────────────────────────────────────── */
+/* ── DCP framing constants ──────────────────────────────────────────── */
 
 #define CATEGORY_FLASH     0x81F
-#define GOLDEN_COPY_START  0x10000
-#define GOLDEN_COPY_END    0x40000
-#define SECTOR_SIZE        0x1000
-
-/* JEDEC ID for SST25VF016B */
-#define JEDEC_ID           0x00BF2541
-#define FLASH_SECTOR_SIZE  0x00001000
-#define FLASH_TOTAL_SIZE   0x00200000
-
-/* Error codes */
-#define ERR_GOLDEN_PROTECT 0xDEAD0001
-#define ERR_WRITE_BAD_BODY 0xDEAD0002
-#define ERR_ERASE_FAIL     0xDEAD0003
-#define ERR_UNKNOWN_OPCODE 0xDEAD00FF
 
 /* ── Mailbox for host polling ───────────────────────────────────────── */
 
@@ -149,11 +129,19 @@ void _start(void) {
  *   r3 = body_ptr     (0x31704 = state+0x14, shared cmd/response buffer)
  *   [sp+0] = body_len (u16)
  *
- * Opcodes:
- *   0 = INFO:   -> 12 bytes (jedec_id, sector_size, flash_size)
- *   1 = READ:   body[addr:4, len:2] -> raw flash data (max 1024)
- *   2 = ERASE:  body[addr:4, len:4] -> status(4)
- *   3 = WRITE:  body[addr:4, data:N] -> status(4)
+ * Opcodes (handled by midi_flash_dispatch.c shared core):
+ *   0 = INFO        -> info(16)        (legacy callers see only first 12 B)
+ *   1 = READ        body[addr:4, len:2] -> raw flash data (max 4096)
+ *   2 = ERASE       body[addr:4, len:4] -> status(4)
+ *   3 = WRITE/AAI   body[addr:4, data:N] -> status(4)
+ *
+ * HASH_RANGE is intentionally NOT exposed via DCP — it's MIDI-only (the
+ * SysEx filter in patch/midi_sysex_filter.c). DCP recovery path is rare;
+ * host-side READ-based sector diff is acceptable. Saves ~400 B in this
+ * handler region (capped at ~1 KB by the SRAM DEADBEEF zone).
+ *
+ * The shared core in midi_flash_dispatch.c writes the response payload
+ * into `body` and sets `resp_len`. We forward to dcp_send_response.
  */
 static void flash_handler(void *ctx, uint16_t category, uint16_t opcode,
                           uint8_t *body, uint16_t body_len)
@@ -161,84 +149,39 @@ static void flash_handler(void *ctx, uint16_t category, uint16_t opcode,
     (void)ctx;
     (void)category;
 
+    uint32_t resp_len = 4;  /* default for status-only paths */
+
     switch (opcode) {
-
-    case 0: { /* INFO */
-        uint32_t *out = (uint32_t *)body;
-        out[0] = JEDEC_ID;
-        out[1] = FLASH_SECTOR_SIZE;
-        out[2] = FLASH_TOTAL_SIZE;
-        dcp_send_response(0, body, 12);
-        return;
-    }
-
+    case 0: /* INFO */
+        flash_op_info(body, &resp_len);
+        break;
     case 1: { /* READ */
         uint32_t addr = *(uint32_t *)body;
-        uint16_t len  = *(uint16_t *)(body + 4);
-        if (len > 1024) len = 1024;
-
-        /* XIP read: memory address == SPI address */
-        memcpy(body, (void *)(uintptr_t)addr, len);
-        dcp_send_response(0, body, len);
-        return;
+        uint32_t len  = (uint32_t)(*(uint16_t *)(body + 4));
+        flash_op_read(addr, len, body, &resp_len);
+        break;
     }
-
     case 2: { /* ERASE */
         uint32_t addr = *(uint32_t *)body;
         uint32_t len  = *(uint32_t *)(body + 4);
-
-        /* Golden copy protection */
-        if (addr < GOLDEN_COPY_END && (addr + len) > GOLDEN_COPY_START) {
-            *(uint32_t *)body = ERR_GOLDEN_PROTECT;
-            dcp_send_response(0, body, 4);
-            return;
-        }
-
-        /* Erase sectors */
-        uint32_t end = addr + len;
-        while (addr < end) {
-            int ret = sst25xx_sector_erase(DRIVER_CTX, addr);
-            if (ret != 0) {
-                *(uint32_t *)body = ERR_ERASE_FAIL;
-                dcp_send_response(0, body, 4);
-                return;
-            }
-            addr += SECTOR_SIZE;
-        }
-
-        *(uint32_t *)body = 0;
-        dcp_send_response(0, body, 4);
-        return;
+        uint32_t count = (len + FLASH_SECTOR_SIZE_B - 1) / FLASH_SECTOR_SIZE_B;
+        flash_op_erase_sector(addr, count, body, &resp_len);
+        break;
     }
-
-    case 3: { /* WRITE */
+    case 3: { /* WRITE / AAI */
         uint32_t addr = *(uint32_t *)body;
         int32_t  data_len = (int32_t)body_len - 4;
-
         if (data_len <= 0) {
-            *(uint32_t *)body = ERR_WRITE_BAD_BODY;
-            dcp_send_response(0, body, 4);
-            return;
+            *(uint32_t *)body = ERR_BAD_BODY;
+            break;
         }
-
-        /* Golden copy protection */
-        if (addr < GOLDEN_COPY_END && (addr + (uint32_t)data_len) > GOLDEN_COPY_START) {
-            *(uint32_t *)body = ERR_GOLDEN_PROTECT;
-            dcp_send_response(0, body, 4);
-            return;
-        }
-
-        int ret = sst25xx_aai_write(DRIVER_CTX, addr, body + 4, (uint32_t)data_len);
-        *(uint32_t *)body = (uint32_t)ret;
-        dcp_send_response(0, body, 4);
-        return;
+        flash_op_aai_write(addr, body + 4, (uint32_t)data_len, body, &resp_len);
+        break;
     }
-
-    default: {
+    default:
         *(uint32_t *)body = ERR_UNKNOWN_OPCODE;
-        dcp_send_response(0, body, 4);
-        return;
+        break;
     }
 
-    }
+    dcp_send_response(0, body, (int)resp_len);
 }
