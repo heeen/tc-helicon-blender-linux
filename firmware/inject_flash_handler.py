@@ -79,25 +79,30 @@ HANDLER_FN_ADDR         = 0x31500
 # ── Build handler binary ──────────────────────────────────────────────
 
 def build_handler() -> Path:
-    """Compile sram_flash_handler.c if needed, return path to .bin."""
+    """Compile sram_flash_handler.c + shared dispatch if needed, return path to .bin."""
     code_bin  = FIRMWARE_DIR / 'sram_flash_handler.bin'
     c_src     = FIRMWARE_DIR / 'sram_flash_handler.c'
+    c_dispatch = FIRMWARE_DIR / 'midi_flash_dispatch.c'
+    h_dispatch = FIRMWARE_DIR / 'midi_flash_dispatch.h'
     ld_script = FIRMWARE_DIR / 'sram_handler.ld'
     elf       = FIRMWARE_DIR / 'sram_flash_handler.elf'
 
     needs_build = (
         not code_bin.exists()
         or c_src.stat().st_mtime > code_bin.stat().st_mtime
+        or c_dispatch.stat().st_mtime > code_bin.stat().st_mtime
+        or h_dispatch.stat().st_mtime > code_bin.stat().st_mtime
         or ld_script.stat().st_mtime > code_bin.stat().st_mtime
     )
 
     if needs_build:
-        print('Building SRAM handler (C)...')
+        print('Building SRAM handler (C) + shared dispatch...')
         subprocess.run([
             'arm-none-eabi-gcc', '-march=armv5te', '-marm', '-mno-thumb-interwork',
             '-Os', '-nostdlib', '-ffreestanding', '-Wall',
+            '-I', str(FIRMWARE_DIR),
             '-T', str(ld_script),
-            '-o', str(elf), str(c_src)
+            '-o', str(elf), str(c_src), str(c_dispatch),
         ], check=True)
         subprocess.run([
             'arm-none-eabi-objcopy', '-O', 'binary', str(elf), str(code_bin)
