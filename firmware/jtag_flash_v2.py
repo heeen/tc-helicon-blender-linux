@@ -1081,57 +1081,11 @@ def plan_flash_ops(ref, image_size, block_threshold_64k=12,
     return ops
 
 
-def _zlib_rom_crc32(buf):
-    """Match the on-device ROM CRC32 step routine: poly 0xEDB88320, init=0,
-    no final XOR. Equivalent to zlib.crc32 with init/finalize cancelled
-    (zlib does ~init at start and ~result at end; passing 0xFFFFFFFF for
-    both inverts twice = identity)."""
-    return zlib.crc32(buf, 0xFFFFFFFF) ^ 0xFFFFFFFF
-
-
-def batch_diff(client, ref, sector_buf_addr=DATA_BUF_ADDR):
-    """Single device sweep that returns:
-      - whole-image match boolean
-      - set of differing sector start addresses (empty if matched)
-
-    Mirrors the bootloader's spi_dma_read_and_crc — one continuous
-    DMA+CRC run over the whole image — but additionally writes per-sector
-    CRCs to a host-readable SRAM buffer. Avoids the double-SPI-read of a
-    separate whole-image-then-per-sector flow on the mismatch path.
-    """
-    t0 = time.monotonic()
-    print(f"  batch CRC ({len(ref)} bytes, "
-          f"{len(ref) // SECTOR_SIZE} sectors)...")
-    whole_local = _zlib_rom_crc32(ref)
-    whole_dev, sec_crcs = client.device_crc32_batch(
-        0, len(ref), sector_buf_addr)
-    dt = time.monotonic() - t0
-    if whole_dev == whole_local:
-        print(f"  whole-image CRC match (0x{whole_local:08x}) in {dt:.1f}s")
-        return True, set()
-    diff = set()
-    for i, dev_crc in enumerate(sec_crcs):
-        addr = i * SECTOR_SIZE
-        local = _zlib_rom_crc32(ref[addr:addr + SECTOR_SIZE])
-        if local != dev_crc:
-            diff.add(addr)
-    print(f"  whole-image mismatch (local=0x{whole_local:08x}, "
-          f"device=0x{whole_dev:08x}); {len(diff)} sectors differ "
-          f"— sweep took {dt:.1f}s")
-    return False, diff
-
-
-def filter_ops_by_diff(ops, diff, sector_size=SECTOR_SIZE):
-    """Drop ops whose constituent sectors are all already-correct on
-    device. Preserves the density heuristic on top of the diff set:
-    a dense block op stays a single block op when any sector inside it
-    differs; an unchanged block op vanishes entirely."""
-    out = []
-    for kind, addr, span in ops:
-        sectors_in_op = range(addr, addr + span, sector_size)
-        if any(s in diff for s in sectors_in_op):
-            out.append((kind, addr, span))
-    return out
+from sector_diff import (
+    zlib_rom_crc32 as _zlib_rom_crc32,
+    batch_diff,
+    filter_ops_by_diff,
+)
 
 
 def flash_all(client, args):
