@@ -47,24 +47,33 @@ Ghidra MMIO scan]
 ---
 ## SPI controller register layout (0xCC=flash, 0xCF=LED — same IP block)
 
-| Offset | Name | Description |
-|---|---|---|
-| 0x00 | CTRL | Mode word: `direction \| base`. Base = 0x007 (polling) or 0x1006 (IRQ-mode, stock fw). Direction adds: `0x100` = TX-only, `0x200` = RX-only, `0x300` = bidir-channel-mode, `0x000` = bidir. So `0x107` = TX, `0x207` = RX-only, `0x307` = RX-DMA-mode (stock bootloader's read), `0x007` = bidir (our v2 driver). [verified Ghidra + runtime] |
-| 0x04 | LEN | Total transfer length minus 1 (1 ⇒ 2 bytes on wire) [verified] |
-| 0x08 | EN | Controller enable: 1 = on, 0 = off [verified] |
-| 0x0C | (unknown) | Sometimes written 0; purpose unclear [conjecture] |
-| 0x10 | CS | Chip select assert (bit 0 = CS low). The cs_index field in the firmware's resource_t is a controller slot selector, NOT a MOSI CS mask — the chip only responds when bit 0 is set. [verified 2026-04-17] |
-| 0x14 | CLK | IP-level prescaler. Flash uses 2 (driver) or 0x32 (stock eCos = 8 MHz wire); LED uses 0xFF [verified] |
-| 0x18 | CLRINT | Write 0 to clear pending IRQ edge (done right before kickoff in DMA mode) [verified] |
-| 0x28 | STAT | bit 0 = BUSY, bit 1 = TX_READY, bit 3 = RX_READY [verified] |
-| 0x2C | DMAGO | Stock v1 firmware never writes 1 here (reset only); our v2 follows the same convention [verified Ghidra] |
-| 0x34 | ERR | Error flags. bit 2 = transfer error (bootloader's `dma_poll_complete` increments a counter on this bit) [verified Ghidra] |
-| 0x4C | DMAMD | DMA mode select. 0 = PIO, 1 = RX-only DMA, 2 = TX-only DMA (CH0 → TX_PORT), 3 = bidir DMA (CH0=RX, CH1=TX) [verified] |
-| 0x50 | DMACFG0 | Per-direction DMA framing constant. Stock always writes 4 [verified] |
-| 0x54 | DMACFG1 | Per-direction DMA framing constant. Stock always writes 3 [verified] |
-| 0x60 | DATA | PIO data register (8-bit r/w). Also DMA source for the bootloader's RX-DMA pattern (CTRL=0x307) — the IP multiplexes TX-PIO writes and RX-DMA reads on the same register [verified 2026-05-02] |
-| 0x70 | RX_PORT | RX DMA port (used by our v2 driver bidir reads) [verified] |
-| 0x80 | TX_PORT | TX DMA port [verified] |
+The IP is **Synopsys DW_apb_ssi v3.22** (verified 2026-05-04 — see "IP
+fingerprints" below). Column "DW name" gives the DesignWare canonical
+register name; behavior matches DW spec at every offset shown.
+
+| Offset | Local name | DW name | Description |
+|---|---|---|---|
+| 0x00 | CTRL | CTRLR0 | Mode word. DW field decode: `[3:0]=DFS` (frame-bits-1, always 7 → 8-bit), `[5:4]=FRF` (always 0=Motorola SPI), `[6]=SCPH`, `[7]=SCPOL`, `[9:8]=TMOD` (0=TR, 1=TO, 2=RO, 3=EEPROM_READ), `[12]=CFS[0]` (TCAT-repurposed as IRQ-mode bit, see below). Common values: `0x007` = DFS=7+TMOD=TR (Mode 0 bidir, our v2), `0x107` = TX-only Mode 0, `0x207` = RX-only Mode 0, `0x307` = EEPROM_READ Mode 0 (stock bootloader). Stock eCos at runtime uses `0x1c7` (DFS=7+SCPH+SCPOL+TMOD=TO → **SPI Mode 3 TX**) for flash writes [verified 2026-05-04 live JTAG]. Static `0x1006` value in firmware was **misattributed** earlier — runtime CTRL never has DFS=6 (would be 7-bit frames; flash wouldn't respond). |
+| 0x04 | LEN | CTRLR1 | NDF (number of data frames - 1). DW spec says only used in RO/EEPROM_READ; stock writes it for all transfers (harmless in TR/TO). |
+| 0x08 | EN | SSIENR | Controller enable: 1 = on, 0 = off. Must clear before changing CTRLR0 (DW rule). [verified] |
+| 0x0C | (unknown) | MWCR | Microwire control. Written 0; unused with FRF=0. |
+| 0x10 | CS | SER | Slave-enable bitmask (`1<<slave_idx`). Stock uses `4` (bit 2) for flash, `8` (bit 3) for BLE module [verified 2026-05-04 live JTAG]. v2 driver currently uses `1` (bit 0) — empirically works but is **not stock-aligned**. |
+| 0x14 | CLK | BAUDR | DW: `sclk = ssi_clk / BAUDR`. Stock eCos uses `0x32` (50) at PLL-passthrough = 4 MHz wire; live probe also caught BAUDR=8 in some flash ops. v2 uses 2. LED bus uses `0xFF` (slow). |
+| 0x18 | CLRINT | (TCAT) | TCAT-specific aggregated IRQ clear (write 0). DW core has TXFTLR at this offset; TCAT replaces it. [verified] |
+| 0x1C..0x24 | — | TXFTLR/RXFTLR/TXFLR/RXFLR | DW FIFO threshold/level regs. TXFTLR/RXFTLR clamp at 0 → **TX/RX FIFO depth = 1** on this silicon (verified by writing 0xFF, reading back). |
+| 0x28 | STAT | SR | DW SR with bit 0=BUSY, bit 1=TFNF (TX_READY), bit 3=RFNE (RX_READY). [verified] |
+| 0x2C | DMAGO | IMR | Stock writes 1 here in IRQ mode to fire DMA; DW IMR is the standard interrupt-mask register. TCAT may have repurposed semantics. [conjecture: TCAT-specific use of DW IMR] |
+| 0x34 | ERR | RISR | DW raw interrupt-status register. Bit 2 = RXUI (RX FIFO underflow) per DW spec; bootloader's `dma_poll_complete` watches this bit. [verified Ghidra; cross-referenced DW spec] |
+| 0x4C | DMAMD | DMACR | DW DMA control: bit 0=RDMAE, bit 1=TDMAE. DICE3 `DMAMD` value 0–3 = `{TDMAE,RDMAE}` exactly: 0=PIO, 1=RX-only DMA, 2=TX-only DMA, 3=bidir DMA. [verified — DW-canonical encoding] |
+| 0x50 | DMACFG0 | DMATDLR | DW TX FIFO data-level for DMA request. Stock + v2 both write 4. |
+| 0x54 | DMACFG1 | DMARDLR | DW RX FIFO data-level for DMA request. Stock + v2 both write 3. |
+| 0x58 | (verified) | IDR | DW SSI integrator-set instance ID. Flash = `0x00000001`, LED = `0x00000002`. Firmware never reads (`get_xrefs_to(0xCC000058) = none`). [verified 2026-05-04] |
+| 0x5C | (verified) | VERSION_ID | DW SSI version-tag in ASCII LE = `0x3332322A` = "*223" → DW v3.22. Both instances identical. [verified 2026-05-04] |
+| 0x60 | DATA | DR0 | DW data register (PIO TX/RX; also DMA source for the bootloader's EEPROM_READ pattern with CTRL=0x307). |
+| 0x70 | RX_PORT | (TCAT extension) | TCAT-specific dedicated AHB slave port for RX DMA. DW stock would have DMA target DR0; TCAT split it for PL080 routing. |
+| 0x80 | TX_PORT | (TCAT extension) | TCAT-specific dedicated AHB slave port for TX DMA. |
+| 0xF0 | — | RX_SAMPLE_DLY | DW optional RX-sample delay (newer DW SSI revs). Writable on this silicon (probed: write 0x7, reads back 0x7), currently 0. **Untouched by firmware** — could be a tuning knob for AAI tail-drop. [verified 2026-05-04] |
+| 0xF4 | — | CS_OVERRIDE | DW optional CS-override (force CS asserted). **Tied off** on this silicon (write 0xF, reads 0). [verified 2026-05-04] |
 
 `Registers.md` mislabeled several rows (CS at 0x18, DMAMD at 0x2C, etc.).
 The offsets above match driver source `dice3_hw.h`, Ghidra decompile of stock
@@ -232,11 +241,53 @@ functions onto these pins (e.g., SPI MISO/MOSI/SCK). [verified Ghidra
 | DMA @ 0x80000000 | **ARM PrimeCell PL080 rev 1** | CIDs `0xB105F00D` at +0xFF0..+0xFFF, part `0x080`, designer `0x41` (ARM JEP106) [verified 2026-04-23 JTAG] |
 | VIC @ 0xFFFFF000 | **ARM PrimeCell PL190-family** (custom part `0x808`) | CIDs `0xB105F00D`, designer ARM. Non-standard part suggests TCAT customization. [verified 2026-04-23 JTAG] |
 | USB @ 0x90000000 | **Synopsys DWC2 v3.20a** | GSNPSID register readback [verified 2026-04-29 JTAG] |
-| SPI @ 0xCC / 0xCF | **Unidentified** — **likely TCAT-internal** based on source-path strings (`/home/tcat/tch-git/.../dice3-sdk/...` in primary firmware). Speculatively named "Arasan" in earlier docs/comments, but no fingerprint probe confirms this and the firmware contains zero "arasan" strings. Available IDs at `+0x58 = 0x921B5` and `+0x5C = 0x3332322A` (ASCII `*223`) are exposed by the IP but **never read by firmware** [verified 2026-05-03 Ghidra: `get_xrefs_to(0xCC000058) = none`]. Behavior is well-characterized empirically (RX FIFO packer mid-word state, post-AAI word-drop bug) regardless of IP identity. [conjecture: IP vendor; verified IDs from JTAG read-only] |
+| SPI @ 0xCC / 0xCF | **Synopsys DesignWare APB SSI v3.22** (`DW_apb_ssi`), two instances | `+0x5C VERSION_ID = 0x3332322A` (ASCII `*223` little-endian = DW SSI's standard "M.mm*" version-tag format → 3.22 with revision-letter packed as `*`). `+0x58 IDR = 1` (flash bus) / `2` (LED bus) — integrator-set instance IDs. No PrimeCell magic at `+0xFE0/+0xFFE0` (returns 0xff and zeros), correctly indicating this is NOT ARM IP. Register layout matches DW spec at every standard offset (CTRLR0/CTRLR1/SSIENR/SER/BAUDR/SR/IMR/RISR/DMACR/DMATDLR/DMARDLR/DR/RX_SAMPLE_DLY) and all bit semantics verified empirically: TMOD encoding 0–3 in CTRLR0[9:8] (TR/TO/RO/EEPROM_READ), DFS at CTRLR0[3:0] (frame-bits-1, clamping observed via JTAG-driven JEDEC probe), DMACR[1:0] = `{TDMAE, RDMAE}` driven by `SPI_DMAMD` 0–3, SR.BUSY/TFNF/RFNE at bits 0/1/3. TX/RX FIFO depth = 1 (TXFTLR/RXFTLR clamp probe). RX_SAMPLE_DLY at +0xF0 is writable but unused by firmware. [verified 2026-05-04 JTAG ID-block + register-clamp probes] |
 | BLE module (external MCU) | TC-BLE proprietary | Identified by string `TCH-BLE` at firmware offset `0x23042` and bridged via 3-wire SPI on 0xCF + GPIO on 0xCA/0xCB [verified Ghidra] |
 
-Throughout this documentation, references to "Arasan SPI IP" should be
-read as `[conjecture]` until a fingerprint probe confirms otherwise.
+### TCAT-specific extensions on top of DW_apb_ssi v3.22
+
+DICE3 wraps the DW SSI core with three vendor extensions, all empirically
+verified:
+
+1. **Dedicated DMA AHB slave ports at `+0x70` (RX) and `+0x80` (TX).**
+   Stock DW_apb_ssi has DMA hit `DR0 @ 0x60` directly. TCAT split them so
+   the PL080 can route to peripheral-1 (TX) and peripheral-3 (RX) on
+   independent AHB slaves. Combined with FIFO depth = 1 this is a sensible
+   accommodation. [verified runtime: `dma_engine_commit_and_wait` writes
+   peripheral-side addresses `spi_base + 0x70/0x80` to PL080 channel SRC/DST]
+
+2. **`CTRLR0[12]` repurposed as "DMA-IRQ / descriptor-ring participation."**
+   DW spec says this bit is `CFS[0]` (Microwire control frame size). Under
+   FRF=Motorola SPI it's architecturally a no-op — TCAT reuses it to gate
+   silicon participation in the IRQ vector-10 + descriptor-ring handshake.
+   Stock fw sets it (`0x1006` static value in firmware) and drives flash
+   from `spi_dma_tx_done_cb @ 0xF618` / `spi_dma_rx_done_cb @ 0xF63C`
+   callbacks; setting it from a polling driver without the IRQ consumer
+   wired up empirically breaks WREN. [verified 2026-04-17 driver tests]
+
+3. **Simplified vendor IRQ aggregation registers.** DW stock has nine
+   IRQ-related registers (TXOICR/RXOICR/RXUICR/MSTICR/ICR + IMR/ISR/RISR);
+   DICE3 collapses these into `+0x18 CLRINT` (write-0-to-clear) and
+   `+0x2C` (DMAGO equivalent), plus a separate `+0x34 ERR` summary
+   register. The "DMAGO" name in our header and `+0x34 ERR` are likely
+   mappings of DW IMR and RISR with TCAT-specific semantics. [conjecture:
+   IRQ-register mapping; verified register effects]
+
+### Live VERSION_ID and IDR
+
+| Register | Flash @ 0xCC000000 | LED @ 0xCF000000 |
+|---|---|---|
+| `+0x58 IDR` | `0x00000001` | `0x00000002` |
+| `+0x5C VERSION_ID` | `0x3332322A` ("*223") | `0x3332322A` ("*223") |
+| `+0xF0 RX_SAMPLE_DLY` | writable, currently 0 | writable, currently 0 |
+| `+0xF4 CS_OVERRIDE` | tied off (write 0xF, reads 0) | tied off |
+
+DW_apb_ssi datasheet: <https://www.synopsys.com/dw/ipdir.php?ds=amba_ssi>
+(public Synopsys page; full TRM gated). Linux kernel reference driver:
+`drivers/spi/spi-dw-core.c` + `drivers/spi/spi-dw.h`.
+
+Throughout this documentation, references to "Arasan SPI IP" or "unidentified
+SPI IP" are **superseded** by the DW_apb_ssi v3.22 identification above.
 
 ---
 ## SRAM map

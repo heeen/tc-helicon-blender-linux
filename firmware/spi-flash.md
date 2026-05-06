@@ -25,12 +25,19 @@ DICE3 has two instances of the same SPI IP block:
 | 0xCC000000 | Flash SPI | Drives SST25VF016B (2 MB, 4 KB sectors). Used for firmware storage. |
 | 0xCF000000 | LED SPI | Drives LED ring + bridges to TC-BLE module. |
 
-The IP vendor is **unidentified** [conjecture: was called "Arasan SPI" in
-older docs but no firmware string supports this; source paths point to
-TCAT-internal SDK code]. See `hardware-reference.md` § "IP fingerprints".
+The IP is **Synopsys DW_apb_ssi v3.22** (`VERSION_ID = 0x3332322A` = "*223")
+with three TCAT-specific extensions: dedicated DMA AHB ports at +0x70/+0x80,
+`CTRLR0[12]` repurposed as a vendor IRQ/descriptor-ring participation bit,
+and a simplified IRQ-aggregation register set. [verified 2026-05-04 JTAG
+ID-block + DFS-clamping probes] See `hardware-reference.md` § "IP fingerprints"
+for the full identification trail. Earlier "Arasan SPI" / "unidentified"
+attributions are superseded.
 
 Per-register layout (CTRL/LEN/EN/CS/CLK/CLRINT/STAT/DMAGO/ERR/DMAMD/
-DMACFG0/DMACFG1/DATA/RX_PORT/TX_PORT) is in `hardware-reference.md`.
+DMACFG0/DMACFG1/DATA/RX_PORT/TX_PORT) is in `hardware-reference.md` —
+that file now also gives the DW-canonical name for each row (CTRLR0,
+CTRLR1, SSIENR, SER, BAUDR, …) so the Linux `spi-dw-core.c` driver and
+DW datasheet apply directly.
 
 ---
 
@@ -333,6 +340,12 @@ and actually recovered a booting unit.
   packer fully word-aligned) — would need address+len math adjustment.
   Not tested.
 
-The Arasan datasheet would be the unlock — except the IP is **not
-verified to be Arasan**. The actual IP vendor is unknown
-[conjecture: TCAT-internal based on source-path strings].
+The IP has now been positively identified as **Synopsys DW_apb_ssi v3.22**
+(2026-05-04 — see `hardware-reference.md` § "IP fingerprints"). The DW
+datasheet + Linux `spi-dw-core.c` driver are the correct unlock. Two
+DW-derived tuning knobs not yet tried for the AAI tail-drop:
+
+- `RX_SAMPLE_DLY @ +0xF0` — writable; relaxes RX setup-time margin.
+- Switch AAI to `TMOD=TO` (TX-only) — eliminates RX-channel bus
+  contention with TX during the bidir hot loop. **Implemented as
+  `--xport dma-tx` in v2 driver (2026-05-04).**

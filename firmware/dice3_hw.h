@@ -23,86 +23,119 @@
  */
 
 /* ──────────────────────────────────────────────────────────────
- * SPI controller IP block  —  two instances on DICE3
+ * SPI controller IP block  —  Synopsys DW_apb_ssi v3.22, two instances
  *
- *   0xCC000000  flash controller (connects to SST25VF016B, cs_index=2)
- *   0xCF000000  LED/coprocessor bus (cs_index=4)
+ *   0xCC000000  flash controller (IDR=1, drives SST25VF016B + multiplexed BLE)
+ *   0xCF000000  LED bus           (IDR=2, drives LED ring)
  *
- * Register map and bit-field semantics were recovered by decompiling
- * the stock firmware's transaction engine in Ghidra (2026-04-17):
- *   spi_engine_queue_and_arm @ 0xfa10   (was FUN_0000f384 / "spi_dma_transfer_start")
+ * Verified 2026-05-04 via JTAG: VERSION_ID @ +0x5C = 0x3332322A (ASCII
+ * "*223" → DW SSI v3.22), IDR @ +0x58 = 1 / 2, no PrimeCell magic at
+ * +0xFE0 (correctly indicating non-ARM IP). Register layout matches DW
+ * spec at every standard offset; DFS clamping at bits [3:0] verified
+ * empirically (write DFS=3, observe 4 bits clocked). See
+ * firmware/hardware-reference.md "IP fingerprints" + register layout
+ * tables for the DW-canonical name of each register.
+ *
+ * TCAT extensions on top of stock DW_apb_ssi:
+ *   - Dedicated DMA AHB ports at +0x70 (RX) and +0x80 (TX). Stock DW
+ *     would route DMA through DR0 @ 0x60.
+ *   - CTRLR0[12] (DW: CFS[0], unused under FRF=Motorola) is repurposed
+ *     as "DMA-IRQ / descriptor-ring participation" — see SPI_CTRL note
+ *     below.
+ *   - +0x18 CLRINT, +0x2C DMAGO, +0x34 ERR are TCAT-simplified IRQ
+ *     aggregation registers replacing DW's TXFTLR/IMR/RISR set.
+ *
+ * Stock-fw register accesses recovered via Ghidra decompile (2026-04-17):
+ *   spi_engine_queue_and_arm @ 0xfa10
  *   dma_engine_commit_and_wait @ 0xf7b4
- *   dma_engine_acquire_hw @ 0xf72c  (computes ctrl_base + clk_div on first use)
- *   dma_transfer_execute_submit @ 0xf5cc (acquire + transfer + release one-shot)
+ *   dma_engine_acquire_hw @ 0xf72c
+ *   dma_transfer_execute_submit @ 0xf5cc
  *
- * Per-resource constants the firmware holds in its resource_t:
- *   flash @ 0x000237ac   ctrl_base=0x1006, clk_div=0x0880, cs_index=2
- *   led   @ 0x000237f8   ctrl_base=0x100A, clk_div=0x0900, cs_index=4
+ * RUNTIME observation (2026-05-04 live JTAG, post-power-cycle stock fw):
+ *   Flash TX ops: CTRL = 0x1c7 = DFS=7 + SCPH=1 + SCPOL=1 + TMOD=TO →
+ *     SPI Mode 3, 8-bit, TX-only. SER = 4 (bit 2). BAUDR = 8.
+ *   BLE bus ops: CTRL = 0x007 = DFS=7 + TMOD=TR (Mode 0 bidir).
+ *     SER = 8 (bit 3). BAUDR = 0x32.
+ *   Earlier static-analysis claim that stock uses 0x1006 with DFS=6
+ *   (= 7-bit frames) was a Ghidra misattribution — the static value
+ *   0x1006 in firmware is in some other field, not the runtime
+ *   CTRL_BASE.
  * ────────────────────────────────────────────────────────────── */
 #define SPI_BASE        0xCC000000u
 
-/* +0x00 CTRL — (direction_bits << 8) | ctrl_base.
+/* +0x00 CTRL = DW CTRLR0. Bit fields per DW spec:
  *
- *   direction_bits select the transfer mode for the current descriptor:
- *     0x000  BIDIR       (full-duplex, DMA TX + RX, e.g. flash READ/RDSR)
- *     0x100  TX          (DMA TX only, e.g. byte-program, WREN, erase)
- *     0x200  RX-only     (DMA RX only — uncommon; primes with DATA=0)
- *     0x300  chained BIDIR (used by multi-descriptor reads)
+ *   [3:0] DFS   data frame size, N_BITS - 1. Always 7 (8-bit).
+ *   [5:4] FRF   frame format. Always 0 (Motorola SPI).
+ *   [6]   SCPH  clock phase  (0 = sample on first edge,  1 = second).
+ *   [7]   SCPOL clock polarity (0 = clock idles low, 1 = idles high).
+ *   [9:8] TMOD  transfer mode: 0=TR (bidir), 1=TO (TX only),
+ *               2=RO (RX only), 3=EEPROM_READ.
+ *   [12]  CFS[0] (DW spec: Microwire control-frame-size, unused under
+ *               FRF=Motorola). TCAT repurposes as IRQ/descriptor-ring
+ *               participation bit. Stock fw sets it (`0x1006` static
+ *               firmware constant) and drives the transaction from
+ *               vector-10 callbacks (spi_dma_tx_done_cb @ 0xf618,
+ *               spi_dma_rx_done_cb @ 0xf63c). Polling driver MUST clear
+ *               it — empirically breaks WREN when set without an IRQ
+ *               consumer attached.
  *
- *   ctrl_base is built by dma_engine_acquire_hw from the resource struct:
- *     | 0x80  if res.byte6 != 0  (16-bit word mode)
- *     | 0x40  if res.byte7 != 0  (MSB-first / polarity)
- *     | 0x07  if res.byte5 == 0  (std 8-bit) else | 0x0F
- *     | 0x1000                   (silicon-level IRQ/descriptor-ring
- *                                 participation bit — see note below)
+ *   v2 driver values (polling, Mode 0):
+ *     0x107 = DFS=7 | TMOD=TO   (TX-only)
+ *     0x207 = DFS=7 | TMOD=RO   (RX-only, primes with DATA=0)
+ *     0x007 = DFS=7 | TMOD=TR   (bidir)
+ *     0x307 = DFS=7 | TMOD=EEPROM_READ (used by stock bootloader's read)
  *
- *   Stock-fw CTRL values for flash (from spi_resource_flash_cfg_singleton
- *   @ 0x000237d0):
- *     TX    = 0x100 | 0x1006 = 0x1106
- *     BIDIR = 0x000 | 0x1006 = 0x1006
- *     RX    = 0x200 | 0x1006 = 0x1206
- *
- *   Polling-mode driver (what we ship) uses direction_bits | 0x06 instead
- *   — bit 12 is the silicon's "participate in the DMA IRQ / descriptor
- *   ring handshake" flag. Stock fw sets it because it drives the whole
- *   transaction from the IRQ vector 10 completion callbacks
- *   (spi_dma_tx_done_cb @ 0xf618, spi_dma_rx_done_cb @ 0xf63c), which
- *   cyg_cond_signal a flag at engine_ctx+0x88. dma_engine_commit_and_wait
- *   @ 0xf7b4 blocks on cyg_flag_timed_wait until the ISR fires. Our
- *   bare-metal driver polls DMA_ISTAT directly, does not install vector
- *   10, and empirically breaks WREN when bit 12 is set — the silicon
- *   seems to stall the controller waiting for the descriptor-ring
- *   handshake that never comes.
- *
- *   WARNING: Earlier memory notes labelled 0x107 = "TX" and 0x207 = "RX".
- *   That was a partial decompile — the real format is direction | base,
- *   not `0xN07` standalone. */
+ *   Stock eCos at runtime uses Mode 3 (SCPH+SCPOL set) for flash TX —
+ *   v2 driver is in Mode 0 and works, but Mode 3 may give better timing
+ *   margin on the AAI hot loop. Switching is a one-line change here
+ *   (OR 0xC0 into the value).
+ */
 #define SPI_CTRL_OFF    0x00
 
-/* Direction bits to OR into CTRL (shift position already baked in). */
-#define SPI_CTRL_DIR_BIDIR      0x000u
-#define SPI_CTRL_DIR_TX         0x100u
-#define SPI_CTRL_DIR_RX         0x200u
-#define SPI_CTRL_DIR_BIDIR_CH   0x300u
+/* Direction bits to OR into CTRL (= DW CTRLR0[9:8] = TMOD). */
+#define SPI_CTRL_DIR_BIDIR      0x000u   /* DW TMOD=0 (TR)         */
+#define SPI_CTRL_DIR_TX         0x100u   /* DW TMOD=1 (TO)         */
+#define SPI_CTRL_DIR_RX         0x200u   /* DW TMOD=2 (RO)         */
+#define SPI_CTRL_DIR_BIDIR_CH   0x300u   /* DW TMOD=3 (EEPROM)     */
 
-/* Flash ctrl_base variants. Stock fw uses _IRQ (0x1006); our polling
- * driver uses _POLL (0x006) because bit 12 wants the IRQ+descriptor-ring
- * context we don't set up. */
-#define SPI_CTRL_BASE_FLASH_IRQ     0x1006u
-#define SPI_CTRL_BASE_FLASH_POLL    0x0006u
+/* SPI Mode bits — stock uses Mode 3 for flash TX, v2 uses Mode 0. */
+#define SPI_CTRL_SCPH           0x040u   /* CTRLR0[6] = sample on 2nd edge */
+#define SPI_CTRL_SCPOL          0x080u   /* CTRLR0[7] = idle high */
+#define SPI_CTRL_MODE3          (SPI_CTRL_SCPH | SPI_CTRL_SCPOL)
+
+/* Flash CTRL_BASE: DFS=7 (8-bit) + FRF=0 (Motorola). v2 driver uses
+ * polling base (no bit-12 vendor IRQ flag). Stock fw stores 0x1006
+ * statically but live-probe shows runtime CTRL = direction | 0x07
+ * (Mode 0) or direction | 0xC7 (Mode 3) — both with bit 12 = 0. The
+ * historical _IRQ variant is kept for reference; do NOT use without
+ * also installing vector 10 + the descriptor-ring handshake. */
+#define SPI_CTRL_BASE_FLASH_POLL    0x0007u
+#define SPI_CTRL_BASE_FLASH_IRQ     0x1007u   /* + bit 12 = TCAT IRQ-ring */
 
 /* +0x04 LEN — frame length in bytes minus 1 (e.g. 4 ⇒ 5 bytes on the wire). */
 #define SPI_LEN_OFF     0x04
 /* +0x08 EN — SPI controller enable (1=on). Must be 0 while reconfiguring. */
 #define SPI_EN_OFF      0x08
 
-/* +0x10 CS — CS assert (write 1 to pull flash CS# low).
- * Ghidra decompile suggested this is a bitmask of shape `1 << cs_index`
- * (cs_index=2 for flash, 4 for LED), but probe 2026-04-17 confirmed the
- * real flash chip only responds when bit 0 is set. The cs_index field in
- * the firmware's resource_t is probably a register/slot selector inside
- * the controller, not a MOSI CS mask. Keep writing 1. */
+/* +0x10 CS = DW SER (slave-enable bitmask). `1 << slave_idx` selects
+ * which slave's CS line is asserted while a transaction runs.
+ *
+ * Live JTAG observation 2026-05-04 of stock eCos:
+ *   SER = 4 (bit 2) when stock fw talks to flash (matches Ghidra
+ *           cs_index=2 for the flash resource_t).
+ *   SER = 8 (bit 3) when stock fw talks to BLE module via the same
+ *           0xCC SPI controller (multiplexed bus).
+ *
+ * v2 driver currently writes SER=1 (bit 0). The April 2026 probe
+ * found bit 0 also drives flash — possibly the silicon ANDs all SER
+ * bits onto the flash CS line, or there's a hardware mux. Either way,
+ * v2's bit-0 choice is empirically functional but is NOT
+ * stock-aligned; aligning to bit 2 reduces the unknowns. [verified
+ * 2026-04-17 + 2026-05-04 live JTAG] */
 #define SPI_CS_OFF      0x10
+#define SPI_SER_FLASH   (1u << 2)    /* stock-aligned flash select */
+#define SPI_SER_BLE     (1u << 3)    /* stock-aligned BLE select   */
 
 /* +0x14 CLK — clock divider (flash uses 0x0880 in stock fw; 2 is
  * bootloader default and works for bare-metal TCAT-BOOT context). */
