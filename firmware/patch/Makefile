@@ -19,13 +19,21 @@ CFLAGS  = -march=armv5te -marm -mno-thumb-interwork \
 # --gc-sections drops unused functions (keeps hooks.elf under the 6528 B
 # PATCH region). -u, forces symbols that are only referenced externally
 # (hooks.py patches firmware_entry's bl to call boot_init; nothing in
-# this link unit references it directly).
-LDFLAGS = -Wl,--gc-sections -Wl,-u,boot_init
+# this link unit references it directly). Same for the midi_rx_dispatch
+# hook stub — patched in via hooks.py's BL-replace trampoline at runtime,
+# no static call from anywhere in the link unit, so gc-sections would
+# otherwise discard the whole chain (dispatch → sysex_handle → flash_op_*
+# → ROM CRC).
+LDFLAGS = -Wl,--gc-sections -Wl,-u,boot_init \
+          -Wl,-u,_hook_midi_rx_dispatch_stub \
+          -Wl,-u,midi_rx_dispatch \
+          -Wl,-u,midi_sysex_handle
 ASFLAGS = -march=armv5te
 
 ELF     = hooks.elf
 BIN     = hooks.bin
-SRCS    = hooks_gen.S handlers.c uart_minprintf.c ../reboot_common.c
+SRCS    = hooks_gen.S handlers.c uart_minprintf.c ../reboot_common.c \
+          midi_rx_dispatch.c midi_sysex_filter.c ../midi_flash_dispatch.c
 LD      = patch.ld
 
 # Bootstrap: small DMA loader in safe code section gap

@@ -441,6 +441,10 @@ void boot_init(void) {
     ep3_rxflvl_last = 0;
     ep3_last_q0 = 0;
 
+    /* MIDI RX dispatcher state — same BSS-not-zeroed problem. */
+    extern void midi_rx_dispatch_init(void);
+    midi_rx_dispatch_init();
+
     /* Initialize HPLL clock before USB starts. Without this, the kernel's
      * snd-usb-audio driver fails to probe (clock descriptors invalid).
      * Safe here: .ctors have populated the clock source table, but the

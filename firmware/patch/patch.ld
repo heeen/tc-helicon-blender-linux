@@ -5,12 +5,16 @@ INCLUDE "/home/florian/src-misc/helicon-blender/firmware/firmware_symbols.ld"
 ENTRY(_hook_midi_loop_stub)
 
 MEMORY {
-    PATCH (rwx) : ORIGIN = 0x32600, LENGTH = 9216
+    PATCH (rwx) : ORIGIN = 0x32600, LENGTH = 9728
 }
 
 SECTIONS {
     .text.hook_midi_loop 0x32600 : {
         *(.text.hook_midi_loop)
+    } > PATCH
+
+    .text.hook_midi_rx_dispatch 0x32604 : {
+        *(.text.hook_midi_rx_dispatch)
     } > PATCH
 
     .text : {

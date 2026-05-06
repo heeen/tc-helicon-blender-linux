@@ -35,22 +35,24 @@ PATCHED_SPI = FIRMWARE_DIR / 'blender_spi_patched.bin'
 # DCP registration still needs JTAG inject (main loop blocked in cyg_flag_wait).
 
 PATCH_ZONE_SRAM = 0x32600
-PATCH_ZONE_SIZE = 0x2400  # 9216 bytes — reboot_common.c + handler (grown
-                          # 2026-04-23 from 0x2000 to fit the completion
-                          # callback wrapper + per-loop instrumentation
-                          # counters/polls)
+PATCH_ZONE_SIZE = 0x2600  # 9728 bytes — reboot_common.c + handlers + dispatch
+                          # (grown 2026-04-23 from 0x2000 → 0x2400 for
+                          # completion-callback wrapper + per-loop
+                          # instrumentation; 2026-05-06 → 0x2600 for
+                          # midi_rx_dispatch.c + midi_sysex_handle)
 
 # Heap base literal in code section (patched for persistent mode)
 HEAP_LITERAL_SRAM = 0xC570     # mempool_var_init loads heap_start from here
 HEAP_BASE_ORIG    = 0x325F8    # original heap_start = BSS_end
-HEAP_BASE_NEW     = 0x34A00    # new heap_start (= PATCH_ZONE_SRAM + PATCH_ZONE_SIZE)
+HEAP_BASE_NEW     = 0x34C00    # new heap_start (= PATCH_ZONE_SRAM + PATCH_ZONE_SIZE)
 
 # Firmware identity
 IDENTITY_ADDR = 0x8968
 IDENTITY_WORD = 0xe92d4ff0
 
 # Hook sites
-HOOK_MIDI_LOOP = 0x5180  # bl midi_rx_poll in midi_engine_thread main loop
+HOOK_MIDI_LOOP        = 0x5180  # bl midi_rx_poll in midi_engine_thread main loop
+HOOK_MIDI_RX_PARSE_BL = 0x2AD8  # bl midi_parser_process_bytes inside midi_rx_poll
 
 
 # ── Hook definition ────────────────────────────────────────────────────────
@@ -60,6 +62,20 @@ hooks = [
         name="midi_loop",
         target=HOOK_MIDI_LOOP,
         handler="midi_loop_hook",
+        mode="replace",
+    ),
+    # SysEx flash dispatcher — added 2026-05-05, replaced filter-mode 2026-05-06.
+    # BL-replace at the call to midi_parser_process_bytes inside midi_rx_poll.
+    # The dispatcher demultiplexes the raw USB-MIDI byte stream: bytes that
+    # form an `F0 7D ... F7` frame go into our private 1 KB accumulator,
+    # everything else is forwarded to the displaced midi_parser_process_bytes.
+    # Bypasses the stock parser's 23-byte SysEx buffer cap that previously
+    # limited request payloads to 11 raw bytes (24-byte wire frame).
+    # See firmware/midi_flash_protocol.md for the wire protocol.
+    Hook(
+        name="midi_rx_dispatch",
+        target=HOOK_MIDI_RX_PARSE_BL,
+        handler="midi_rx_dispatch",
         mode="replace",
     ),
 ]
@@ -152,6 +168,23 @@ def cmd_patch():
     new_hook = encode_arm_bl(HOOK_MIDI_LOOP, stub_addr)
     struct.pack_into('<I', content, hook_off, new_hook)
     print(f"  Hook: 0x{HOOK_MIDI_LOOP:05X} bl 0x{stub_addr:05X} ({new_hook:#010x}, was {old_hook:#010x})")
+
+    # ── Patch 3b: MIDI RX dispatcher BL-replace at 0x2AD8 ──
+    # Replace `bl midi_parser_process_bytes` (0x3ED0) inside midi_rx_poll
+    # with `bl _hook_midi_rx_dispatch_stub`. The replace stub does
+    # `b midi_rx_dispatch` — our handler then either accumulates into
+    # its private buffer (for `F0 7D ...` frames) or forwards bytes back
+    # to the displaced midi_parser_process_bytes for stock CC/Roland-SysEx.
+    rxdisp_stub = symbols.get('_hook_midi_rx_dispatch_stub')
+    if rxdisp_stub:
+        rxdisp_off = sram_to_file(HOOK_MIDI_RX_PARSE_BL)
+        old_rxdisp = struct.unpack_from('<I', content, rxdisp_off)[0]
+        new_rxdisp = encode_arm_bl(HOOK_MIDI_RX_PARSE_BL, rxdisp_stub)
+        struct.pack_into('<I', content, rxdisp_off, new_rxdisp)
+        print(f"  Hook: 0x{HOOK_MIDI_RX_PARSE_BL:05X} bl 0x{rxdisp_stub:05X} "
+              f"({new_rxdisp:#010x}, was {old_rxdisp:#010x})")
+    else:
+        print("  WARNING: _hook_midi_rx_dispatch_stub not in ELF — RX dispatcher NOT installed")
 
     # ── Patch 4: Move heap_start past handler zone ──
     # mempool_var_init loads heap_start from literal at 0xC570
