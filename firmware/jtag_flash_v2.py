@@ -64,9 +64,14 @@ TIMING_FIELDS = (
     "verify_quiesce_mode",
     "log_silent",
     "read_mode",
+    "rx_sample_dly",      # DW SSI +0xF0 (0..7)
+    "spi_mode_bits",      # 0 = Mode 0, 0xC0 = Mode 3 (SCPH+SCPOL)
+    "flash_ser",          # 1 = bit 0 (current v2), 4 = bit 2 (stock-aligned)
+    "aai_sync_mode",      # 0 = FAST (busy_wait only), 1 = STOCK (busy_wait + RDSR poll)
 )
-XPORT_DMA = 0
-XPORT_PIO = 1
+XPORT_DMA    = 0   # bidir DMA: CH0 RX + CH1 TX, TMOD=0  (CTRL=0x007)
+XPORT_PIO    = 1   # PIO byte-by-byte (broken on this silicon)
+XPORT_DMA_TX = 2   # TX-only DMA: CH1 only, TMOD=1 (CTRL=0x107). AAI tail-drop probe.
 READ_MODE_BIDIR  = 0
 READ_MODE_RXONLY = 1
 TIMING_DEFAULTS = {
@@ -86,7 +91,11 @@ TIMING_DEFAULTS = {
     "byte_prog_offset":           0,
     "verify_quiesce_mode":        0,
     "log_silent":                 0,
-    "read_mode":                  READ_MODE_BIDIR,
+    "read_mode":                  READ_MODE_RXONLY,
+    "rx_sample_dly":              0,
+    "spi_mode_bits":              0,
+    "flash_ser":                  1,
+    "aai_sync_mode":              0,
 }
 
 MAGIC_CMD = 0x4D324657  # 'M2FW'
@@ -1600,11 +1609,12 @@ def main(argv=None):
                    help="byte-test: target SPI address for the single-byte write")
     p.add_argument("--byte-val", type=lambda x: int(x, 0), default=0x5A,
                    help="byte-test: byte value to program")
-    p.add_argument("--xport", choices=("dma", "pio"), default=None,
+    p.add_argument("--xport", choices=("dma", "pio", "dma-tx"), default=None,
                    help="Select AAI hot-loop transport backend on the "
-                        "driver (dma = current; pio = byte-by-byte DATA "
-                        "register writes). Diagnostic lever for isolating "
-                        "DMA-engine drops from silicon-level drops.")
+                        "driver (dma = bidir DMA, current default; pio = "
+                        "byte-by-byte DATA writes, broken; dma-tx = TX-only "
+                        "DMA with TMOD=1, isolates the DW SSI bidir bus-"
+                        "arbitration tail-drop from silicon-level drops).")
     p.add_argument("--nreset", action="store_true",
                    help="Pulse hardware nRESET (reset halt) after OpenOCD "
                         "connects, before loading the SRAM driver. Uses "
@@ -1645,7 +1655,11 @@ def main(argv=None):
                              f"known: {list(TIMING_DEFAULTS)}")
         timing_overrides[name] = int(val.strip(), 0)
     if args.xport is not None:
-        timing_overrides["xport_mode"] = XPORT_PIO if args.xport == "pio" else XPORT_DMA
+        timing_overrides["xport_mode"] = {
+            "dma":    XPORT_DMA,
+            "pio":    XPORT_PIO,
+            "dma-tx": XPORT_DMA_TX,
+        }[args.xport]
     if getattr(args, "repro_variant", "bidir") == "rxonly":
         timing_overrides["read_mode"] = READ_MODE_RXONLY
 

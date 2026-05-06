@@ -358,10 +358,42 @@ struct v2_timings {
      *                entirely. The bootloader CRC-checks every
      *                successful firmware boot using this path at PLL.) */
     volatile uint32_t read_mode;
+
+    /* AAI tail-drop tuning knobs — added 2026-05-04 after positively
+     * identifying the SPI IP as DW_apb_ssi v3.22. */
+
+    /* DW SSI RX_SAMPLE_DLY @ +0xF0 — relaxes RX-data setup timing. 0–7
+     * sample-clock cycles. Default 0 = stock behavior. Try 1–3 to fight
+     * AAI tail-drop. */
+    volatile uint32_t rx_sample_dly;
+
+    /* SPI mode bits OR'd into CTRL. 0 = Mode 0 (current v2 default).
+     * 0xC0 = Mode 3 (stock-aligned: SCPH+SCPOL set). Stock eCos uses
+     * Mode 3 for flash TX at runtime. */
+    volatile uint32_t spi_mode_bits;
+
+    /* SER (CS bitmask) for flash. Default 1 (= bit 0, current v2).
+     * 4 = bit 2 (stock-aligned). Both empirically work for the flash
+     * chip on this hardware. */
+    volatile uint32_t flash_ser;
+
+    /* AAI per-pair readiness sync mode (added 2026-05-04 after live-probe
+     * confirmed stock fw uses RDSR polling between pairs):
+     *   0 = FAST (current v2 default — busy_wait_us only, no RDSR)
+     *   1 = STOCK (busy_wait_us + RDSR poll until WIP clears, then
+     *              re-setup the AAI hot loop). Slower (~30-50 µs/pair)
+     *              but matches stock's per-pair handshake — should
+     *              eliminate Tbp-edge violations that cause +2B shift. */
+    volatile uint32_t aai_sync_mode;
 };
 
-#define V2_XPORT_DMA 0u
-#define V2_XPORT_PIO 1u
+#define V2_XPORT_DMA    0u   /* bidir DMA: CH0 RX, CH1 TX, TMOD=0 (CTRL=0x007) */
+#define V2_XPORT_PIO    1u   /* PIO byte-by-byte (broken on this silicon) */
+#define V2_XPORT_DMA_TX 2u   /* TX-only DMA: CH1 only, TMOD=1 (CTRL=0x107).
+                              * Probe for the AAI tail-drop hypothesis: with
+                              * FIFO_DEPTH=1 the bidir variant fights for PL080
+                              * bus arbitration; TX-only eliminates the RX
+                              * channel and removes that contention path. */
 
 #define V2_VERIFY_QUIESCE_OFF    0u
 #define V2_VERIFY_QUIESCE_LIGHT  1u
@@ -399,6 +431,22 @@ struct v2_timings {
  * is caught by do_verify's 4× retry. */
 #define V2_TIM_DEFAULT_VERIFY_QUIESCE_MODE       V2_VERIFY_QUIESCE_OFF
 #define V2_TIM_DEFAULT_LOG_SILENT                0u
-#define V2_TIM_DEFAULT_READ_MODE                 V2_READ_MODE_BIDIR
+/* Flipped to RXONLY 2026-05-05 after the read-mode A/B sweep showed it
+ * cuts the +2B-shift miss rate by ~2× (47% → 23% on a 30-iter shift-
+ * repro). Bidir mode is still selectable via host TIM override for
+ * comparison testing. The remaining 23% is a residual bug that doesn't
+ * yield to dummy-JEDEC preambles (those are bidir-specific and
+ * actively hurt rxonly — verified 2026-05-05). */
+#define V2_TIM_DEFAULT_READ_MODE                 V2_READ_MODE_RXONLY
+
+/* AAI tail-drop tuning defaults (added 2026-05-04). All defaults match
+ * current v2 behavior so existing tests are unaffected. */
+#define V2_TIM_DEFAULT_RX_SAMPLE_DLY             0u   /* 0..7 */
+#define V2_TIM_DEFAULT_SPI_MODE_BITS             0u   /* 0=Mode 0, 0xC0=Mode 3 */
+#define V2_TIM_DEFAULT_FLASH_SER                 1u   /* 1=bit 0 (current), 4=bit 2 (stock) */
+
+#define V2_AAI_SYNC_FAST                         0u   /* busy_wait only (current default) */
+#define V2_AAI_SYNC_STOCK                        1u   /* busy_wait + RDSR poll (stock-aligned) */
+#define V2_TIM_DEFAULT_AAI_SYNC_MODE             V2_AAI_SYNC_FAST
 
 #endif /* SRAM_FLASH_MAILBOX_V2_H */

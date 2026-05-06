@@ -57,6 +57,10 @@ static void init_timings_if_needed(void) {
     TIM->verify_quiesce_mode       = V2_TIM_DEFAULT_VERIFY_QUIESCE_MODE;
     TIM->log_silent                = V2_TIM_DEFAULT_LOG_SILENT;
     TIM->read_mode                 = V2_TIM_DEFAULT_READ_MODE;
+    TIM->rx_sample_dly             = V2_TIM_DEFAULT_RX_SAMPLE_DLY;
+    TIM->spi_mode_bits             = V2_TIM_DEFAULT_SPI_MODE_BITS;
+    TIM->flash_ser                 = V2_TIM_DEFAULT_FLASH_SER;
+    TIM->aai_sync_mode             = V2_TIM_DEFAULT_AAI_SYNC_MODE;
     TIM->magic                     = V2_TIMINGS_MAGIC;
 }
 #define LOG_RING  ((struct v2_log_entry *)V2_LOG_RING_ADDR)
@@ -340,6 +344,9 @@ static void spi_reset_clean(void) {
     SPI_CLRINT = 0;
     SPI_DMACFG0 = 0;
     SPI_DMACFG1 = 0;
+    /* DW SSI RX_SAMPLE_DLY (+0xF0). Tunable knob — defaults to 0 (no
+     * delay), set non-zero to relax RX setup timing for AAI tail-drop. */
+    *(volatile uint32_t *)(SPI_BASE + 0xF0) = TIM->rx_sample_dly;
     DMA_EN = 0;
     DMA_ICLR = 0xF;
     DMA_CHCLR(0) = 1;
@@ -854,8 +861,15 @@ typedef struct {
 } spi_xport_t;
 
 static const spi_xport_t xport_dma;
-static const spi_xport_t xport_pio;
 static const spi_xport_t *XPORT = &xport_dma;
+
+static void aai_hot_loop_setup(void);
+
+/* When non-zero, the xport_dma path runs the AAI hot loop in TMOD=TO
+ * (TX-only) instead of TMOD=TR (bidir). Set by do_main from
+ * TIM->xport_mode == V2_XPORT_DMA_TX. Single-byte to keep the size
+ * delta minimal — every byte counts against the 9 KB SRAM budget. */
+static uint8_t s_xport_tx_only;
 
 static int do_aai_program(uint32_t spi_addr, const uint8_t *data, uint32_t len) {
     if (len < 2 || (len & 1)) {
@@ -898,13 +912,25 @@ static int xport_dma_aai_begin(uint32_t spi_addr, uint8_t d0, uint8_t d1) {
     log_put(V2_EVT_AAI_FIRST, 0, spi_addr);
     if (aai_pair_wait(0) != 0) return -1;
 
-    /* Configure the controller for the bidir DMA hot loop. */
+    aai_hot_loop_setup();
+    return 0;
+}
+
+/* Configure SPI controller + DMA channels for the AAI hot-loop. Called
+ * once per AAI run by xport_dma_aai_begin, AND again after each per-pair
+ * RDSR poll if TIM->aai_sync_mode == STOCK (the rdsr() call tears down
+ * the SPI EN state, requiring a re-setup before the next shift_once).
+ *
+ * tx_only=1 → DW SSI TMOD=TO + DMACR=TDMAE; tx_only=0 → bidir (TMOD=TR
+ * + DMACR=TDMAE|RDMAE). spi_mode_bits OR'd in for SCPH+SCPOL Mode 3. */
+
+static void aai_hot_loop_setup(void) {
     SPI_EN = 0;
     SPI_CS = 0;
     SPI_DMAGO = 0;
-    SPI_CTRL = 0x007;
+    SPI_CTRL = (s_xport_tx_only ? 0x107 : 0x007) | TIM->spi_mode_bits;
     SPI_LEN = 2;
-    SPI_DMAMD = 3;
+    SPI_DMAMD = s_xport_tx_only ? 2 : 3;
     SPI_CLK = DRV_SPI_CLK_DIV;
     SPI_DMACFG0 = 4;
     SPI_DMACFG1 = 3;
@@ -912,17 +938,18 @@ static int xport_dma_aai_begin(uint32_t spi_addr, uint8_t d0, uint8_t d1) {
     SPI_EN = 1;
     dwb();
 
-    DMA_EN = 3;
+    DMA_EN = s_xport_tx_only ? 2 : 3;
     dwb();
-    DMA_CHREG(0, 0x04) = (uint32_t)(uintptr_t)RX_SCRATCH;
-    DMA_CHREG(0, 0x08) = 0;
+    if (!s_xport_tx_only) {
+        DMA_CHREG(0, 0x04) = (uint32_t)(uintptr_t)RX_SCRATCH;
+        DMA_CHREG(0, 0x08) = 0;
+    }
     DMA_CHREG(1, 0x04) = SPI_TX_PORT;
     DMA_CHREG(1, 0x08) = 0;
     dwb();
 
     TX_SCRATCH[0] = SST_CMD_AAI;
     dwb();
-    return 0;
 }
 
 /* Core pair transmission: one CS cycle shifting [0xAD, d0, d1] via bidir
@@ -931,14 +958,16 @@ static int xport_dma_aai_begin(uint32_t spi_addr, uint8_t d0, uint8_t d1) {
  * Returns -1 on spin timeout. */
 static int xport_dma_aai_shift_once(uint32_t *out_err) {
     DMA_ICLR = 0xF;
-    DMA_CHCLR(0) = 1;
+    if (!s_xport_tx_only) DMA_CHCLR(0) = 1;
     DMA_CHCLR(1) = 1;
 
-    DMA_CHREG(0, 0x10) = 0;
-    DMA_CHREG(0, 0x00) = SPI_RX_PORT;
-    DMA_CHREG(0, 0x04) = (uint32_t)(uintptr_t)RX_SCRATCH;
-    DMA_CHREG(0, 0x08) = 0;
-    DMA_CHREG(0, 0x0C) = 3u | DMA_CFG_RX;
+    if (!s_xport_tx_only) {
+        DMA_CHREG(0, 0x10) = 0;
+        DMA_CHREG(0, 0x00) = SPI_RX_PORT;
+        DMA_CHREG(0, 0x04) = (uint32_t)(uintptr_t)RX_SCRATCH;
+        DMA_CHREG(0, 0x08) = 0;
+        DMA_CHREG(0, 0x0C) = 3u | DMA_CFG_RX;
+    }
     DMA_CHREG(1, 0x10) = 0;
     DMA_CHREG(1, 0x00) = (uint32_t)(uintptr_t)TX_SCRATCH;
     DMA_CHREG(1, 0x04) = SPI_TX_PORT;
@@ -948,22 +977,29 @@ static int xport_dma_aai_shift_once(uint32_t *out_err) {
 
     dma_done_flag = 0;
     dwb();
-    DMA_CHREG(0, 0x10) = DMA_TRG_RX;
+    if (!s_xport_tx_only) DMA_CHREG(0, 0x10) = DMA_TRG_RX;
     DMA_CHREG(1, 0x10) = DMA_TRG_TX;
     dwb();
 
-    SPI_CS = 1;
+    /* DW SSI SER (slave-enable bitmask). TIM->flash_ser = 1 (current
+     * v2 default) or 4 (stock-aligned bit 2). Only this hot-path CS
+     * assertion is parameterized — other paths still use SPI_CS=1. */
+    SPI_CS = TIM->flash_ser;
     SPI_CLRINT = 0;
     dwb();
 
-    if (wait_dma_irq(5000) != 0) { dma_abort(); return -1; }
+    /* Bidir waits on CH0 (RX completes after TX in the SPI core's
+     * model); TX-only waits on CH1. */
+    uint32_t mask = s_xport_tx_only ? 0x2u : 0x1u;
+    if (wait_dma_irq_mask(5000, mask) != 0) { dma_abort(); return -1; }
     uint32_t t0 = now_us();
     while (SPI_STAT & SPI_STAT_BUSY) {
         if (now_us() - t0 > 5000) { dma_abort(); return -1; }
     }
-    /* Sample SPI_ERR BEFORE dropping CS — the bit may be cleared by the
-     * next CS assert edge, so sampling after is racy. Bit 2 == transfer
-     * error per bootloader's dma_poll_complete. */
+    /* Sample SPI_ERR (= DW SSI RISR) BEFORE dropping CS — the bit may
+     * be cleared by the next CS assert edge. Bit 2 = RXUI on stock DW
+     * SSI; on TX-only it shouldn't fire (RX disabled). Bit 1 = TXOI
+     * (TX overrun) is the canonical underrun-after-CS-deassert symptom. */
     *out_err = SPI_ERR;
     SPI_CS = 0;
     dwb();
@@ -990,8 +1026,17 @@ static int xport_dma_aai_pair(uint8_t d0, uint8_t d1, uint32_t pair_idx,
         MBOX->pair_retries++;
     }
 
-    busy_wait_us(TIM->aai_pair_fixed_us);
-    (void)pair_idx;
+    if (TIM->aai_sync_mode == V2_AAI_SYNC_STOCK) {
+        /* Stock-aligned readiness sync (added 2026-05-04). aai_pair_wait
+         * does the fixed delay + RDSR poll until WIP clears. RDSR (via
+         * dma_rx) tears down the AAI hot-loop SPI EN state, so we must
+         * re-arm before the next shift_once. ~30-50 µs/pair total vs
+         * ~10 µs in FAST mode — the cost of catching Tbp_max drift. */
+        if (aai_pair_wait(pair_idx) != 0) return -1;
+        aai_hot_loop_setup();
+    } else {
+        busy_wait_us(TIM->aai_pair_fixed_us);
+    }
     (void)spi_addr_for_log;
     return 0;
 }
@@ -1016,100 +1061,17 @@ static const spi_xport_t xport_dma = {
     .aai_end   = xport_dma_aai_end,
 };
 
-/* ─── xport_pio: byte-by-byte DATA-register backend ───────────
- *
- * WARNING (2026-04-18): PIO TX on the flash SPI controller (0xCC) does
- * not clock bytes reliably. v1's `pio_cmd1` uses `dma_tx` internally
- * despite the misleading name, and a commit-time note in v1
- * (sram_flash_driver.c:267-270) documents that "genuine PIO was tried
- * and the WREN silently fails on the stock firmware path." Matches what
- * we see here: this AAI-via-PIO path compiles, completes its spin
- * loops, leaves last_sr=0xFF and writes nothing to flash. Kept as a
- * stub for documentation and future debugging; not production-viable.
- * Use xport_dma for real flashing. */
+/* xport_dma_tx is not a separate vtable — it shares xport_dma's
+ * functions and toggles a static flag (s_xport_tx_only) read inside
+ * xport_dma_aai_begin / xport_dma_aai_shift_once. The flag is set in
+ * do_main when latching XPORT from TIM->xport_mode. */
 
-static int pio_send_bytes(const uint8_t *buf, uint32_t len) {
-    /* Caller must have CS asserted and LEN / EN configured. Pushes each
-     * byte into the DATA register after TX_READY. Returns 0 on success,
-     * -1 on spin-timeout. */
-    for (uint32_t i = 0; i < len; i++) {
-        int spun = 0;
-        while (!(SPI_STAT & SPI_STAT_TX_RDY)) {
-            if (++spun > 20000) return -1;
-        }
-        SPI_DATA = buf[i];
-    }
-    int spun = 0;
-    while (SPI_STAT & SPI_STAT_BUSY) {
-        if (++spun > 30000) return -1;
-    }
-    return 0;
-}
-
-static int pio_cs_cycle(const uint8_t *buf, uint32_t len) {
-    /* Full CS cycle + PIO burst for a short transfer (up to TX_SCRATCH_MAX
-     * bytes). Reconfigures the controller each call so we can interleave
-     * with other modes cleanly. */
-    while (SPI_STAT & SPI_STAT_BUSY) {}
-    SPI_EN = 0;
-    SPI_CS = 0;
-    SPI_DMAGO = 0;
-    SPI_DMAMD = 0;
-    SPI_CTRL = 0x207;            /* PIO TX (v1 validated value) */
-    SPI_LEN = len - 1;
-    SPI_CLK = DRV_SPI_CLK_DIV;
-    dwb();
-    SPI_EN = 1;
-    SPI_CS = 1;
-    SPI_CLRINT = 0;
-    dwb();
-
-    int rc = pio_send_bytes(buf, len);
-
-    SPI_CS = 0;
-    SPI_EN = 0;
-    dwb();
-    return rc;
-}
-
-static int xport_pio_aai_begin(uint32_t spi_addr, uint8_t d0, uint8_t d1) {
-    set_phase(V2_PHASE_AAI_FIRST);
-    TX_SCRATCH[0] = SST_CMD_AAI;
-    TX_SCRATCH[1] = (uint8_t)(spi_addr >> 16);
-    TX_SCRATCH[2] = (uint8_t)(spi_addr >> 8);
-    TX_SCRATCH[3] = (uint8_t)spi_addr;
-    TX_SCRATCH[4] = d0;
-    TX_SCRATCH[5] = d1;
-    if (pio_cs_cycle((const uint8_t *)TX_SCRATCH, 6) != 0) return -1;
-    log_put(V2_EVT_AAI_FIRST, 0, spi_addr);
-    if (aai_pair_wait(0) != 0) return -1;
-
-    /* Leave SPI off/idle — each aai_pair call configures fresh. */
-    return 0;
-}
-
-static int xport_pio_aai_pair(uint8_t d0, uint8_t d1, uint32_t pair_idx,
-                              uint32_t spi_addr_for_log) {
-    TX_SCRATCH[0] = SST_CMD_AAI;
-    TX_SCRATCH[1] = d0;
-    TX_SCRATCH[2] = d1;
-    if (pio_cs_cycle((const uint8_t *)TX_SCRATCH, 3) != 0) return -1;
-    busy_wait_us(TIM->aai_pair_fixed_us);
-    (void)pair_idx; (void)spi_addr_for_log;
-    return 0;
-}
-
-static void xport_pio_aai_end(void) {
-    SPI_CS = 0;
-    SPI_EN = 0;
-    dwb();
-}
-
-static const spi_xport_t xport_pio = {
-    .aai_begin = xport_pio_aai_begin,
-    .aai_pair  = xport_pio_aai_pair,
-    .aai_end   = xport_pio_aai_end,
-};
+/* PIO xport (V2_XPORT_PIO=1) was tried 2026-04-18 and removed 2026-05-04
+ * to free SRAM budget for the stock-aligned RDSR sync. PIO TX on the
+ * flash SPI controller (0xCC) does not clock bytes reliably on this
+ * silicon — leaves last_sr=0xFF and writes nothing. v1's pio_cmd1 uses
+ * dma_tx internally despite the misleading name. Use V2_XPORT_DMA or
+ * V2_XPORT_DMA_TX. */
 
 /* ─── do_aai_program_run: xport-dispatched ──────────────────── */
 
@@ -1339,6 +1301,15 @@ static int dma_rxonly_read(uint32_t spi_addr, uint8_t *out, uint32_t len,
                            uint32_t budget_us)
 {
     if (len == 0 || len > 0xFFF) return -1;
+
+    /* No dummy JEDEC preamble here — verified 2026-05-05 that adding
+     * one (mirroring dma_bidir_read 2026-05-02) DOUBLES the +2B-shift
+     * miss rate (23% → 47%). The dummy JEDEC is a bidir transaction;
+     * running it before an rxonly read re-injects the very FIFO-packer
+     * state that rxonly was bypassing. The two paths have different
+     * post-AAI sensitivities: bidir's own first chunk hits the packer
+     * bug (dummy absorbs it); rxonly's CTRL=0x307 / TMOD=EEPROM_READ
+     * sidesteps the packer entirely (no dummy needed). */
 
     while (SPI_STAT & SPI_STAT_BUSY) {}
     SPI_EN = 0;
@@ -1802,9 +1773,12 @@ void do_main(void) {
     MBOX->build_tag    = 0x56324648u;   /* 'V2FH' — adds V2_CMD_HASH_RANGE */
     init_timings_if_needed();
     /* Latch the AAI transport backend from the timings struct. The
-     * default is DMA; host may set xport_mode=V2_XPORT_PIO before
-     * issuing the first command. */
-    XPORT = (TIM->xport_mode == V2_XPORT_PIO) ? &xport_pio : &xport_dma;
+     * default is bidir DMA. PIO is broken on this silicon (kept for
+     * documentation). DMA_TX flips a flag inside xport_dma's inner
+     * channel-program code to TMOD=TO + single-channel — diagnostic
+     * for the AAI tail-drop hypothesis. */
+    XPORT = &xport_dma;
+    s_xport_tx_only = (TIM->xport_mode == V2_XPORT_DMA_TX) ? 1 : 0;
     dwb();
 
     driver_setup();
@@ -1818,7 +1792,8 @@ void do_main(void) {
         /* Accept: clear magic (host re-arms by writing magic again). */
         MBOX->magic = 0;
         /* Re-latch the AAI xport — host may have toggled between cmds. */
-        XPORT = (TIM->xport_mode == V2_XPORT_PIO) ? &xport_pio : &xport_dma;
+        XPORT = &xport_dma;
+        s_xport_tx_only = (TIM->xport_mode == V2_XPORT_DMA_TX) ? 1 : 0;
         dwb();
 
         handle_command(cmd);
