@@ -8,6 +8,8 @@ use blender_proto::param::ParamId;
 use blender_proto::state::MixerState;
 use blender_proto::tuple::Tuple;
 
+pub mod flash;
+
 /// MIDI CC numbers matching the firmware's midi_cc_handler in handlers.c.
 const CC_MASTER_LEVEL: u8 = 7;
 const CC_INPUT1: u8 = 16;

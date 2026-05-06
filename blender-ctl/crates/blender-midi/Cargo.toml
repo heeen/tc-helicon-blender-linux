@@ -9,3 +9,4 @@ midir = "0.10"
 tokio = { version = "1", features = ["sync", "rt"] }
 anyhow = "1"
 log = "0.4"
+rusb = "0.9"

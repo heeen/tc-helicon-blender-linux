@@ -208,6 +208,7 @@ dependencies = [
  "blender-proto",
  "log",
  "midir",
+ "rusb",
  "tokio",
 ]
 

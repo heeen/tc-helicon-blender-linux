@@ -45,6 +45,9 @@ enum Command {
     /// USB subcommands
     #[command(subcommand)]
     Usb(UsbCommand),
+    /// USB MIDI SysEx subcommands (flash via patched primary firmware)
+    #[command(subcommand)]
+    Midi(MidiCommand),
 }
 
 #[derive(Subcommand)]
@@ -113,6 +116,71 @@ enum FlashCommand {
     Reenum,
 }
 
+#[derive(Subcommand)]
+enum MidiCommand {
+    /// SPI flash operations over USB-MIDI SysEx (manuf 0x7D)
+    #[command(subcommand)]
+    Flash(MidiFlashCommand),
+}
+
+#[derive(Subcommand)]
+enum MidiFlashCommand {
+    /// Query flash + dispatcher version (JEDEC, sector/flash size, MFD tag)
+    Info,
+    /// Read flash region via sst25xx_fast_read
+    Read {
+        /// Start address (hex, e.g. 0x40000)
+        addr: String,
+        /// Length in bytes (hex or decimal, ≤ 192 per call)
+        len: String,
+        /// Output file (omit for hex dump to stdout)
+        #[arg(long)]
+        out: Option<String>,
+    },
+    /// HASH_RANGE — whole CRC + per-sector CRC array drained via MEM_READ
+    Hash {
+        /// Start address
+        addr: String,
+        /// Length in bytes
+        len: String,
+        /// Print every per-sector CRC
+        #[arg(long)]
+        show_sectors: bool,
+    },
+    /// Erase one or more 4 KB sectors
+    Erase {
+        /// Start address (sector-aligned)
+        addr: String,
+        /// Sector count
+        #[arg(default_value = "1")]
+        count: u16,
+    },
+    /// Write a small region (one frame, ≤ chunk size)
+    Write {
+        /// Start address
+        addr: String,
+        /// Input file
+        file: String,
+    },
+    /// Sector-diff update — flash only sectors that differ from --ref
+    Update {
+        /// Reference image file
+        #[arg(long)]
+        r#ref: String,
+        /// Region start in flash (default 0x40000 — patched primary base)
+        #[arg(long, default_value = "0x40000")]
+        region: String,
+        /// Region length (default = primary size = 0x4B000 = 75 sectors)
+        #[arg(long, default_value = "0x4B000")]
+        length: String,
+    },
+    /// Reboot device (best-effort — reply may be lost during reset)
+    Reboot {
+        #[arg(long, default_value = "0")]
+        mode: u8,
+    },
+}
+
 fn parse_value(s: &str) -> Result<u8> {
     let s = s.trim();
     if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
@@ -168,6 +236,12 @@ async fn main() -> Result<()> {
                 UsbCommand::Info => cmd_usb_info(),
                 UsbCommand::Dcp { cmd_id, body } => cmd_usb_dcp(&cmd_id, body.as_deref()),
                 UsbCommand::Flash(flash) => cmd_usb_flash(flash),
+            })
+            .await?
+        }
+        Command::Midi(midi) => {
+            tokio::task::spawn_blocking(move || match midi {
+                MidiCommand::Flash(flash) => cmd_midi_flash(flash),
             })
             .await?
         }
@@ -630,4 +704,189 @@ fn cmd_usb_dcp(cmd_id_str: &str, body_str: Option<&str>) -> Result<()> {
 
     dev.release();
     Ok(())
+}
+
+// ── MIDI Flash Commands ─────────────────────────────────────────────────
+
+/// Wraps a MIDI flash error with a hint pointing at the JTAG fallback path.
+/// Reached when MIDI is unreachable (e.g. patched primary not flashed yet,
+/// EP3 OUT wedged after soft-reboot, dispatcher BSS un-initialized) — the
+/// JTAG path bypasses the running firmware entirely.
+fn jtag_fallback_hint(e: anyhow::Error) -> anyhow::Error {
+    eprintln!();
+    eprintln!("MIDI flash failed: {e:#}");
+    eprintln!();
+    eprintln!("JTAG fallback (requires Pico-DAP / MioLink):");
+    eprintln!("  cd firmware/patch && make flash");
+    eprintln!("    — uses blender_tool.py + v2 mailbox driver via JTAG.");
+    eprintln!("    — flashes the persistent SPI image (sector-diffed).");
+    eprintln!("    — auto-reboots; physical power-cycle still needed if EP3 OUT wedges.");
+    eprintln!();
+    e
+}
+
+fn cmd_midi_flash(cmd: MidiFlashCommand) -> Result<()> {
+    let mut fc = blender_midi::flash::MidiFlash::open()
+        .map_err(jtag_fallback_hint)?;
+
+    match cmd {
+        MidiFlashCommand::Info => {
+            let info = fc.info().map_err(jtag_fallback_hint)?;
+            println!("{info}");
+            Ok(())
+        }
+        MidiFlashCommand::Read { addr, len, out } => {
+            let addr = parse_u32(&addr)?;
+            let total = parse_u32(&len)?;
+            let mut buf = Vec::with_capacity(total as usize);
+            let mut a = addr;
+            let mut remaining = total;
+            while remaining > 0 {
+                let chunk = remaining.min(192) as u16;
+                buf.extend(fc.read(a, chunk).map_err(jtag_fallback_hint)?);
+                a += chunk as u32;
+                remaining -= chunk as u32;
+            }
+            if let Some(path) = out {
+                std::fs::write(&path, &buf)?;
+                println!("wrote {} bytes → {path}", buf.len());
+            } else {
+                blender_usb::hexdump("  ", &buf);
+            }
+            Ok(())
+        }
+        MidiFlashCommand::Hash { addr, len, show_sectors } => {
+            let addr = parse_u32(&addr)?;
+            let length = parse_u32(&len)?;
+            let (whole, count) = fc
+                .hash_range(addr, length, blender_midi::flash::DEFAULT_SECTOR_BUF_ADDR, show_sectors)
+                .map_err(jtag_fallback_hint)?;
+            println!("whole CRC: {:#010x}", whole);
+            println!("sectors:   {}", count);
+            if show_sectors {
+                let (_, crcs) = fc
+                    .device_crc32_batch(addr, length, blender_midi::flash::DEFAULT_SECTOR_BUF_ADDR)
+                    .map_err(jtag_fallback_hint)?;
+                for (i, c) in crcs.iter().enumerate() {
+                    let sec_addr = addr + (i as u32) * blender_midi::flash::SECTOR_SIZE;
+                    println!("  sector {i:3} (0x{sec_addr:06x}): {:#010x}", c);
+                }
+            }
+            Ok(())
+        }
+        MidiFlashCommand::Erase { addr, count } => {
+            let addr = parse_u32(&addr)?;
+            fc.erase_sector(addr, count).map_err(jtag_fallback_hint)?;
+            println!("erased {count} sector(s) @ {addr:#x}");
+            Ok(())
+        }
+        MidiFlashCommand::Write { addr, file } => {
+            let addr = parse_u32(&addr)?;
+            let data = std::fs::read(&file)?;
+            let info = fc.info().map_err(jtag_fallback_hint)?;
+            let chunk_size = info.write_aai_chunk();
+            if data.len() > chunk_size {
+                anyhow::bail!(
+                    "write payload {} > dispatcher chunk size {}; use 'update' for multi-frame writes",
+                    data.len(),
+                    chunk_size
+                );
+            }
+            fc.write_aai(addr, &data).map_err(jtag_fallback_hint)?;
+            println!("wrote {} bytes @ {addr:#x}", data.len());
+            Ok(())
+        }
+        MidiFlashCommand::Update { r#ref, region, length } => {
+            cmd_midi_flash_update(&mut fc, &r#ref, &region, &length)
+        }
+        MidiFlashCommand::Reboot { mode } => {
+            fc.reboot(mode).map_err(jtag_fallback_hint)?;
+            println!("reboot requested (mode={mode}). Power-cycle if USB wedges.");
+            Ok(())
+        }
+    }
+}
+
+fn cmd_midi_flash_update(
+    fc: &mut blender_midi::flash::MidiFlash,
+    ref_path: &str,
+    region_str: &str,
+    length_str: &str,
+) -> Result<()> {
+    use blender_midi::flash::{batch_diff, DEFAULT_SECTOR_BUF_ADDR, SECTOR_SIZE};
+
+    let region = parse_u32(region_str)?;
+    let length = parse_u32(length_str)?;
+    let full = std::fs::read(ref_path)?;
+    if region as usize + length as usize > full.len() {
+        anyhow::bail!(
+            "ref {ref_path} ({} bytes) too short for region {region:#x}+{length:#x}",
+            full.len()
+        );
+    }
+    let ref_slice = &full[region as usize..region as usize + length as usize];
+    println!(
+        "Reference: {ref_path} sliced to {region:#x}+{length:#x} ({} sectors)",
+        length / SECTOR_SIZE
+    );
+
+    let info = fc.info().map_err(jtag_fallback_hint)?;
+    println!("Device dispatcher: {info}");
+    let chunk_size = info.write_aai_chunk();
+
+    println!("Computing batch CRC + per-sector diff...");
+    let diff = batch_diff(fc, region, ref_slice, DEFAULT_SECTOR_BUF_ADDR)
+        .map_err(jtag_fallback_hint)?;
+    if diff.diff.is_empty() {
+        println!(
+            "Already up to date (whole CRC = {:#010x}).",
+            diff.whole_local
+        );
+        return Ok(());
+    }
+    println!(
+        "  whole-image local=0x{:08x} device=0x{:08x}; {} sectors differ",
+        diff.whole_local,
+        diff.whole_device,
+        diff.diff.len()
+    );
+
+    let total = diff.diff.len();
+    for (idx, &rel_off) in diff.diff.iter().enumerate() {
+        let sector_addr = region + rel_off;
+        let sector_data = &ref_slice[rel_off as usize..(rel_off + SECTOR_SIZE) as usize];
+        fc.erase_sector(sector_addr, 1).map_err(jtag_fallback_hint)?;
+        let mut off = 0usize;
+        while off < sector_data.len() {
+            let end = (off + chunk_size).min(sector_data.len());
+            let chunk = &sector_data[off..end];
+            fc.write_aai(sector_addr + off as u32, chunk)
+                .map_err(jtag_fallback_hint)?;
+            off = end;
+        }
+        if (idx + 1) % 16 == 0 || idx + 1 == total {
+            println!("  {}/{} sectors flashed...", idx + 1, total);
+        }
+    }
+
+    println!("Re-verifying...");
+    let post = batch_diff(fc, region, ref_slice, DEFAULT_SECTOR_BUF_ADDR)
+        .map_err(jtag_fallback_hint)?;
+    if post.diff.is_empty() {
+        println!(
+            "Done. {} sectors flashed; whole-image CRC matches ({:#010x}).",
+            total, post.whole_local
+        );
+        Ok(())
+    } else {
+        eprintln!(
+            "Verify FAILED: {} sectors still differ (first: {:#x})",
+            post.diff.len(),
+            region + post.diff[0]
+        );
+        Err(jtag_fallback_hint(anyhow::anyhow!(
+            "post-flash diff still has {} sectors",
+            post.diff.len()
+        )))
+    }
 }
