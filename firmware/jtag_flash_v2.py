@@ -1038,7 +1038,7 @@ def plan_erase_ops(sectors, policy):
 
 
 def plan_flash_ops(ref, image_size, block_threshold_64k=12,
-                   block_threshold_32k=6):
+                   block_threshold_32k=6, target_sectors=None):
     """Pick flash ops covering every 4 KB sector in [0, image_size).
 
     For each 64 KB block:
@@ -1051,38 +1051,72 @@ def plan_flash_ops(ref, image_size, block_threshold_64k=12,
     and ("sector", ...) for content. Erase ops leave flash at 0xFF, which
     is the correct state for any reference byte that's 0xFF.
 
+    When `target_sectors` is provided, only those 4 KB sectors are
+    considered for planning. Block/half-block ops are only emitted when
+    ALL sectors in the corresponding region are targeted (avoids touching
+    sectors outside the diff set).
+
     Returns list of (kind, addr, span) tuples. kind ∈ {block_64k,
     block_32k, sector, erase_64k, erase_32k, erase}.
     """
     def is_ff(lo, hi):
         return all(b == 0xFF for b in ref[lo:hi])
 
+    if target_sectors is not None:
+        target_set = {
+            int(s) & ~(SECTOR_SIZE - 1)
+            for s in target_sectors
+            if 0 <= int(s) < image_size
+        }
+    else:
+        target_set = None
+
     ops = []
     for blk_addr in range(0, image_size, BLOCK_64K):
         blk_hi = blk_addr + BLOCK_64K
+        if target_set is not None:
+            blk_targets = sorted(
+                s for s in target_set if blk_addr <= s < blk_hi
+            )
+            if not blk_targets:
+                continue
+        else:
+            blk_targets = [blk_addr + i * SECTOR_SIZE
+                           for i in range(BLOCK_64K // SECTOR_SIZE)]
+
+        full_block_targeted = len(blk_targets) == (BLOCK_64K // SECTOR_SIZE)
         if is_ff(blk_addr, blk_hi):
-            ops.append(("erase_64k", blk_addr, BLOCK_64K))
+            if full_block_targeted:
+                ops.append(("erase_64k", blk_addr, BLOCK_64K))
+            else:
+                for sec_addr in blk_targets:
+                    ops.append(("erase", sec_addr, SECTOR_SIZE))
             continue
-        # Count non-empty sectors in this block
-        sec_list = [blk_addr + i*SECTOR_SIZE
-                    for i in range(BLOCK_64K // SECTOR_SIZE)
-                    if not is_ff(blk_addr + i*SECTOR_SIZE,
-                                 blk_addr + (i+1)*SECTOR_SIZE)]
-        if len(sec_list) >= block_threshold_64k:
+        # Count non-empty sectors in this block among targeted sectors.
+        sec_list = [sec for sec in blk_targets
+                    if not is_ff(sec, sec + SECTOR_SIZE)]
+        if full_block_targeted and len(sec_list) >= block_threshold_64k:
             ops.append(("block_64k", blk_addr, BLOCK_64K))
             continue
         # Split into two 32 KB halves
         for half_addr in (blk_addr, blk_addr + BLOCK_32K):
             half_hi = half_addr + BLOCK_32K
-            if is_ff(half_addr, half_hi):
-                ops.append(("erase_32k", half_addr, BLOCK_32K))
+            half_targets = [s for s in blk_targets if half_addr <= s < half_hi]
+            if not half_targets:
                 continue
-            half_secs = [s for s in sec_list
-                         if half_addr <= s < half_hi]
-            if len(half_secs) >= block_threshold_32k:
+            full_half_targeted = len(half_targets) == (BLOCK_32K // SECTOR_SIZE)
+            if is_ff(half_addr, half_hi):
+                if full_half_targeted:
+                    ops.append(("erase_32k", half_addr, BLOCK_32K))
+                else:
+                    for sec_addr in half_targets:
+                        ops.append(("erase", sec_addr, SECTOR_SIZE))
+                continue
+            half_secs = [s for s in sec_list if half_addr <= s < half_hi]
+            if full_half_targeted and len(half_secs) >= block_threshold_32k:
                 ops.append(("block_32k", half_addr, BLOCK_32K))
             else:
-                for sec_addr in range(half_addr, half_hi, SECTOR_SIZE):
+                for sec_addr in half_targets:
                     if is_ff(sec_addr, sec_addr + SECTOR_SIZE):
                         ops.append(("erase", sec_addr, SECTOR_SIZE))
                     else:
@@ -1093,7 +1127,6 @@ def plan_flash_ops(ref, image_size, block_threshold_64k=12,
 from sector_diff import (
     zlib_rom_crc32 as _zlib_rom_crc32,
     batch_diff,
-    filter_ops_by_diff,
 )
 
 
@@ -1106,16 +1139,27 @@ def flash_all(client, args):
     ref = Path(args.ref).read_bytes()
     print(f"Reference: {args.ref} ({len(ref)} bytes)")
 
+    diff_sectors = None
+    if args.diff and not args.sectors:
+        # One sweep returns whole-image + per-sector CRCs. Plan from the
+        # diff set directly so we don't build then trim a full-image plan.
+        match, diff_sectors = batch_diff(client, ref)
+        if match:
+            print("\n=== flash-all done "
+                  "(image already matches device, whole-image CRC) ===")
+            return 0
+        if not diff_sectors:
+            # Should be rare (whole-image mismatch but no sector-level hit).
+            print("  ⚠ whole-image mismatch but per-sector found no diff "
+                  "— defaulting to full-image planning")
+
     if args.sectors:
         # Explicit sector list — treat each as a separate op (content or
         # erase decided per-sector).
         sectors = [int(s.strip(), 0) for s in args.sectors.split(",") if s.strip()]
-        ops = []
-        for addr in sectors:
-            if all(b == 0xFF for b in ref[addr:addr + SECTOR_SIZE]):
-                ops.append(("erase", addr, SECTOR_SIZE))
-            else:
-                ops.append(("sector", addr, SECTOR_SIZE))
+        ops = plan_flash_ops(ref, len(ref), target_sectors=sectors)
+    elif diff_sectors:
+        ops = plan_flash_ops(ref, len(ref), target_sectors=diff_sectors)
     else:
         # Cover the ENTIRE reference image. All-FF regions get erase-only
         # ops; content regions get flash-sector/block as before. No more
@@ -1131,39 +1175,9 @@ def flash_all(client, args):
     print(f"  {non_empty // 1024} KB content, "
           f"plan: {kind_summary} ({len(ops)} commands)")
 
-    # CRC sweep (read-only) runs FIRST, at whatever clock the chip arrived
-    # in. The bootloader's CRC routine runs at PLL on every successful boot
-    # — same code path validates the SPI bus + DMA at PLL, so reads here
-    # are safe at PLL and fast. We only drop to crystal once we know we
-    # have ops to actually flash.
-    if args.diff and not args.sectors:
-        # ONE device sweep returns both whole-image CRC and per-sector
-        # CRCs. Idempotent re-flash exits after this single round-trip;
-        # mismatch case already has the per-sector localization in hand.
-        match, diff = batch_diff(client, ref)
-        if match:
-            print("\n=== flash-all done "
-                  "(image already matches device, whole-image CRC) ===")
-            return 0
-        if not diff:
-            # Whole-image said mismatch, per-sector says all-match.
-            # Shouldn't happen unless ref length isn't sector-aligned or
-            # there's a CRC implementation bug — fall through and flash
-            # everything per the original plan to be safe.
-            print("  ⚠ whole-image mismatch but per-sector found no diff "
-                  "— defaulting to full plan")
-        else:
-            before = len(ops)
-            ops = filter_ops_by_diff(ops, diff)
-            if not ops:
-                print(f"  diff filter: 0 of {before} ops needed (no-op)")
-                return 0
-            kinds_filt = {}
-            for k, *_ in ops: kinds_filt[k] = kinds_filt.get(k, 0) + 1
-            kind_filt = ", ".join(
-                f"{v}×{k}" for k, v in sorted(kinds_filt.items()))
-            print(f"  diff filter: {len(ops)} of {before} ops needed "
-                  f"({kind_filt})")
+    if not ops:
+        print("  plan: no flash operations needed")
+        return 0
 
     # About to write — drop CPU to crystal to match the user's XMODEM-
     # validated flash configuration, then bp_clear (itself a WRSR write).
