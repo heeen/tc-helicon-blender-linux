@@ -35,7 +35,8 @@ PATCHED_SPI = FIRMWARE_DIR / 'blender_spi_patched.bin'
 # DCP registration still needs JTAG inject (main loop blocked in cyg_flag_wait).
 
 PATCH_ZONE_SRAM = 0x32600
-PATCH_ZONE_SIZE = 0x2600  # 9728 bytes — reboot_common.c + handlers + dispatch
+PATCH_ZONE_SIZE = 0x2700  # 9984 bytes (+0x100 2026-05-06 USB DSR deferred log BSS)
+                          # reboot_common.c + handlers + dispatch
                           # (grown 2026-04-23 from 0x2000 → 0x2400 for
                           # completion-callback wrapper + per-loop
                           # instrumentation; 2026-05-06 → 0x2600 for
@@ -44,7 +45,7 @@ PATCH_ZONE_SIZE = 0x2600  # 9728 bytes — reboot_common.c + handlers + dispatch
 # Heap base literal in code section (patched for persistent mode)
 HEAP_LITERAL_SRAM = 0xC570     # mempool_var_init loads heap_start from here
 HEAP_BASE_ORIG    = 0x325F8    # original heap_start = BSS_end
-HEAP_BASE_NEW     = 0x34C00    # new heap_start (= PATCH_ZONE_SRAM + PATCH_ZONE_SIZE)
+HEAP_BASE_NEW     = 0x34D00    # new heap_start (= PATCH_ZONE_SRAM + PATCH_ZONE_SIZE)
 
 # Firmware identity
 IDENTITY_ADDR = 0x8968
@@ -53,7 +54,8 @@ IDENTITY_WORD = 0xe92d4ff0
 # Hook sites
 HOOK_MIDI_LOOP        = 0x5180  # bl midi_rx_poll in midi_engine_thread main loop
 HOOK_MIDI_RX_PARSE_BL = 0x2AD8  # bl midi_parser_process_bytes inside midi_rx_poll
-
+# Entry of usb_hw_dsr_interrupt_dispatch — first insn is `mov r1,#1` (safe "before").
+HOOK_USB_DSR          = 0x21EF8
 
 # ── Hook definition ────────────────────────────────────────────────────────
 
@@ -77,6 +79,14 @@ hooks = [
         target=HOOK_MIDI_RX_PARSE_BL,
         handler="midi_rx_dispatch",
         mode="replace",
+    ),
+    # Enumeration trace: log SETUP-phase DSR activity without touching 0x90001000
+    # (reading the SETUP FIFO here would consume bytes and break EP0).
+    Hook(
+        name="usb_dsr_log",
+        target=HOOK_USB_DSR,
+        handler="usb_dsr_setup_trace",
+        mode="before",
     ),
 ]
 

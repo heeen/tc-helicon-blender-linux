@@ -6,7 +6,10 @@
  * from firmware code.
  *
  * Current handlers:
- *   flash_handler_init  — registers DCP 0x81F handler (called via "before" hook)
+ *   boot_init           — SPI/patch entry: DCP node, USB/DWC2 masks, MIDI hooks
+ *   midi_loop_hook      — replaces midi_rx_poll call site; EP3 telemetry + fallback arm
+ *   usb_dsr_setup_trace — "before" on USB DSR: queues SETUP/xfer (sts&0x10) events;
+ *                         midi_loop_hook drains to UART (DSR-safe)
  *   flash_handler       — DCP dispatch for INFO/READ/ERASE/WRITE
  *   midi_cc_handler     — intercepts MIDI CC → mixer control
  */
@@ -352,7 +355,14 @@ static volatile uint32_t ep3_cmps_seen;           /* DAINT bit 19 (EP3 OUT pendi
 static volatile uint32_t ep3_cf_clears;           /* complete_fn observed cleared (= ISR processed completion) */
 static volatile uint32_t ep3_cf_last;             /* last observed ep+0x08 (complete_fn) */
 static volatile uint32_t ep3_force_rearms;        /* manual re-arm attempts */
-static volatile int32_t  ep3_stuck_loops;         /* consecutive loops with state==3 + no q2 progress */
+
+/* USB DSR trace: record from DSR (no UART), drain from midi_loop_hook.
+ * Single-slot last event — bursts between polls collapse (seq still counts). */
+static volatile uint32_t usb_dsr_hook_calls;
+static volatile uint32_t usb_dsr_sts10_seq; /* incremented when GINTSTS & 0x10 */
+static volatile uint32_t usb_dsr_last_ss;
+static volatile uint32_t usb_dsr_last_g;
+static uint32_t usb_dsr_printed_seq;
 
 /* 2026-04-23 cleanup: removed uart_log_ep3_slot_and_dma + ep3_force_slot_gate_open
  * + associated logging. Slot gate clears stopped being informative once we
@@ -433,7 +443,11 @@ void boot_init(void) {
     ep3_cf_clears = 0;
     ep3_cf_last = 0;
     ep3_force_rearms = 0;
-    ep3_stuck_loops = 0;
+    usb_dsr_hook_calls = 0;
+    usb_dsr_sts10_seq = 0;
+    usb_dsr_last_ss = 0;
+    usb_dsr_last_g = 0;
+    usb_dsr_printed_seq = 0;
     ep3_hs_arms = 0;
     ep3_hs_rearms = 0;
     ep3_dcfg_fixups = 0;
@@ -483,7 +497,38 @@ void boot_init(void) {
 
 extern void midi_rx_poll(void);
 
+/* Runs inside usb_hw_dsr_interrupt_dispatch (IRQ/DSR context) via "before" hook.
+ * Bit 0x10 on 0x90000014 matches both TCAT "USBSTS" and DWC2 GINTSTS vendor use
+ * for SETUP/xfer dispatch (see firmware/usb_stack_runtime.md §4.2).
+ * TCAT_SETUPSTAT @ 0x90000020: xfer type in bits [20:17]; value 6 = SETUP stage.
+ *
+ * Do not read 0x90001000 here — that pops the SETUP FIFO and breaks EP0.
+ * Do not call UART here — eCos DSR + polled UART was dropping lines on cold
+ * boot; queue for midi_loop_hook instead. */
+void usb_dsr_setup_trace(void) {
+    usb_dsr_hook_calls++;
+
+    uint32_t gint = USB_GINTSTS;
+    if ((gint & 0x10u) == 0)
+        return;
+    usb_dsr_last_ss = *(volatile uint32_t *)0x90000020u;
+    usb_dsr_last_g = gint;
+    usb_dsr_sts10_seq++;
+}
+
+static void usb_drain_dsr_log(void) {
+    uint32_t s = usb_dsr_sts10_seq;
+    if (s == usb_dsr_printed_seq)
+        return;
+    usb_dsr_printed_seq = s;
+    uint32_t ss = usb_dsr_last_ss;
+    uint32_t g = usb_dsr_last_g;
+    uart_mini_printf("[usb] dsr xt=%b ss=%x g=%x\r\n",
+                     (unsigned)((ss >> 17) & 0xFu), ss, g);
+}
+
 void midi_loop_hook(void) {
+    usb_drain_dsr_log();
     /* One-shot: confirm the HS speed-check bypass worked.
      * boot_init patches 0x19BE0 (cmp r3,#2 -> cmp r3,r3) so SET_CONFIGURATION
      * now arms MIDI endpoints at High Speed. Just log the result. */
@@ -531,6 +576,37 @@ void midi_loop_hook(void) {
 
     /* Call the displaced midi_rx_poll first — processes USB MIDI RX data */
     midi_rx_poll();
+
+    /* Fallback arming for hosts that never issue SET_CONFIGURATION. */
+    {
+        uint32_t ep_h = *(volatile uint32_t *)(midi_pkt_buf + MIDI_PKT_RX_EP);
+        if (!ep_h) {
+            void *rx_ep = usb_iface_get_rx_endpoint((void *)usb_midi_conn, USB_EP_TYPE_MIDI_RX);
+            ep_h = (uint32_t)(uintptr_t)rx_ep;
+        }
+        if (ep_h && ep3_out_trace_calls == 0u
+            && (loop_count & 0x3Fu) == 0u
+            && usb_conn_get_state(usb_midi_conn) >= USB_STATE_ADDRESSED) {
+                uint8_t st = *(volatile uint8_t *)(ep_h + ECOS_EP_STATE);
+                uint32_t cf = *(volatile uint32_t *)(ep_h + ECOS_EP_COMPLETE_FN);
+                if (st == 2u && cf == 0u && (USB_DOEPCTL(3) & DEPCTL_EPENA) == 0u) {
+                    uint8_t ep_desc[8];
+                    if (usb_endpoint_descriptor_build((void *)(midi_streaming_state + MIDI_STREAM_EP_DESC),
+                                                      USB_EP_TYPE_MIDI_RX, ep_desc)) {
+                        int rc = usb_hw_ep_read_start((void *)usb_midi_conn, ep_desc);
+                        if (rc == 0) {
+                            uint8_t cables = *(volatile uint8_t *)(midi_pkt_buf + MIDI_PKT_CABLE_CNT);
+                            if (cables == 0u) cables = 1u;
+                            usb_midi_rx_start((void *)ep_h, (int)cables);
+                            ep3_force_rearms++;
+                            if (ep3_force_rearms <= 4u)
+                                uart_mini_printf("[midi] fb armed fr=%x c=%b\r\n",
+                                                 ep3_force_rearms, (unsigned)cables);
+                        }
+                    }
+                }
+        }
+    }
 
     /* 2026-04-23 instrumentation: per-loop EP3 OUT state poll. */
     {
@@ -645,13 +721,24 @@ void midi_loop_hook(void) {
 
     /* Monitor USB MIDI RX state — report changes */
     uint32_t total = *(volatile uint32_t *)(midi_pkt_buf + MIDI_PKT_TOTAL);
+    uint8_t ec_dump_now = 0;
     if (total != last_total_pkts) {
         uart_mini_printf("[rx] %b\r\n", (unsigned)(uint8_t)total);
         last_total_pkts = total;
+        ec_dump_now = 1;
     }
-    /* Periodic EP status + USB registers (~every 4 seconds). */
+    /* Also fire on completion-callback events even if no MIDI bytes were
+     * decoded (e.g. zero-length OUT, parser-rejected packet, error status). */
+    static uint32_t last_cmc;
+    if (ep3_cmp_calls != last_cmc) {
+        last_cmc = ep3_cmp_calls;
+        ec_dump_now = 1;
+    }
+    /* EP status + USB registers — every USB MIDI packet (rx-driven), plus
+     * a slow heartbeat fallback when idle (~64 s; loop runs at ~1024 Hz, so
+     * 0x10000 ticks ≈ 64 s). */
     loop_count++;
-    if ((loop_count & 0x3FF) == 0) {
+    if (ec_dump_now || (loop_count & 0xFFFFu) == 0u) {
         uint32_t ep_handle = *(volatile uint32_t *)(midi_pkt_buf + MIDI_PKT_RX_EP);
         uint8_t cable_cnt = *(volatile uint8_t *)(midi_pkt_buf + MIDI_PKT_CABLE_CNT);
         uint32_t complete_fn = ep_handle ? *(volatile uint32_t *)((uint8_t *)ep_handle + 8) : 0;
@@ -694,10 +781,11 @@ void midi_loop_hook(void) {
                 : (enumspd == 2u) ? 'L'
                                   : 'X';   /* 3 = FS-on-HS-PHY */
         uart_mini_printf(
-            "EC2 u=%b g=%b es=%c dcfg=%x dctl=%x dsts=%x",
+            "EC2 u=%b g=%b es=%c dcfg=%x dctl=%x dsts=%x dhc=%x d10=%x",
             (unsigned)(uint8_t)usb_conn_get_state(usb_midi_conn),
             (unsigned)*(volatile uint8_t *)(midi_streaming_state + 0x1C),
-            es, USB_DCFG, USB_DCTL, dsts);
+            es, USB_DCFG, USB_DCTL, dsts,
+            usb_dsr_hook_calls, usb_dsr_sts10_seq);
         if (ep_handle) {
             uint32_t bufp = *(volatile uint32_t *)((uint8_t *)ep_handle + ECOS_EP_BUFFER);
             int32_t bufsz = *(volatile int32_t *)((uint8_t *)ep_handle + ECOS_EP_BUFFER_SIZE);
